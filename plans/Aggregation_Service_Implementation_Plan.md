@@ -882,49 +882,90 @@ headers: {
 
 ---
 
-## 8. Required Clarifications
+## 8. Required Clarifications & Suggested Solutions
 
-The following items are **not specified** in the provided documentation and require clarification before implementation:
+The following items are **not specified** in the provided documentation. Each item includes a **suggested solution** that can be implemented unless stakeholders specify otherwise.
 
 ### 8.1 Infrastructure & Deployment
 
-| Item                            | Question                                                              | Impact                                      |
-| ------------------------------- | --------------------------------------------------------------------- | ------------------------------------------- |
-| **Kubernetes vs. Docker Swarm** | What is the target orchestration platform?                            | Affects scaling configuration and manifests |
-| **GPU availability**            | Is GPU available for Whisper? If not, CPU-only Whisper will be slower | Affects transcription latency targets       |
-| **Storage region/provider**     | Supabase Storage vs. AWS S3 vs. other?                                | Affects client implementation and CDN setup |
+| Item                            | Question                                                              | Impact                                      | Suggested Solution                                                                                                                                                                               |
+| ------------------------------- | --------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Kubernetes vs. Docker Swarm** | What is the target orchestration platform?                            | Affects scaling configuration and manifests | **Use Kubernetes (K8s)** — Industry standard with better ecosystem support, HPA for auto-scaling, and native support for job queues. Provide both Docker Compose (dev) and K8s manifests (prod). |
+| **GPU availability**            | Is GPU available for Whisper? If not, CPU-only Whisper will be slower | Affects transcription latency targets       | **Plan for CPU-only initially** — Use Whisper `base` model on CPU with async processing. Queue design absorbs latency. Add GPU support as optional enhancement in Phase 4 if available.          |
+| **Storage region/provider**     | Supabase Storage vs. AWS S3 vs. other?                                | Affects client implementation and CDN setup | **Use Supabase Storage as primary** (per context docs) with S3-compatible API. Implement storage abstraction layer to allow future migration to AWS S3 if needed.                                |
 
 ### 8.2 CMS Internal APIs
 
-| Item                     | Question                                                               | Impact                                |
-| ------------------------ | ---------------------------------------------------------------------- | ------------------------------------- |
-| **API endpoint paths**   | Exact paths for CMS internal APIs (e.g., `/internal/*` vs. `/admin/*`) | Affects API client implementation     |
-| **Service token format** | JWT or simple bearer token? Token rotation policy?                     | Affects authentication implementation |
-| **Batch upsert support** | Can CMS handle batch creates/updates?                                  | Affects throughput optimization       |
+| Item                     | Question                                                               | Impact                                | Suggested Solution                                                                                                                                                                                  |
+| ------------------------ | ---------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **API endpoint paths**   | Exact paths for CMS internal APIs (e.g., `/internal/*` vs. `/admin/*`) | Affects API client implementation     | **Use `/internal/*` prefix** — Separates service-to-service APIs from admin APIs (`/admin/*` is reserved for Platform Console). Proposed paths: `/internal/content-items`, `/internal/transcripts`. |
+| **Service token format** | JWT or simple bearer token? Token rotation policy?                     | Affects authentication implementation | **Use simple bearer token (not JWT)** — Service tokens don't need claims verification. Store in env var `CMS_SERVICE_TOKEN`. Implement 90-day rotation policy with overlap period.                  |
+| **Batch upsert support** | Can CMS handle batch creates/updates?                                  | Affects throughput optimization       | **Implement single-item API first** — Design for batch support (`POST /internal/content-items/batch`) as Phase 4 optimization. Use parallel requests (max 10 concurrent) as interim solution.       |
 
 ### 8.3 Source-Specific
 
-| Item                   | Question                                                    | Impact                          |
-| ---------------------- | ----------------------------------------------------------- | ------------------------------- |
-| **YouTube API quota**  | What is the allocated quota? Are we using OAuth or API key? | Affects polling frequency       |
-| **X/Twitter access**   | API tier (Basic, Pro, Enterprise) or scraping approach?     | Affects implementation approach |
-| **Scraping allowlist** | Initial list of approved domains for full-article scraping? | Affects RSS pipeline scope      |
+| Item                   | Question                                                    | Impact                          | Suggested Solution                                                                                                                                                                                              |
+| ---------------------- | ----------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **YouTube API quota**  | What is the allocated quota? Are we using OAuth or API key? | Affects polling frequency       | **Assume 10,000 units/day default quota** — Use API key (not OAuth) for public data. Implement quota tracking with Redis counter. Poll channels every 15 min, playlists every 30 min. Reserve 20% quota buffer. |
+| **X/Twitter access**   | API tier (Basic, Pro, Enterprise) or scraping approach?     | Affects implementation approach | **Use approved scraping initially** — Twitter API pricing is prohibitive for v1. Implement Puppeteer-based scraper with rate limiting (100 req/hour). Design interface to swap to API when budget allows.       |
+| **Scraping allowlist** | Initial list of approved domains for full-article scraping? | Affects RSS pipeline scope      | **Start with major news domains** — Initial allowlist: `reuters.com`, `apnews.com`, `bbc.com`, `techcrunch.com`, `theverge.com`, `arstechnica.com`. Store in JSON config, expandable via Platform Console.      |
 
 ### 8.4 AI/ML
 
-| Item                        | Question                                 | Impact                                |
-| --------------------------- | ---------------------------------------- | ------------------------------------- |
-| **Whisper model size**      | tiny, base, small, medium, or large?     | Affects accuracy vs. latency tradeoff |
-| **Whisper deployment**      | Self-hosted, OpenAI API, or Replicate?   | Affects cost and implementation       |
-| **Embedding model hosting** | Self-hosted or API (Hugging Face, etc.)? | Affects latency and cost              |
+| Item                        | Question                                 | Impact                                | Suggested Solution                                                                                                                                                                           |
+| --------------------------- | ---------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Whisper model size**      | tiny, base, small, medium, or large?     | Affects accuracy vs. latency tradeoff | **Use `base` model** — Best balance of accuracy (WER ~10%) and speed for CPU. ~1GB memory footprint. Transcribes 5-min audio in ~60-90s on CPU. Configurable via `WHISPER_MODEL` env var.    |
+| **Whisper deployment**      | Self-hosted, OpenAI API, or Replicate?   | Affects cost and implementation       | **Self-hosted via `openai-whisper` Python package** — Zero per-request cost, full control. Run as sidecar container or subprocess. Fall back to OpenAI API for overflow (budget permitting). |
+| **Embedding model hosting** | Self-hosted or API (Hugging Face, etc.)? | Affects latency and cost              | **Self-hosted via `@xenova/transformers`** — Run `all-MiniLM-L6-v2` locally in Node.js using ONNX runtime. ~100MB model, <500ms inference. No API costs or rate limits.                      |
 
 ### 8.5 Operational
 
-| Item                    | Question                                                                     | Impact                           |
-| ----------------------- | ---------------------------------------------------------------------------- | -------------------------------- |
-| **SLA targets**         | What is the expected time from source publish to READY?                      | Affects queue prioritization     |
-| **Manual upload flow**  | How does Platform Console trigger manual uploads? Direct API or file upload? | Affects endpoint design          |
-| **Alerting thresholds** | DLQ size, latency P99, error rate thresholds for alerts?                     | Affects monitoring configuration |
+| Item                    | Question                                                                     | Impact                           | Suggested Solution                                                                                                                                                                                                                             |
+| ----------------------- | ---------------------------------------------------------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **SLA targets**         | What is the expected time from source publish to READY?                      | Affects queue prioritization     | **Target: 15 minutes for articles, 30 minutes for media** — Articles (no media processing) should be fast. Video/podcast includes download + transcode + transcript. Implement priority queues: `high` (manual uploads), `normal` (scheduled). |
+| **Manual upload flow**  | How does Platform Console trigger manual uploads? Direct API or file upload? | Affects endpoint design          | **Two-step flow via CMS** — Console uploads file to storage via CMS `/admin/uploads` endpoint, receives `storage_path`. Console then calls CMS `/admin/content-sources/:id/ingest` with `storage_path`. CMS enqueues job to Aggregation.       |
+| **Alerting thresholds** | DLQ size, latency P99, error rate thresholds for alerts?                     | Affects monitoring configuration | **Proposed thresholds:** DLQ > 50 items (warning), > 200 (critical). P99 latency > 2x target (warning), > 5x (critical). Error rate > 5% (warning), > 15% (critical). Circuit breaker open > 5 min (critical).                                 |
+
+### 8.6 Summary of Suggested Defaults
+
+```yaml
+# Suggested configuration defaults (can be overridden)
+infrastructure:
+  orchestration: kubernetes
+  gpu_required: false
+  storage_provider: supabase
+
+cms_integration:
+  api_prefix: /internal
+  token_type: bearer
+  batch_support: phase_4
+
+sources:
+  youtube_quota: 10000_units_per_day
+  twitter_method: scraping
+  scrape_allowlist:
+    - reuters.com
+    - apnews.com
+    - bbc.com
+    - techcrunch.com
+    - theverge.com
+    - arstechnica.com
+
+ai_ml:
+  whisper_model: base
+  whisper_deployment: self_hosted
+  embedding_model: all-MiniLM-L6-v2
+  embedding_deployment: self_hosted_onnx
+
+operations:
+  sla_article_minutes: 15
+  sla_media_minutes: 30
+  manual_upload: cms_mediated
+  alert_dlq_warning: 50
+  alert_dlq_critical: 200
+  alert_error_rate_warning: 0.05
+  alert_error_rate_critical: 0.15
+```
 
 ---
 
