@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-service
+  labels:
+    app: aggregation-service
+    component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aggregation-service
+  template:
+    metadata:
+      labels:
+        app: aggregation-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3001"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: aggregation
+          image: ghcr.io/your-org/aggregation-service:latest
+          ports:
+            - name: metrics
+              containerPort: 3001
+              protocol: TCP
+          env:
+            - name: CMS_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: CMS_BASE_URL
+            - name: CMS_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aggregation-secrets
+                  key: CMS_SERVICE_TOKEN
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: REDIS_URL
+            - name: STORAGE_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: STORAGE_ENDPOINT
+            - name: STORAGE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: STORAGE_BUCKET
+            - name: STORAGE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aggregation-secrets
+                  key: STORAGE_ACCESS_KEY
+            - name: STORAGE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aggregation-secrets
+                  key: STORAGE_SECRET_KEY
+            - name: WHISPER_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: WHISPER_API_URL
+            - name: WORKER_CONCURRENCY
+              value: "5"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: METRICS_PORT
+              value: "3001"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: media-temp
+              mountPath: /tmp/turfa-media
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: media-temp
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: config
+          configMap:
+            name: aggregation-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aggregation-service
+  labels:
+    app: aggregation-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3001
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app: aggregation-service
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aggregation-config
+data:
+  CMS_BASE_URL: "http://cms-service.default.svc.cluster.local/internal"
+  REDIS_URL: "redis://redis-master.default.svc.cluster.local:6379"
+  STORAGE_ENDPOINT: "https://your-storage.supabase.co/storage/v1"
+  STORAGE_BUCKET: "turfa-media"
+  WHISPER_API_URL: "http://whisper-service.default.svc.cluster.local:9000"

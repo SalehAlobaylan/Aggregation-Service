@@ -6,7 +6,7 @@
  * - Exposes internal Fastify endpoints for health/ready/metrics
  * - Never serves user-facing API traffic
  */
-import { config } from './config/index.js';
+import { config, getRedactedConfig } from './config/index.js';
 import { logger } from './observability/logger.js';
 import { getRedisConnection, closeRedisConnection } from './queues/redis.js';
 import { initializeQueues, closeQueues } from './queues/index.js';
@@ -15,15 +15,7 @@ import { startServer, stopServer } from './server/index.js';
 
 async function main(): Promise<void> {
     logger.info('Starting Aggregation Service...');
-    logger.info('Configuration loaded', {
-        cmsBaseUrl: config.cmsBaseUrl,
-        redisUrl: config.redisUrl.replace(/\/\/.*@/, '//<redacted>@'), // Redact password if present
-        storageEndpoint: config.storageEndpoint,
-        storageBucket: config.storageBucket,
-        workerConcurrency: config.workerConcurrency,
-        logLevel: config.logLevel,
-        metricsPort: config.metricsPort,
-    });
+    logger.info('Configuration loaded', getRedactedConfig(config));
 
     try {
         // Initialize Redis connection

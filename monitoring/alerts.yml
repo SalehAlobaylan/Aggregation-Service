@@ -1,0 +1,156 @@
+# Prometheus Alert Rules for Turfa Aggregation Service
+groups:
+  - name: aggregation.rules
+    interval: 30s
+    rules:
+      # ========================================================================
+      # DLQ Alerts
+      # ========================================================================
+      - alert: DLQSizeWarning
+        expr: aggregation_dlq_size > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead letter queue growing"
+          description: "DLQ has {{ $value }} jobs. Manual intervention may be needed."
+
+      - alert: DLQSizeCritical
+        expr: aggregation_dlq_size > 50
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead letter queue critical"
+          description: "DLQ has {{ $value }} jobs. Immediate attention required."
+
+      # ========================================================================
+      # Latency Alerts
+      # ========================================================================
+      - alert: JobLatencyWarning
+        expr: histogram_quantile(0.95, rate(aggregation_job_duration_seconds_bucket[5m])) > 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job latency elevated"
+          description: "P95 job duration is {{ $value | humanizeDuration }}. Target is 30s."
+
+      - alert: JobLatencyCritical
+        expr: histogram_quantile(0.95, rate(aggregation_job_duration_seconds_bucket[5m])) > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Job latency critical"
+          description: "P95 job duration is {{ $value | humanizeDuration }}. Pipeline may be stalled."
+
+      # ========================================================================
+      # Error Rate Alerts
+      # ========================================================================
+      - alert: ErrorRateWarning
+        expr: |
+          (
+            sum(rate(aggregation_jobs_total{status="failed"}[5m]))
+            /
+            sum(rate(aggregation_jobs_total[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error rate elevated"
+          description: "Job failure rate is {{ $value | humanizePercentage }}. Investigating recommended."
+
+      - alert: ErrorRateCritical
+        expr: |
+          (
+            sum(rate(aggregation_jobs_total{status="failed"}[5m]))
+            /
+            sum(rate(aggregation_jobs_total[5m]))
+          ) > 0.15
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate critical"
+          description: "Job failure rate is {{ $value | humanizePercentage }}. Immediate action required."
+
+      # ========================================================================
+      # Circuit Breaker Alerts
+      # ========================================================================
+      - alert: CircuitBreakerOpen
+        expr: aggregation_circuit_state == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker open"
+          description: "Circuit breaker for {{ $labels.dependency }} has been open for >5 minutes."
+
+      - alert: CircuitBreakerFlapping
+        expr: increase(aggregation_circuit_trips_total[15m]) > 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker flapping"
+          description: "Circuit {{ $labels.dependency }} has tripped {{ $value }} times in 15 minutes."
+
+      # ========================================================================
+      # Queue Depth Alerts
+      # ========================================================================
+      - alert: QueueBacklogWarning
+        expr: aggregation_queue_depth > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue backlog growing"
+          description: "Queue {{ $labels.queue }} has {{ $value }} pending jobs."
+
+      - alert: QueueBacklogCritical
+        expr: aggregation_queue_depth > 500
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Queue backlog critical"
+          description: "Queue {{ $labels.queue }} has {{ $value }} pending jobs. Consider scaling workers."
+
+      # ========================================================================
+      # CMS Connectivity Alerts
+      # ========================================================================
+      - alert: CMSLatencyHigh
+        expr: histogram_quantile(0.95, rate(aggregation_cms_latency_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CMS API latency high"
+          description: "P95 CMS latency is {{ $value | humanizeDuration }}."
+
+      - alert: CMSErrorRate
+        expr: |
+          sum(rate(aggregation_cms_requests_total{status_code=~"5.."}[5m]))
+          /
+          sum(rate(aggregation_cms_requests_total[5m]))
+          > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CMS API error rate high"
+          description: "CMS 5xx error rate is {{ $value | humanizePercentage }}."
+
+      # ========================================================================
+      # Resource Alerts
+      # ========================================================================
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / 1024 / 1024 > 1024
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Process is using {{ $value | humanize1024 }}B of memory."

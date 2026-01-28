@@ -1,4 +1,7 @@
 services:
+  # ============================================================================
+  # Core Services
+  # ============================================================================
   aggregation:
     build: .
     container_name: aggregation-service
@@ -16,6 +19,8 @@ services:
       - WORKER_CONCURRENCY=5
       - LOG_LEVEL=info
       - METRICS_PORT=3001
+      - CB_FAILURE_THRESHOLD=5
+      - CB_RESET_TIMEOUT_MS=30000
     depends_on:
       redis:
         condition: service_healthy
@@ -58,7 +63,6 @@ services:
       - minio-data:/data
     restart: unless-stopped
 
-  # MinIO bucket initialization
   minio-init:
     image: minio/mc
     container_name: aggregation-minio-init
@@ -73,7 +77,6 @@ services:
       exit 0;
       "
 
-  # Whisper ASR service for transcription
   whisper:
     image: onerahmet/openai-whisper-asr-webservice:latest
     container_name: aggregation-whisper
@@ -90,8 +93,47 @@ services:
         limits:
           memory: 4G
 
+  # ============================================================================
+  # Monitoring Stack (optional - use 'docker compose --profile monitoring up')
+  # ============================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: aggregation-prometheus
+    profiles: ["monitoring"]
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: aggregation-grafana
+    profiles: ["monitoring"]
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3002:3000"
+    volumes:
+      - ./monitoring/grafana/dashboard.json:/var/lib/grafana/dashboards/aggregation.json:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   redis-data:
   minio-data:
   media-temp:
   whisper-cache:
+  prometheus-data:
+  grafana-data:
