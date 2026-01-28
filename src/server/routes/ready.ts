@@ -39,13 +39,13 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
         // In Phase 1, just mark as "configured" if URL is set
         let storageStatus: DependencyStatus = 'configured';
         try {
-            if (config.storageBaseUrl) {
+            if (config.storageEndpoint) {
                 // Try a lightweight HEAD request to storage
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), 5000);
 
                 try {
-                    const response = await fetch(config.storageBaseUrl, {
+                    const response = await fetch(config.storageEndpoint, {
                         method: 'HEAD',
                         signal: controller.signal,
                     });

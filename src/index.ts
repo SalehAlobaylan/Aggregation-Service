@@ -18,7 +18,7 @@ async function main(): Promise<void> {
     logger.info('Configuration loaded', {
         cmsBaseUrl: config.cmsBaseUrl,
         redisUrl: config.redisUrl.replace(/\/\/.*@/, '//<redacted>@'), // Redact password if present
-        storageBaseUrl: config.storageBaseUrl,
+        storageEndpoint: config.storageEndpoint,
         storageBucket: config.storageBucket,
         workerConcurrency: config.workerConcurrency,
         logLevel: config.logLevel,

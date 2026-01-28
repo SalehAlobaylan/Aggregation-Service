@@ -6,8 +6,13 @@ services:
       - CMS_BASE_URL=http://host.docker.internal:3000/internal
       - CMS_SERVICE_TOKEN=dev-service-token
       - REDIS_URL=redis://redis:6379
-      - STORAGE_BASE_URL=http://minio:9000
+      - STORAGE_ENDPOINT=http://minio:9000
       - STORAGE_BUCKET=turfa-media
+      - STORAGE_ACCESS_KEY=minioadmin
+      - STORAGE_SECRET_KEY=minioadmin
+      - STORAGE_PUBLIC_URL=http://localhost:9000
+      - WHISPER_API_URL=http://whisper:9000
+      - MEDIA_TEMP_DIR=/tmp/turfa-media
       - WORKER_CONCURRENCY=5
       - LOG_LEVEL=info
       - METRICS_PORT=3001
@@ -16,10 +21,13 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+      whisper:
+        condition: service_started
     ports:
       - "3001:3001"
     volumes:
       - ./config:/config:ro
+      - media-temp:/tmp/turfa-media
     restart: unless-stopped
 
   redis:
@@ -50,6 +58,40 @@ services:
       - minio-data:/data
     restart: unless-stopped
 
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc
+    container_name: aggregation-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/turfa-media --ignore-existing;
+      mc anonymous set public local/turfa-media;
+      exit 0;
+      "
+
+  # Whisper ASR service for transcription
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: aggregation-whisper
+    environment:
+      - ASR_MODEL=base
+      - ASR_ENGINE=openai_whisper
+    ports:
+      - "9002:9000"
+    volumes:
+      - whisper-cache:/root/.cache
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
 volumes:
   redis-data:
   minio-data:
+  media-temp:
+  whisper-cache:
