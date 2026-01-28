@@ -2,9 +2,9 @@
  * CMS API type definitions
  */
 
-// Content types
+// Content types - must match queue schemas
 export type ContentType = 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
-export type SourceType = 'RSS' | 'PODCAST' | 'YOUTUBE' | 'UPLOAD' | 'MANUAL';
+export type SourceType = 'RSS' | 'PODCAST' | 'YOUTUBE' | 'TWITTER' | 'REDDIT' | 'UPLOAD' | 'MANUAL';
 export type ContentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' | 'ARCHIVED';
 
 /**
@@ -12,31 +12,31 @@ export type ContentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' | 'ARC
  */
 export interface ContentItem {
     id: string;
-    idempotencyKey: string;
+    idempotency_key: string;
     type: ContentType;
     source: SourceType;
     status: ContentStatus;
 
     title: string;
-    bodyText: string | null;
+    body_text: string | null;
     excerpt: string | null;
 
     author: string | null;
-    sourceName: string;
-    sourceFeedUrl: string | null;
+    source_name: string;
+    source_feed_url: string | null;
 
-    mediaUrl: string | null;
-    thumbnailUrl: string | null;
-    originalUrl: string;
-    durationSec: number | null;
+    media_url: string | null;
+    thumbnail_url: string | null;
+    original_url: string;
+    duration_sec: number | null;
 
-    topicTags: string[];
+    topic_tags: string[];
     embedding: number[];
     metadata: Record<string, unknown>;
 
-    publishedAt: string;
-    createdAt: string;
-    updatedAt: string;
+    published_at: string | null;
+    created_at: string;
+    updated_at: string;
 }
 
 /**
@@ -44,12 +44,12 @@ export interface ContentItem {
  */
 export interface Transcript {
     id: string;
-    contentItemId: string;
-    fullText: string;
+    content_item_id: string;
+    full_text: string;
     summary: string | null;
-    wordTimestamps: WordTimestamp[] | null;
+    word_timestamps: WordTimestamp[] | null;
     language: string;
-    createdAt: string;
+    created_at: string;
 }
 
 export interface WordTimestamp {
@@ -64,28 +64,35 @@ export interface WordTimestamp {
  * POST /internal/content-items
  */
 export interface CreateContentItemRequest {
-    idempotencyKey: string;
+    idempotency_key: string;
     type: ContentType;
     source: SourceType;
-    status: 'PENDING';
+    status: ContentStatus;
 
     title: string;
-    bodyText?: string;
-    excerpt?: string;
+    body_text?: string | null;
+    excerpt?: string | null;
 
-    author?: string;
-    sourceName: string;
-    sourceFeedUrl?: string;
-    originalUrl: string;
+    author?: string | null;
+    source_name: string;
+    source_feed_url?: string | null;
+    original_url: string;
 
-    publishedAt: string;
+    media_url?: string | null;
+    thumbnail_url?: string | null;
+    duration_sec?: number | null;
+
+    topic_tags?: string[];
     metadata?: Record<string, unknown>;
+
+    published_at?: string | null;
 }
 
 export interface CreateContentItemResponse {
     id: string;
-    status: 'PENDING';
-    createdAt: string;
+    status: ContentStatus;
+    created: boolean; // true if newly created, false if already existed
+    created_at: string;
 }
 
 /**
@@ -93,13 +100,13 @@ export interface CreateContentItemResponse {
  */
 export interface UpdateContentItemRequest {
     title?: string;
-    bodyText?: string;
-    excerpt?: string;
-    author?: string;
-    sourceName?: string;
-    sourceFeedUrl?: string;
-    originalUrl?: string;
-    publishedAt?: string;
+    body_text?: string | null;
+    excerpt?: string | null;
+    author?: string | null;
+    source_name?: string;
+    source_feed_url?: string | null;
+    original_url?: string;
+    published_at?: string | null;
     metadata?: Record<string, unknown>;
 }
 
@@ -107,40 +114,40 @@ export interface UpdateContentItemRequest {
  * PATCH /internal/content-items/:id/status
  */
 export interface UpdateStatusRequest {
-    status: 'PROCESSING' | 'READY' | 'FAILED';
-    errorMessage?: string;
+    status: ContentStatus;
+    failure_reason?: string;
 }
 
 /**
  * PATCH /internal/content-items/:id/artifacts
  */
 export interface UpdateArtifactsRequest {
-    mediaUrl?: string;
-    thumbnailUrl?: string;
-    durationSec?: number;
+    media_url?: string;
+    thumbnail_url?: string;
+    duration_sec?: number;
 }
 
 /**
  * POST /internal/transcripts
  */
 export interface CreateTranscriptRequest {
-    contentItemId: string;
-    fullText: string;
+    content_item_id: string;
+    full_text: string;
     summary?: string;
-    wordTimestamps?: WordTimestamp[];
+    word_timestamps?: WordTimestamp[];
     language: string;
 }
 
 export interface CreateTranscriptResponse {
     id: string;
-    createdAt: string;
+    created_at: string;
 }
 
 /**
  * PATCH /internal/content-items/:id/transcript
  */
 export interface LinkTranscriptRequest {
-    transcriptId: string;
+    transcript_id: string;
 }
 
 /**
@@ -148,7 +155,7 @@ export interface LinkTranscriptRequest {
  */
 export interface UpdateEmbeddingRequest {
     embedding: number[];
-    topicTags?: string[];
+    topic_tags?: string[];
 }
 
 /**

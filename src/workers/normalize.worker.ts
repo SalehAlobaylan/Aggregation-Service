@@ -1,14 +1,19 @@
 /**
  * Normalize Worker - handles content normalization to canonical format
- * Phase 1: Stub implementation
+ * Phase 2: Full implementation with CMS upsert
  */
 import { Job } from 'bullmq';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type NormalizeJob } from '../queues/index.js';
+import { normalizeItem } from '../normalizers/index.js';
+import { dedupService } from '../services/dedup.service.js';
+import { upsertContentItem } from '../cms/upsert.js';
+import { getQueue } from '../queues/index.js';
+import type { RawFetchedItem } from '../fetchers/types.js';
 
 export const normalizeWorker = createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
-    processor: async (job: Job<NormalizeJob>, jobLogger) => {
+    processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, rawItems, fetchJobId } = job.data;
 
         jobLogger.info('Processing normalize job', {
@@ -18,19 +23,87 @@ export const normalizeWorker = createWorker({
             fetchJobId,
         });
 
-        // Phase 1: Stub - actual implementation will be added in Phase 2
-        // This would:
-        // 1. Map raw items to ContentItem schema
-        // 2. Generate idempotency keys
-        // 3. Check for duplicates
-        // 4. Create content items in CMS
-        // 5. Enqueue media jobs for items requiring media processing
+        let processed = 0;
+        let duplicates = 0;
+        let failed = 0;
+        let mediaEnqueued = 0;
 
-        await new Promise(resolve => setTimeout(resolve, 100));
+        for (const rawItem of rawItems || []) {
+            try {
+                // Cast raw data back to RawFetchedItem
+                const item = rawItem.rawData as unknown as RawFetchedItem;
 
-        jobLogger.info('Normalize job completed (stub)', {
+                // Normalize the item
+                const normalized = normalizeItem(item);
+                if (!normalized) {
+                    failed++;
+                    continue;
+                }
+
+                // Check for duplicates
+                const dedupResult = await dedupService.checkDedup(normalized.idempotencyKey);
+                if (dedupResult.isDuplicate) {
+                    jobLogger.debug('Skipping duplicate', {
+                        idempotencyKey: normalized.idempotencyKey,
+                        existingId: dedupResult.existingId,
+                    });
+                    duplicates++;
+                    continue;
+                }
+
+                // Upsert to CMS
+                const { contentItemId, created } = await upsertContentItem(normalized, job.id);
+
+                if (created) {
+                    processed++;
+
+                    jobLogger.info('Content item created', {
+                        contentItemId,
+                        idempotencyKey: normalized.idempotencyKey,
+                        type: normalized.type,
+                        status: normalized.status,
+                    });
+
+                    // Enqueue media jobs for VIDEO and PODCAST
+                    if (normalized.type === 'VIDEO' || normalized.type === 'PODCAST') {
+                        const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
+
+                        if (mediaQueue) {
+                            await mediaQueue.add(
+                                `media-${normalized.type}-${contentItemId}`,
+                                {
+                                    contentItemId,
+                                    contentType: normalized.type,
+                                    sourceUrl: normalized.originalUrl,
+                                    operations: ['download', 'transcode', 'thumbnail'],
+                                },
+                                {
+                                    priority: normalized.type === 'VIDEO' ? 2 : 3,
+                                }
+                            );
+
+                            mediaEnqueued++;
+                            jobLogger.debug('Enqueued media job', { contentItemId, type: normalized.type });
+                        }
+                    }
+                } else {
+                    duplicates++;
+                }
+            } catch (error) {
+                failed++;
+                jobLogger.error('Failed to process item', error, {
+                    externalId: rawItem.externalId,
+                });
+            }
+        }
+
+        jobLogger.info('Normalize job completed', {
             sourceId,
             sourceType,
+            processed,
+            duplicates,
+            failed,
+            mediaEnqueued,
         });
     },
 });

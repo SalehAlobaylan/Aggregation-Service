@@ -7,6 +7,7 @@ import { logger } from '../observability/logger.js';
 import { healthRoutes } from './routes/health.js';
 import { readyRoutes } from './routes/ready.js';
 import { metricsRoutes } from './routes/metrics.js';
+import { adminRoutes } from './routes/admin.js';
 
 let server: FastifyInstance | null = null;
 
@@ -30,8 +31,9 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     await fastify.register(healthRoutes);
     await fastify.register(readyRoutes);
     await fastify.register(metricsRoutes);
+    await fastify.register(adminRoutes);
 
-    logger.info('Routes registered: /health, /ready, /metrics');
+    logger.info('Routes registered: /health, /ready, /metrics, /admin/*');
 }
 
 /**
