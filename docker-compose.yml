@@ -1,0 +1,55 @@
+services:
+  aggregation:
+    build: .
+    container_name: aggregation-service
+    environment:
+      - CMS_BASE_URL=http://host.docker.internal:3000/internal
+      - CMS_SERVICE_TOKEN=dev-service-token
+      - REDIS_URL=redis://redis:6379
+      - STORAGE_BASE_URL=http://minio:9000
+      - STORAGE_BUCKET=turfa-media
+      - WORKER_CONCURRENCY=5
+      - LOG_LEVEL=info
+      - METRICS_PORT=3001
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./config:/config:ro
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: aggregation-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio
+    container_name: aggregation-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  minio-data:
