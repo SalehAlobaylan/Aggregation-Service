@@ -4,6 +4,7 @@
  */
 import { getRedisConnection } from '../queues/redis.js';
 import { logger } from '../observability/logger.js';
+import { rateLimitHits } from '../observability/metrics.js';
 
 const RATE_LIMIT_PREFIX = 'ratelimit:';
 
@@ -12,14 +13,46 @@ export interface RateLimitConfig {
     windowMs: number;
 }
 
-// Default rate limits per source type
-export const DEFAULT_RATE_LIMITS: Record<string, RateLimitConfig> = {
-    RSS: { maxRequests: 60, windowMs: 60000 },         // 60/min
-    YOUTUBE: { maxRequests: 100, windowMs: 60000 },   // 100/min (API quota managed separately)
-    PODCAST: { maxRequests: 60, windowMs: 60000 },    // 60/min
-    REDDIT: { maxRequests: 60, windowMs: 60000 },     // 60/min (OAuth limit)
-    TWITTER: { maxRequests: 100, windowMs: 3600000 }, // 100/hour (conservative scraping)
-};
+// Build rate limits from environment variables with defaults
+function buildRateLimits(): Record<string, RateLimitConfig> {
+    const windowMs = parseInt(process.env['RATE_LIMIT_WINDOW_MS'] || '60000');
+
+    return {
+        RSS: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_RSS'] || '60'),
+            windowMs,
+        },
+        YOUTUBE: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_YOUTUBE'] || '100'),
+            windowMs,
+        },
+        PODCAST: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_PODCAST'] || '60'),
+            windowMs,
+        },
+        REDDIT: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_REDDIT'] || '60'),
+            windowMs,
+        },
+        TWITTER: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_TWITTER'] || '100'),
+            windowMs: parseInt(process.env['RATE_LIMIT_WINDOW_MS_TWITTER'] || '3600000'), // 1 hour for scraping
+        },
+        ITUNES: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_ITUNES'] || '20'),
+            windowMs,
+        },
+    };
+}
+
+// Lazy initialization of rate limits
+let _rateLimits: Record<string, RateLimitConfig> | null = null;
+function getRateLimits(): Record<string, RateLimitConfig> {
+    if (!_rateLimits) {
+        _rateLimits = buildRateLimits();
+    }
+    return _rateLimits;
+}
 
 /**
  * Check if request is allowed under rate limit
@@ -28,7 +61,8 @@ export async function checkRateLimit(
     sourceType: string,
     sourceId?: string
 ): Promise<{ allowed: boolean; remaining: number; resetMs: number }> {
-    const config = DEFAULT_RATE_LIMITS[sourceType] || DEFAULT_RATE_LIMITS.RSS;
+    const limits = getRateLimits();
+    const config = limits[sourceType] || limits.RSS;
     const key = `${RATE_LIMIT_PREFIX}${sourceType}:${sourceId || 'default'}`;
     const now = Date.now();
     const windowStart = now - config.windowMs;
@@ -48,7 +82,10 @@ export async function checkRateLimit(
             ? parseInt(oldest[1]) + config.windowMs - now
             : config.windowMs;
 
-        logger.warn('Rate limit exceeded', { sourceType, sourceId, currentCount });
+        // Record metrics
+        rateLimitHits.inc({ source_type: sourceType, source_id: sourceId || 'default' });
+
+        logger.warn('Rate limit exceeded', { sourceType, sourceId, currentCount, maxRequests: config.maxRequests });
         return { allowed: false, remaining: 0, resetMs };
     }
 
@@ -66,7 +103,8 @@ export async function recordRequest(
     sourceType: string,
     sourceId?: string
 ): Promise<void> {
-    const config = DEFAULT_RATE_LIMITS[sourceType] || DEFAULT_RATE_LIMITS.RSS;
+    const limits = getRateLimits();
+    const config = limits[sourceType] || limits.RSS;
     const key = `${RATE_LIMIT_PREFIX}${sourceType}:${sourceId || 'default'}`;
     const now = Date.now();
 
@@ -95,9 +133,35 @@ export async function consumeRateLimit(
     return result;
 }
 
+/**
+ * Get current rate limit status (for admin inspection)
+ */
+export async function getRateLimitStatus(
+    sourceType: string,
+    sourceId?: string
+): Promise<{ current: number; max: number; remaining: number; windowMs: number }> {
+    const limits = getRateLimits();
+    const config = limits[sourceType] || limits.RSS;
+    const key = `${RATE_LIMIT_PREFIX}${sourceType}:${sourceId || 'default'}`;
+    const now = Date.now();
+    const windowStart = now - config.windowMs;
+
+    const redis = getRedisConnection();
+    await redis.zremrangebyscore(key, '-inf', windowStart);
+    const current = await redis.zcard(key);
+
+    return {
+        current,
+        max: config.maxRequests,
+        remaining: Math.max(0, config.maxRequests - current),
+        windowMs: config.windowMs,
+    };
+}
+
 export const rateLimiter = {
     checkRateLimit,
     recordRequest,
     consumeRateLimit,
-    DEFAULT_RATE_LIMITS,
+    getRateLimitStatus,
+    getRateLimits,
 };

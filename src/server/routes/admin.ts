@@ -4,6 +4,8 @@
 import { FastifyInstance } from 'fastify';
 import { scheduler } from '../../services/scheduler.service.js';
 import { getQueue, QUEUE_NAMES } from '../../queues/index.js';
+import { rateLimiter } from '../../services/rate-limiter.js';
+import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
 import type { SourceType } from '../../queues/schemas.js';
 
@@ -27,6 +29,19 @@ interface QueueStatsResponse {
     completed: number;
     failed: number;
     delayed: number;
+}
+
+interface JobResponse {
+    id: string;
+    name: string;
+    data: unknown;
+    state: string;
+    progress: unknown;
+    attemptsMade: number;
+    failedReason?: string;
+    processedOn?: number;
+    finishedOn?: number;
+    timestamp: number;
 }
 
 export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
@@ -183,7 +198,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     );
 
     /**
-     * Get queue statistics
+     * Get all queue statistics
      * GET /admin/queues
      */
     fastify.get<{ Reply: QueueStatsResponse[] }>(
@@ -212,6 +227,102 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     );
 
     /**
+     * Get specific queue statistics
+     * GET /admin/queues/:name/stats
+     */
+    fastify.get<{ Params: { name: string }; Reply: QueueStatsResponse | { error: string } }>(
+        '/admin/queues/:name/stats',
+        async (request, reply) => {
+            const { name } = request.params;
+            const queue = getQueue(name as any);
+
+            if (!queue) {
+                return reply.status(404).send({ error: `Queue '${name}' not found` });
+            }
+
+            const counts = await queue.getJobCounts();
+
+            return reply.send({
+                queue: name,
+                waiting: counts.waiting || 0,
+                active: counts.active || 0,
+                completed: counts.completed || 0,
+                failed: counts.failed || 0,
+                delayed: counts.delayed || 0,
+            });
+        }
+    );
+
+    /**
+     * Get job by ID from any queue
+     * GET /admin/jobs/:id
+     */
+    fastify.get<{ Params: { id: string }; Querystring: { queue?: string }; Reply: JobResponse | { error: string } }>(
+        '/admin/jobs/:id',
+        async (request, reply) => {
+            const { id } = request.params;
+            const { queue: queueName } = request.query;
+
+            // If queue specified, search that queue only
+            const queuesToSearch = queueName
+                ? [queueName]
+                : Object.values(QUEUE_NAMES);
+
+            for (const qName of queuesToSearch) {
+                const queue = getQueue(qName as any);
+                if (!queue) continue;
+
+                const job = await queue.getJob(id);
+                if (job) {
+                    const state = await job.getState();
+                    return reply.send({
+                        id: job.id || id,
+                        name: job.name,
+                        data: job.data,
+                        state,
+                        progress: job.progress,
+                        attemptsMade: job.attemptsMade,
+                        failedReason: job.failedReason,
+                        processedOn: job.processedOn,
+                        finishedOn: job.finishedOn,
+                        timestamp: job.timestamp,
+                    });
+                }
+            }
+
+            return reply.status(404).send({ error: `Job '${id}' not found` });
+        }
+    );
+
+    /**
+     * Get rate limit status
+     * GET /admin/ratelimits/:sourceType
+     */
+    fastify.get<{ Params: { sourceType: string }; Querystring: { sourceId?: string } }>(
+        '/admin/ratelimits/:sourceType',
+        async (request, reply) => {
+            const { sourceType } = request.params;
+            const { sourceId } = request.query;
+
+            const status = await rateLimiter.getRateLimitStatus(sourceType, sourceId);
+            return reply.send({
+                sourceType,
+                sourceId: sourceId || 'default',
+                ...status,
+            });
+        }
+    );
+
+    /**
+     * Get all rate limit configurations
+     * GET /admin/ratelimits
+     */
+    fastify.get('/admin/ratelimits', async (_request, reply) => {
+        const limits = rateLimiter.getRateLimits();
+        return reply.send(limits);
+    });
+
+    /**
      * Get scheduled jobs
      * GET /admin/scheduled
      */
@@ -219,4 +330,31 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         const jobs = await scheduler.getScheduledJobs();
         return reply.send(jobs);
     });
+
+    /**
+     * Search iTunes for podcasts
+     * GET /admin/itunes/search
+     */
+    fastify.get<{ Querystring: { term: string; limit?: number; country?: string } }>(
+        '/admin/itunes/search',
+        async (request, reply) => {
+            const { term, limit, country } = request.query;
+
+            if (!term) {
+                return reply.status(400).send({ error: 'term query parameter is required' });
+            }
+
+            if (!itunesSearch.isEnabled()) {
+                return reply.status(503).send({ error: 'iTunes Search is disabled' });
+            }
+
+            try {
+                const result = await itunesSearch.searchPodcasts(term, limit || 25, country || 'US');
+                return reply.send(result);
+            } catch (error) {
+                logger.error('iTunes search endpoint error', error);
+                return reply.status(500).send({ error: 'iTunes search failed' });
+            }
+        }
+    );
 }

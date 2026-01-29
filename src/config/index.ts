@@ -62,6 +62,12 @@ const configSchema = z.object({
 
     // Optional - Twitter API
     twitterBearerToken: z.string().nullable().default(null),
+
+    // Optional - iTunes Search
+    enableItunesSearch: z.preprocess(
+        (val) => val === undefined ? true : val,
+        z.coerce.boolean().default(true)
+    ),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -108,6 +114,8 @@ function mapEnvToConfig(): Record<string, unknown> {
         redditPassword: process.env.REDDIT_PASSWORD || null,
 
         twitterBearerToken: process.env.TWITTER_BEARER_TOKEN || null,
+
+        enableItunesSearch: process.env.ENABLE_ITUNES_SEARCH,
     };
 }
 
