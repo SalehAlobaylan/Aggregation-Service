@@ -400,12 +400,7 @@ Because Platform Console runs on Vercel (different origin), CRM must:
 
 ### CRM (database)
 
-- `DB_HOST`
-- `DB_PORT`
-- `DB_NAME`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_SSLMODE` (e.g., `disable` for local compose)
+- `DATABASE_URL` - PostgreSQL connection URL (format: `postgres://user:password@host:port/dbname?sslmode=mode`)
 
 ### Platform Console
 

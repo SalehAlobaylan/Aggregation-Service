@@ -57,6 +57,8 @@ Router structure:
 
 ## 4) Database schema & migrations
 
+The CMS shares the `turfa_platform` PostgreSQL database with CRM. Table names across CMS and CRM are distinct to avoid conflicts.
+
 The repository uses two schema layers:
 
 1. SQL migrations for the original CMS tables (src/migrations):
