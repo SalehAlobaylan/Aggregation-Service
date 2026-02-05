@@ -1,10 +1,10 @@
-# Turfa — LLM Context Requirements (for AI Agents)
+# Wahb — LLM Context Requirements (for AI Agents)
 
-This document defines the core rules and system constraints that AI agents must follow when working across the Turfa platform. It consolidates the service boundaries, data contracts, and pipeline expectations from the full context set.
+This document defines the core rules and system constraints that AI agents must follow when working across the Wahb platform. It consolidates the service boundaries, data contracts, and pipeline expectations from the full context set.
 
 ## 1) System definitions
 
-Turfa is a social app with two feeds:
+Wahb is a social app with two feeds:
 
 - For You: audio/video cards (full-screen MP4).
 - News: editorial slides (1 featured item + 3 related items).

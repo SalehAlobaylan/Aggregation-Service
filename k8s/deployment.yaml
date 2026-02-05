@@ -102,7 +102,7 @@ spec:
             failureThreshold: 3
           volumeMounts:
             - name: media-temp
-              mountPath: /tmp/turfa-media
+              mountPath: /tmp/wahb-media
             - name: config
               mountPath: /config
               readOnly: true
@@ -138,5 +138,5 @@ data:
   CMS_BASE_URL: "http://cms-service.default.svc.cluster.local/internal"
   REDIS_URL: "redis://redis-master.default.svc.cluster.local:6379"
   STORAGE_ENDPOINT: "https://your-storage.supabase.co/storage/v1"
-  STORAGE_BUCKET: "turfa-media"
+  STORAGE_BUCKET: "wahb-media"
   WHISPER_API_URL: "http://whisper-service.default.svc.cluster.local:9000"

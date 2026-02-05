@@ -1,4 +1,4 @@
-# Operational Runbook: Turfa Aggregation Service
+# Operational Runbook: Wahb Aggregation Service
 
 This runbook provides operational procedures for the Aggregation Service.
 
@@ -243,7 +243,7 @@ docker compose logs cms
 ```bash
 # Check MinIO/S3 connectivity
 mc alias set local http://localhost:9000 minioadmin minioadmin
-mc ls local/turfa-media
+mc ls local/wahb-media
 
 # Check storage circuit breaker
 curl -s http://localhost:3001/metrics | grep 'circuit_state.*storage'

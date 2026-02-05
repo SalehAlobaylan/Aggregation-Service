@@ -206,7 +206,7 @@ export async function downloadHttp(
 
     const response = await fetch(url, {
         headers: {
-            'User-Agent': 'TurfaBot/1.0 (Media Download)',
+            'User-Agent': 'WahbBot/1.0 (Media Download)',
         },
     });
 

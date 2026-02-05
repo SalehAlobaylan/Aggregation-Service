@@ -1,10 +1,10 @@
-# Turfa Platform — Complete Context & Requirements (formerly “Lumen Platform”)
+# Wahb Platform — Complete Context & Requirements (formerly “Wahb Platform”)
 
-This document consolidates product requirements, architecture, and the current frontend implementation under src. It integrates the context files in contex and the project docs to provide a complete, implementation-aware description of the Turfa (formerly Lumen) platform.
+This document consolidates product requirements, architecture, and the current frontend implementation under src. It integrates the context files in contex and the project docs to provide a complete, implementation-aware description of the Wahb platform.
 
 ## 1) Executive Summary
 
-Turfa is a mobile-first social platform built around dual-mode discovery:
+Wahb is a mobile-first social platform built around dual-mode discovery:
 
 - **For You feed:** TikTok-style full-screen, snap-scrolling audio/video cards.
 - **News feed:** Magazine-style slides with 1 featured article and 3 related items.
@@ -33,7 +33,7 @@ The core interaction model includes like, bookmark, share, view tracking via Int
 
 ## 3) System Architecture (System Location)
 
-Turfa is split into three runtime domains with strict boundaries:
+Wahb is split into three runtime domains with strict boundaries:
 
 1. **Frontend Web App (Next.js)**
    - Mobile-first UI with App Router.

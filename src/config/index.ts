@@ -28,7 +28,7 @@ const configSchema = z.object({
     whisperApiUrl: urlSchema.default('http://whisper:9000'),
 
     // Media Processing
-    mediaTempDir: z.string().default('/tmp/turfa-media'),
+    mediaTempDir: z.string().default('/tmp/wahb-media'),
 
     // Worker Configuration
     workerConcurrency: positiveIntSchema.default(5),

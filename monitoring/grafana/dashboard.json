@@ -440,7 +440,7 @@
     "style": "dark",
     "tags": [
         "aggregation",
-        "turfa"
+        "wahb"
     ],
     "templating": {
         "list": []
@@ -451,7 +451,7 @@
     },
     "timepicker": {},
     "timezone": "browser",
-    "title": "Turfa Aggregation Service",
-    "uid": "turfa-aggregation",
+    "title": "Wahb Aggregation Service",
+    "uid": "wahb-aggregation",
     "version": 1
 }

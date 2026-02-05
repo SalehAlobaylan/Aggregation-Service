@@ -82,7 +82,7 @@ async function getAccessToken(): Promise<string> {
         headers: {
             'Authorization': `Basic ${auth}`,
             'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'TurfaBot/1.0',
+            'User-Agent': 'WahbBot/1.0',
         },
         body,
     });
@@ -114,7 +114,7 @@ async function fetchParentContext(
         const response = await fetch(`${REDDIT_API_BASE}/r/${subreddit}/comments/${postId}?depth=1&limit=1`, {
             headers: {
                 'Authorization': `Bearer ${accessToken}`,
-                'User-Agent': 'TurfaBot/1.0',
+                'User-Agent': 'WahbBot/1.0',
             },
         });
 
@@ -171,7 +171,7 @@ export const redditFetcher: Fetcher = {
             const response = await fetch(url.toString(), {
                 headers: {
                     'Authorization': `Bearer ${accessToken}`,
-                    'User-Agent': 'TurfaBot/1.0',
+                    'User-Agent': 'WahbBot/1.0',
                 },
             });
 

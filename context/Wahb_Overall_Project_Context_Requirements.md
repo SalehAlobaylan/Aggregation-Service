@@ -1,10 +1,10 @@
-# Turfa — Overall Project Context & Requirements
+# Wahb — Overall Project Context & Requirements
 
-This document consolidates the product, system architecture, and service boundaries for Turfa. It incorporates the PRD and the platform/service requirements for the CMS, Aggregation Service, and Platform Console.
+This document consolidates the product, system architecture, and service boundaries for Wahb. It incorporates the PRD and the platform/service requirements for the CMS, Aggregation Service, and Platform Console.
 
 ## 1) Executive summary
 
-Turfa is a mobile-first social platform that merges an audio-first “For You” feed with a magazine-style “News” feed, consumed via TikTok-style vertical snap scrolling. The product’s core innovation is “dual-mode discovery,” where users switch between immersive audio entertainment and premium journalism in one app.
+Wahb is a mobile-first social platform that merges an audio-first “For You” feed with a magazine-style “News” feed, consumed via TikTok-style vertical snap scrolling. The product’s core innovation is “dual-mode discovery,” where users switch between immersive audio entertainment and premium journalism in one app.
 
 Core value proposition:
 
@@ -14,7 +14,7 @@ Core value proposition:
 
 ## 2) Core feeds & UX constraints
 
-Turfa has two feeds:
+Wahb has two feeds:
 
 1. For You (audio-first)
 
@@ -32,7 +32,7 @@ Interaction model (MVP): like, bookmark, share, view, complete. Views are tracke
 
 ## 3) System architecture & boundaries
 
-Turfa is split into three runtime domains with strict boundaries:
+Wahb is split into three runtime domains with strict boundaries:
 
 1. CMS / Feed Service (Go)
 

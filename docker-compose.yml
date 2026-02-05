@@ -10,12 +10,12 @@ services:
       - CMS_SERVICE_TOKEN=dev-service-token
       - REDIS_URL=redis://redis:6379
       - STORAGE_ENDPOINT=http://minio:9000
-      - STORAGE_BUCKET=turfa-media
+      - STORAGE_BUCKET=wahb-media
       - STORAGE_ACCESS_KEY=minioadmin
       - STORAGE_SECRET_KEY=minioadmin
       - STORAGE_PUBLIC_URL=http://localhost:9000
       - WHISPER_API_URL=http://whisper:9000
-      - MEDIA_TEMP_DIR=/tmp/turfa-media
+      - MEDIA_TEMP_DIR=/tmp/wahb-media
       - WORKER_CONCURRENCY=5
       - LOG_LEVEL=info
       - METRICS_PORT=3001
@@ -32,7 +32,7 @@ services:
       - "3001:3001"
     volumes:
       - ./config:/config:ro
-      - media-temp:/tmp/turfa-media
+      - media-temp:/tmp/wahb-media
     restart: unless-stopped
 
   redis:
@@ -72,8 +72,8 @@ services:
       /bin/sh -c "
       sleep 5;
       mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb local/turfa-media --ignore-existing;
-      mc anonymous set public local/turfa-media;
+      mc mb local/wahb-media --ignore-existing;
+      mc anonymous set public local/wahb-media;
       exit 0;
       "
 

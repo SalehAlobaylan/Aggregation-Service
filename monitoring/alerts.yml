@@ -1,4 +1,4 @@
-# Prometheus Alert Rules for Turfa Aggregation Service
+# Prometheus Alert Rules for Wahb Aggregation Service
 groups:
   - name: aggregation.rules
     interval: 30s
