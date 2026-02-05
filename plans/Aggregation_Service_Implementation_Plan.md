@@ -1,4 +1,4 @@
-# Turfa — Aggregation Service Implementation Plan
+# Wahb — Aggregation Service Implementation Plan
 
 **Version:** 1.0  
 **Date:** January 25, 2026  
@@ -25,7 +25,7 @@
 
 ### 1.1 Service Purpose
 
-The Aggregation Service is the **asynchronous content ingestion and processing pipeline** for the Turfa platform. It is a **worker-first system** that:
+The Aggregation Service is the **asynchronous content ingestion and processing pipeline** for the Wahb platform. It is a **worker-first system** that:
 
 - Ingests content from external sources (RSS, YouTube, Podcasts, X/Twitter, Reddit, manual uploads)
 - Processes media (download, transcode to MP4)
@@ -46,7 +46,7 @@ The Aggregation Service is the **asynchronous content ingestion and processing p
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           Turfa Platform                                 │
+│                           Wahb Platform                                 │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │   ┌─────────────────┐      ┌─────────────────┐      ┌───────────────┐  │
@@ -975,11 +975,11 @@ operations:
 
 ```bash
 # Required
-CMS_BASE_URL=https://cms.turfa.app/internal
+CMS_BASE_URL=https://cms.wahb.app/internal
 CMS_SERVICE_TOKEN=<service-token>
 REDIS_URL=redis://localhost:6379
 STORAGE_BASE_URL=https://storage.supabase.co
-STORAGE_BUCKET=turfa-media
+STORAGE_BUCKET=wahb-media
 
 # Optional
 SOURCE_ALLOWLIST_PATH=/config/allowlist.json
@@ -1006,7 +1006,7 @@ services:
       - CMS_SERVICE_TOKEN=dev-token
       - REDIS_URL=redis://redis:6379
       - STORAGE_BASE_URL=http://minio:9000
-      - STORAGE_BUCKET=turfa-media
+      - STORAGE_BUCKET=wahb-media
     depends_on:
       - redis
       - minio

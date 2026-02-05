@@ -1,6 +1,6 @@
-# Turfa — Platform Console Context & Requirements (Admin Dashboard + CRM Frontend)
+# Wahb — Platform Console Context & Requirements (Admin Dashboard + CRM Frontend)
 
-This document defines the Platform Console: the internal admin UI that operates the Turfa platform and integrates with the CRM Service. It consolidates requirements from the platform, CMS, Aggregation, and CRM contexts.
+This document defines the Platform Console: the internal admin UI that operates the Wahb platform and integrates with the CRM Service. It consolidates requirements from the platform, CMS, Aggregation, and CRM contexts.
 
 ## 1) Purpose & positioning
 
@@ -13,7 +13,7 @@ It is a standalone Next.js app (Vercel) that calls backend services over HTTPS. 
 
 ## 2) System context & service boundaries
 
-Turfa’s runtime domains:
+Wahb’s runtime domains:
 
 - CMS / Feed Service (Go): serves public feeds and provides admin endpoints for platform operations.
 - Aggregation Service (Node.js workers): ingests external sources and writes content back via CMS internal APIs.

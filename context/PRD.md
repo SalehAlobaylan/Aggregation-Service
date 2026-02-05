@@ -1,4 +1,4 @@
-# Turfa — Product Requirements Document (PRD)
+# Wahb — Product Requirements Document (PRD)
 
 Version: 1.3
 Last Updated: January 18, 2026
@@ -7,7 +7,7 @@ Platform: Web Application (Mobile-First)
 
 ## 1) Executive summary
 
-Turfa is a mobile-first social platform that merges an audio-first “For You” feed with a magazine-style “News” feed, consumed via TikTok-style vertical snap scrolling. The product’s core innovation is “dual-mode discovery,” where users switch between immersive audio entertainment and premium journalism in one app.
+Wahb is a mobile-first social platform that merges an audio-first “For You” feed with a magazine-style “News” feed, consumed via TikTok-style vertical snap scrolling. The product’s core innovation is “dual-mode discovery,” where users switch between immersive audio entertainment and premium journalism in one app.
 
 Core value proposition:
 
@@ -17,7 +17,7 @@ Core value proposition:
 
 ## 2) Core concept & feeds
 
-Turfa has dual feeds: For You and News.
+Wahb has dual feeds: For You and News.
 
 ### 2.1 For You feed (audio-first)
 
@@ -68,7 +68,7 @@ Ranking combines:
 
 ## 6) System location & service boundaries
 
-This PRD defines the user experience, feed shapes, and MVP outcomes that the Turfa Web App consumes and the backend services produce.
+This PRD defines the user experience, feed shapes, and MVP outcomes that the Wahb Web App consumes and the backend services produce.
 
 Service boundaries (must be respected):
 

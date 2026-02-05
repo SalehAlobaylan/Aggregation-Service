@@ -11,7 +11,7 @@ import type { Fetcher, FetchResult, RawFetchedItem, SourceConfig } from './types
 const parser = new Parser({
     timeout: 20000,
     headers: {
-        'User-Agent': 'TurfaBot/1.0 (Podcast Aggregation)',
+        'User-Agent': 'WahbBot/1.0 (Podcast Aggregation)',
         'Accept': 'application/rss+xml, application/xml, text/xml, */*',
     },
 });

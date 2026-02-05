@@ -79,7 +79,7 @@ export async function searchPodcasts(
         const response = await fetch(url.toString(), {
             headers: {
                 'Accept': 'application/json',
-                'User-Agent': 'TurfaBot/1.0',
+                'User-Agent': 'WahbBot/1.0',
             },
         });
 
@@ -138,7 +138,7 @@ export async function lookupPodcast(collectionId: number): Promise<ItunesPodcast
         const response = await fetch(url, {
             headers: {
                 'Accept': 'application/json',
-                'User-Agent': 'TurfaBot/1.0',
+                'User-Agent': 'WahbBot/1.0',
             },
         });
 

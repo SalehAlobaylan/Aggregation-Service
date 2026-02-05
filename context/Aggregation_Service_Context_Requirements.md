@@ -1,10 +1,10 @@
-# Turfa — Aggregation Service Context & Requirements (Node.js Worker Fleet)
+# Wahb — Aggregation Service Context & Requirements (Node.js Worker Fleet)
 
-This document describes the Aggregation Service in the Turfa platform. It is a worker-first system that ingests content from external sources, processes media, generates transcripts and embeddings, and writes results back via CMS internal APIs. It must never serve user-facing API traffic.
+This document describes the Aggregation Service in the Wahb platform. It is a worker-first system that ingests content from external sources, processes media, generates transcripts and embeddings, and writes results back via CMS internal APIs. It must never serve user-facing API traffic.
 
 ## 1) Service purpose & system location
 
-The Aggregation Service is the asynchronous pipeline for Turfa. It handles ingest, processing, and enrichment for all external sources, and persists outputs so the Go CMS/Feed Service can serve the app. It is the only component allowed to scrape content or run FFmpeg conversions.
+The Aggregation Service is the asynchronous pipeline for Wahb. It handles ingest, processing, and enrichment for all external sources, and persists outputs so the Go CMS/Feed Service can serve the app. It is the only component allowed to scrape content or run FFmpeg conversions.
 
 System boundaries:
 

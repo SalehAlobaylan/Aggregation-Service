@@ -42,14 +42,14 @@ RUN npm ci --only=production
 COPY --from=builder /app/dist ./dist
 
 # Create temp directory for media processing
-RUN mkdir -p /tmp/turfa-media && chmod 777 /tmp/turfa-media
+RUN mkdir -p /tmp/wahb-media && chmod 777 /tmp/wahb-media
 
 # Create non-root user
 RUN groupadd -g 1001 nodejs && \
     useradd -u 1001 -g nodejs -s /bin/bash aggregation
 
 # Change ownership
-RUN chown -R aggregation:nodejs /app /tmp/turfa-media
+RUN chown -R aggregation:nodejs /app /tmp/wahb-media
 
 # Switch to non-root user
 USER aggregation

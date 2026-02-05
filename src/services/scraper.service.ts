@@ -44,7 +44,7 @@ export async function scrapeArticle(
 
         const response = await fetch(url, {
             headers: {
-                'User-Agent': 'TurfaBot/1.0 (Content Aggregation Service)',
+                'User-Agent': 'WahbBot/1.0 (Content Aggregation Service)',
                 'Accept': 'text/html,application/xhtml+xml',
             },
             signal: controller.signal,

@@ -1,10 +1,10 @@
-# Turfa — CMS Context & Requirements (Integrated)
+# Wahb — CMS Context & Requirements (Integrated)
 
-This document describes the Go-based CMS + Feed Service in this repository and how it fits into the wider Turfa platform. It consolidates project context from the context folder and describes every subsystem implemented under src.
+This document describes the Go-based CMS + Feed Service in this repository and how it fits into the wider Wahb platform. It consolidates project context from the context folder and describes every subsystem implemented under src.
 
 ## 1) What “CMS” is in this repo set
 
-The CMS is a Go REST API that provides CRUD for Pages, Posts, and Media and also serves Turfa’s feed APIs and interaction endpoints. It is the primary backend for platform content delivery and the future admin surface. It uses Gin for HTTP routing, GORM for data access, and PostgreSQL with pgvector for similarity search.
+The CMS is a Go REST API that provides CRUD for Pages, Posts, and Media and also serves Wahb’s feed APIs and interaction endpoints. It is the primary backend for platform content delivery and the future admin surface. It uses Gin for HTTP routing, GORM for data access, and PostgreSQL with pgvector for similarity search.
 
 Key responsibilities implemented in this repo:
 
@@ -14,9 +14,9 @@ Key responsibilities implemented in this repo:
 - User interaction endpoints (like, bookmark, view, share, complete) with idempotent handling for like/bookmark.
 - Database setup, migration automation in development, and seeded demo data for the platform feed.
 
-## 2) System location in Turfa
+## 2) System location in Wahb
 
-Turfa has three major runtime domains that share data and contract boundaries:
+Wahb has three major runtime domains that share data and contract boundaries:
 
 1. CMS / Feed Service (this repo)
 
@@ -57,7 +57,7 @@ Router structure:
 
 ## 4) Database schema & migrations
 
-The CMS shares the `turfa_platform` PostgreSQL database with CRM. Table names across CMS and CRM are distinct to avoid conflicts.
+The CMS shares the `wahb_platform` PostgreSQL database with CRM. Table names across CMS and CRM are distinct to avoid conflicts.
 
 The repository uses two schema layers:
 
@@ -213,11 +213,11 @@ Cursor pagination
 Database utilities
 
 - ConnectDB uses DATABASE_URL only and ensures extensions (pgcrypto, vector).
-- AutoMigrate and SeedData/SeedLumenData for development.
+- AutoMigrate and SeedData/SeedWahbData for development.
 
 Seed data for platform
 
-- SeedLumenData generates sample VIDEO/PODCAST, ARTICLE, TWEET, COMMENT content.
+- SeedWahbData generates sample VIDEO/PODCAST, ARTICLE, TWEET, COMMENT content.
 - Embeddings use mocked 384-dimension vectors for development/testing.
 
 Response shapes

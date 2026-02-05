@@ -61,11 +61,11 @@
 
 ## Mandatory Implementation Stack (v1)
 
-# CRM Service Requirements (Platform Console + Turfa Platform Alignment)
+# CRM Service Requirements (Platform Console + Wahb Platform Alignment)
 
 **Target repo:** https://github.com/SalehAlobaylan/CRM-Service
 
-**Goal:** Refactor and scale the CRM Service into a production‑ready, API‑first backend that integrates cleanly with the **Platform Console** (admin dashboard) while honoring the wider Turfa system boundaries and auth model.
+**Goal:** Refactor and scale the CRM Service into a production‑ready, API‑first backend that integrates cleanly with the **Platform Console** (admin dashboard) while honoring the wider Wahb system boundaries and auth model.
 
 This document expands the CRM requirements using the broader platform context (CMS/Feed Service, Aggregation Service, Platform Console). The CRM Service is independent from the content pipeline and remains the canonical system of record for CRM data.
 
@@ -73,7 +73,7 @@ This document expands the CRM requirements using the broader platform context (C
 
 ## 1) System context & boundaries (aligned with platform)
 
-Turfa has three major runtime domains:
+Wahb has three major runtime domains:
 
 1. **CMS / Feed Service (Go)**
    - Serves public feeds and platform content APIs.

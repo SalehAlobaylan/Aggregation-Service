@@ -1,7 +1,7 @@
 {
-  "name": "turfa-aggregation-service",
+  "name": "ggregation-service",
   "version": "1.0.0",
-  "description": "Turfa Aggregation Service - Content ingestion and processing pipeline",
+  "description": "Wahb Aggregation Service - Content ingestion and processing pipeline",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -22,7 +22,7 @@
     "test:ai": "tsx src/scripts/test-ai-job.ts"
   },
   "keywords": [
-    "turfa",
+    "wahb",
     "aggregation",
     "bullmq",
     "fastify"

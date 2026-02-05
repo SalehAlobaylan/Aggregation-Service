@@ -1,4 +1,4 @@
-# Prometheus configuration for Turfa Aggregation Service
+# Prometheus configuration for Wahb Aggregation Service
 global:
   scrape_interval: 15s
   evaluation_interval: 15s

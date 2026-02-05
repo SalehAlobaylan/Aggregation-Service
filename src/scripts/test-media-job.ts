@@ -102,7 +102,7 @@ Monitor progress with:
 
 Check MinIO console:
   http://localhost:9001 (minioadmin/minioadmin)
-  Look for: turfa-media/content/${contentItemId}/
+  Look for: wahb-media/content/${contentItemId}/
 `);
 
         // Wait a moment for the job to be persisted
