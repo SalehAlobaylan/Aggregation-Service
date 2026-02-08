@@ -9,16 +9,21 @@ import type { Fetcher, FetchResult, SourceConfig } from './types.js';
 import { rssFetcher } from './rss.fetcher.js';
 import { youtubeFetcher } from './youtube.fetcher.js';
 import { podcastFetcher } from './podcast.fetcher.js';
+import { itunesFetcher } from './itunes.fetcher.js';
 import { redditFetcher } from './reddit.fetcher.js';
 import { twitterFetcher } from './twitter.fetcher.js';
+import { manualFetcher } from './manual.fetcher.js';
 
 // Register all fetchers
 const fetchers: Map<SourceType, Fetcher> = new Map([
     ['RSS', rssFetcher],
     ['YOUTUBE', youtubeFetcher],
     ['PODCAST', podcastFetcher],
+    ['PODCAST_DISCOVERY', itunesFetcher],
     ['REDDIT', redditFetcher],
     ['TWITTER', twitterFetcher],
+    ['UPLOAD', manualFetcher],
+    ['MANUAL', manualFetcher],
 ]);
 
 /**

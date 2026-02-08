@@ -27,6 +27,7 @@ export const normalizeWorker = createWorker({
         let duplicates = 0;
         let failed = 0;
         let mediaEnqueued = 0;
+        let aiEnqueued = 0;
 
         for (const rawItem of rawItems || []) {
             try {
@@ -66,24 +67,56 @@ export const normalizeWorker = createWorker({
 
                     // Enqueue media jobs for VIDEO and PODCAST
                     if (normalized.type === 'VIDEO' || normalized.type === 'PODCAST') {
-                        const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
+                        const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady);
+                        const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
 
-                        if (mediaQueue) {
-                            await mediaQueue.add(
-                                `media-${normalized.type}-${contentItemId}`,
-                                {
+                        if (mediaReady && normalized.mediaUrl) {
+                            const aiQueue = getQueue(QUEUE_NAMES.AI);
+                            if (aiQueue) {
+                                await aiQueue.add(
+                                    `ai-manual-${normalized.type}-${contentItemId}`,
+                                    {
+                                        contentItemId,
+                                        contentType: normalized.type,
+                                        operations: ['transcript', 'embedding'],
+                                        textContent: {
+                                            title: normalized.title,
+                                            excerpt: normalized.excerpt || undefined,
+                                            bodyText: normalized.bodyText || undefined,
+                                        },
+                                        mediaUrl: normalized.mediaUrl,
+                                    },
+                                    {
+                                        priority: 2,
+                                    }
+                                );
+
+                                aiEnqueued++;
+                                jobLogger.debug('Enqueued AI job (manual media ready)', {
                                     contentItemId,
-                                    contentType: normalized.type,
-                                    sourceUrl: normalized.originalUrl,
-                                    operations: ['download', 'transcode', 'thumbnail'],
-                                },
-                                {
-                                    priority: normalized.type === 'VIDEO' ? 2 : 3,
-                                }
-                            );
+                                    type: normalized.type,
+                                });
+                            }
+                        } else {
+                            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
 
-                            mediaEnqueued++;
-                            jobLogger.debug('Enqueued media job', { contentItemId, type: normalized.type });
+                            if (mediaQueue) {
+                                await mediaQueue.add(
+                                    `media-${normalized.type}-${contentItemId}`,
+                                    {
+                                        contentItemId,
+                                        contentType: normalized.type,
+                                        sourceUrl,
+                                        operations: ['download', 'transcode', 'thumbnail'],
+                                    },
+                                    {
+                                        priority: normalized.type === 'VIDEO' ? 2 : 3,
+                                    }
+                                );
+
+                                mediaEnqueued++;
+                                jobLogger.debug('Enqueued media job', { contentItemId, type: normalized.type });
+                            }
                         }
                     }
                 } else {
@@ -104,6 +137,7 @@ export const normalizeWorker = createWorker({
             duplicates,
             failed,
             mediaEnqueued,
+            aiEnqueued,
         });
     },
 });

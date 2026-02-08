@@ -2,6 +2,7 @@
  * Configuration module with Zod schema validation
  * Fail-fast with actionable error messages
  */
+import 'dotenv/config';
 import { z } from 'zod';
 
 // Custom validators
@@ -36,7 +37,7 @@ const configSchema = z.object({
 
     // Logging & Metrics
     logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-    metricsPort: portSchema.default(3001),
+    metricsPort: portSchema.default(5002),
 
     // Circuit Breaker Tuning
     cbFailureThreshold: positiveIntSchema.default(5),

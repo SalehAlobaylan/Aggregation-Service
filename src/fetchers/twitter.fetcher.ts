@@ -16,31 +16,14 @@ interface TwitterAdapter {
 }
 
 /**
- * Scraping adapter - uses web scraping with strict rate limits
- * NOTE: Actual Puppeteer implementation should be added for production
- * This is a placeholder that demonstrates the interface
+ * Scraping adapter - intentionally disabled (API-only mode)
+ * NOTE: Scrape mode is not supported in v1
  */
 const scrapeAdapter: TwitterAdapter = {
     mode: 'scrape',
 
     async fetch(config: TwitterSourceConfig, _cursor?: string): Promise<FetchResult> {
-        // Check strict rate limit for scraping (100/hour)
-        const rateCheck = await rateLimiter.consumeRateLimit('TWITTER', config.id);
-        if (!rateCheck.allowed) {
-            logger.warn('Twitter scrape rate limit exceeded', {
-                sourceId: config.id,
-                resetMs: rateCheck.resetMs
-            });
-            return {
-                items: [],
-                hasMore: false,
-                metadata: { totalFetched: 0, skipped: 0, errors: 0 },
-            };
-        }
-
-        // TODO: Implement actual Puppeteer-based scraping
-        // For Phase 2, this is a placeholder that logs the intent
-        logger.warn('Twitter scraping mode not fully implemented', {
+        logger.error('Twitter scrape mode is disabled; use API mode', {
             sourceId: config.id,
             searchQuery: config.settings.searchQuery,
             userId: config.settings.userId,
@@ -50,7 +33,7 @@ const scrapeAdapter: TwitterAdapter = {
         return {
             items: [],
             hasMore: false,
-            metadata: { totalFetched: 0, skipped: 0, errors: 0 },
+            metadata: { totalFetched: 0, skipped: 0, errors: 1 },
         };
     },
 };
@@ -199,7 +182,7 @@ export const twitterFetcher: Fetcher = {
 
     async fetch(config: SourceConfig, cursor?: string): Promise<FetchResult> {
         const twitterConfig = config as TwitterSourceConfig;
-        const mode = twitterConfig.settings.mode || 'scrape';
+        const mode = twitterConfig.settings.mode || 'api';
 
         const adapter = mode === 'api' ? apiAdapter : scrapeAdapter;
 

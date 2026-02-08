@@ -56,7 +56,8 @@ export const mediaWorker = createWorker({
                 jobLogger.info('Content already processed, skipping', { contentItemId });
 
                 // Still enqueue AI job if needed
-                await enqueueAIJob(job, contentItemId, contentType, processedKey);
+                const publicUrl = getPublicUrl(processedKey);
+                await enqueueAIJob(job, contentItemId, contentType, undefined, publicUrl);
                 return;
             }
 
@@ -184,7 +185,8 @@ async function enqueueAIJob(
     job: Job<MediaJob>,
     contentItemId: string,
     contentType: string,
-    mediaPath: string
+    mediaPath?: string,
+    mediaUrl?: string
 ): Promise<void> {
     const aiQueue = getQueue(QUEUE_NAMES.AI);
     if (!aiQueue) {
@@ -202,6 +204,7 @@ async function enqueueAIJob(
                 title: '', // Will be fetched from CMS if needed
             },
             mediaPath,
+            mediaUrl,
         },
         {
             priority: 2,

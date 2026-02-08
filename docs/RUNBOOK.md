@@ -33,7 +33,7 @@ cp .env.example .env
 docker compose up -d
 
 # 4. Verify readiness
-curl http://localhost:3001/ready
+curl http://localhost:5002/ready
 ```
 
 ### With Monitoring Stack
@@ -42,7 +42,7 @@ curl http://localhost:3001/ready
 docker compose --profile monitoring up -d
 
 # Access:
-# - Metrics: http://localhost:3001/metrics
+# - Metrics: http://localhost:5002/metrics
 # - Prometheus: http://localhost:9090
 # - Grafana: http://localhost:3002 (admin/admin)
 ```
@@ -81,7 +81,7 @@ kubectl logs -l app=aggregation-service --tail=50
 
 ```bash
 # Check readiness with curl
-curl -s http://localhost:3001/ready | jq
+curl -s http://localhost:5002/ready | jq
 
 # Expected:
 # {
@@ -132,7 +132,7 @@ LLEN bull:fetch:active
 
 ```bash
 # Queue depth metric
-curl -s http://localhost:3001/metrics | grep aggregation_queue_depth
+curl -s http://localhost:5002/metrics | grep aggregation_queue_depth
 ```
 
 ### Pausing/Resuming Queues
@@ -159,7 +159,7 @@ docker compose exec redis redis-cli
 LLEN bull:dlq:wait
 
 # Prometheus
-curl -s http://localhost:3001/metrics | grep aggregation_dlq_size
+curl -s http://localhost:5002/metrics | grep aggregation_dlq_size
 ```
 
 ### Inspecting DLQ Jobs
@@ -217,7 +217,7 @@ for (const job of jobs) {
 **Diagnosis:**
 ```bash
 # Check circuit breaker state
-curl -s http://localhost:3001/metrics | grep 'circuit_state.*cms'
+curl -s http://localhost:5002/metrics | grep 'circuit_state.*cms'
 
 # Check CMS logs
 docker compose logs cms
@@ -246,7 +246,7 @@ mc alias set local http://localhost:9000 minioadmin minioadmin
 mc ls local/wahb-media
 
 # Check storage circuit breaker
-curl -s http://localhost:3001/metrics | grep 'circuit_state.*storage'
+curl -s http://localhost:5002/metrics | grep 'circuit_state.*storage'
 ```
 
 **Resolution:**

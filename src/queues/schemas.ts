@@ -3,7 +3,15 @@
  */
 
 // Source types
-export type SourceType = 'RSS' | 'YOUTUBE' | 'PODCAST' | 'TWITTER' | 'REDDIT' | 'UPLOAD' | 'MANUAL';
+export type SourceType =
+    'RSS'
+    | 'YOUTUBE'
+    | 'PODCAST'
+    | 'PODCAST_DISCOVERY'
+    | 'TWITTER'
+    | 'REDDIT'
+    | 'UPLOAD'
+    | 'MANUAL';
 
 // Content types
 export type ContentType = 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
@@ -61,6 +69,7 @@ export interface AIJob {
         bodyText?: string;
     };
     mediaPath?: string; // For transcript generation
+    mediaUrl?: string;  // For transcript generation via remote URL
 }
 
 /**

@@ -12,6 +12,7 @@ const DEFAULT_POLL_INTERVALS: Record<SourceType, number> = {
     RSS: 900000,      // 15 minutes
     YOUTUBE: 3600000, // 1 hour (conserve quota)
     PODCAST: 3600000, // 1 hour
+    PODCAST_DISCOVERY: 86400000, // 24 hours (discovery is slower cadence)
     REDDIT: 600000,   // 10 minutes
     TWITTER: 1800000, // 30 minutes
     UPLOAD: 0,        // Never poll (manual only)
