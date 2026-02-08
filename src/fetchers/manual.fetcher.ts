@@ -3,7 +3,7 @@
  * Treats provided payload as already-fetched content
  */
 import { logger } from '../observability/logger.js';
-import type { Fetcher, FetchResult, RawFetchedItem, ManualSourceConfig, SourceConfig } from './types.js';
+import type { Fetcher, FetchResult, RawFetchedItem, ManualPayload, ManualSourceConfig, SourceConfig } from './types.js';
 
 function buildFallbackUrl(externalId: string): string {
     return `https://manual.wahb.local/${encodeURIComponent(externalId)}`;
@@ -14,13 +14,26 @@ export const manualFetcher: Fetcher = {
 
     async fetch(config: SourceConfig): Promise<FetchResult> {
         const manualConfig = config as ManualSourceConfig;
-        const payload = manualConfig.settings?.payload || manualConfig.settings || {};
+        const payload: ManualPayload = manualConfig.settings?.payload || {} as ManualPayload;
 
         if (!payload.contentType || !payload.title) {
             logger.warn('Manual fetcher missing required payload fields', {
                 sourceId: config.id,
-                hasContentType: !!payload.contentType,
-                hasTitle: !!payload.title,
+                hasContentType: !!(payload as ManualPayload).contentType,
+                hasTitle: !!(payload as ManualPayload).title,
+            });
+            return {
+                items: [],
+                hasMore: false,
+                metadata: { totalFetched: 0, skipped: 1, errors: 1 },
+            };
+        }
+
+        if (!payload.contentType || !payload.title) {
+            logger.warn('Manual fetcher missing required payload fields', {
+                sourceId: config.id,
+                hasContentType: !!(payload as ManualPayload).contentType,
+                hasTitle: !!(payload as ManualPayload).title,
             });
             return {
                 items: [],
@@ -31,35 +44,34 @@ export const manualFetcher: Fetcher = {
 
         const externalId = payload.externalId || config.id || `manual-${Date.now()}`;
         const url = payload.originalUrl || payload.mediaUrl || config.url || buildFallbackUrl(externalId);
-
         const item: RawFetchedItem = {
             externalId,
             sourceType: config.type,
             url,
-            title: payload.title,
-            content: payload.bodyText || undefined,
-            excerpt: payload.excerpt || undefined,
-            author: payload.author || undefined,
-            publishedAt: payload.publishedAt,
-            thumbnailUrl: payload.thumbnailUrl || undefined,
-            duration: payload.durationSec,
+            title: (payload as ManualPayload).title,
+            content: (payload as ManualPayload).bodyText || undefined,
+            excerpt: (payload as ManualPayload).excerpt || undefined,
+            author: (payload as ManualPayload).author || undefined,
+            publishedAt: (payload as ManualPayload).publishedAt,
+            thumbnailUrl: (payload as ManualPayload).thumbnailUrl || undefined,
+            duration: (payload as ManualPayload).durationSec,
             metadata: {
-                contentType: payload.contentType,
-                sourceName: payload.sourceName,
-                sourceFeedUrl: payload.sourceFeedUrl,
-                mediaUrl: payload.mediaUrl,
-                originalUrl: payload.originalUrl,
-                topicTags: payload.topicTags,
-                idempotencyKey: payload.idempotencyKey,
-                mediaReady: payload.mediaReady,
-                ...payload.metadata,
+                contentType: (payload as ManualPayload).contentType,
+                sourceName: (payload as ManualPayload).sourceName,
+                sourceFeedUrl: (payload as ManualPayload).sourceFeedUrl,
+                mediaUrl: (payload as ManualPayload).mediaUrl,
+                originalUrl: (payload as ManualPayload).originalUrl,
+                topicTags: (payload as ManualPayload).topicTags,
+                idempotencyKey: (payload as ManualPayload).idempotencyKey,
+                mediaReady: (payload as ManualPayload).mediaReady,
+                ...(payload as ManualPayload).metadata,
             },
             fetchedAt: new Date().toISOString(),
         };
 
         logger.info('Manual fetcher created item', {
             sourceId: config.id,
-            contentType: payload.contentType,
+            contentType: (payload as ManualPayload).contentType,
             externalId,
         });
 

@@ -109,28 +109,30 @@ export interface TwitterSourceConfig extends SourceConfig {
 /**
  * Manual/Upload source config
  */
+export interface ManualPayload {
+    externalId?: string;
+    contentType: 'ARTICLE' | 'VIDEO' | 'PODCAST' | 'TWEET' | 'COMMENT';
+    title: string;
+    bodyText?: string;
+    excerpt?: string;
+    author?: string;
+    originalUrl?: string;
+    mediaUrl?: string;
+    thumbnailUrl?: string;
+    durationSec?: number;
+    publishedAt?: string;
+    sourceName?: string;
+    sourceFeedUrl?: string;
+    topicTags?: string[];
+    idempotencyKey?: string;
+    mediaReady?: boolean;
+    metadata?: Record<string, unknown>;
+}
+
 export interface ManualSourceConfig extends SourceConfig {
     type: 'UPLOAD' | 'MANUAL';
     settings: {
-        payload?: {
-            externalId?: string;
-            contentType: 'ARTICLE' | 'VIDEO' | 'PODCAST' | 'TWEET' | 'COMMENT';
-            title: string;
-            bodyText?: string;
-            excerpt?: string;
-            author?: string;
-            originalUrl?: string;
-            mediaUrl?: string;
-            thumbnailUrl?: string;
-            durationSec?: number;
-            publishedAt?: string;
-            sourceName?: string;
-            sourceFeedUrl?: string;
-            topicTags?: string[];
-            idempotencyKey?: string;
-            mediaReady?: boolean;
-            metadata?: Record<string, unknown>;
-        };
+        payload?: ManualPayload;
     };
 }
 
