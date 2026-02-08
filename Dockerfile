@@ -55,11 +55,11 @@ RUN chown -R aggregation:nodejs /app /tmp/wahb-media
 USER aggregation
 
 # Expose metrics port
-EXPOSE 3001
+EXPOSE 5002
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:3001/health || exit 1
+  CMD curl -f http://localhost:5002/health || exit 1
 
 # Start the service
 CMD ["node", "dist/index.js"]

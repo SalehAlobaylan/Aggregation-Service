@@ -19,13 +19,13 @@ import {
 
 // Media services
 import { extractAudio } from '../media/transcoder.js';
-import { cleanupTempFile } from '../media/downloader.js';
+import { cleanupTempFile, downloadHttp } from '../media/downloader.js';
 
 export const aiWorker = createWorker({
     queueName: QUEUE_NAMES.AI,
     concurrency: 3, // AI processing with moderate concurrency
     processor: async (job: Job<AIJob>, jobLogger): Promise<void> => {
-        const { contentItemId, contentType, operations, textContent, mediaPath } = job.data;
+        const { contentItemId, contentType, operations, textContent, mediaPath, mediaUrl } = job.data;
 
         jobLogger.info('Processing AI job', {
             contentItemId,
@@ -40,15 +40,32 @@ export const aiWorker = createWorker({
 
         try {
             // 1. Generate transcript if media path provided and transcript operation requested
-            if (operations.includes('transcript') && mediaPath) {
+            let resolvedMediaPath = mediaPath;
+
+            if (!resolvedMediaPath && mediaUrl) {
                 try {
-                    jobLogger.info('Generating transcript', { mediaPath });
+                    jobLogger.info('Downloading media for transcript', { mediaUrl });
+                    const expectedExt = contentType === 'PODCAST' ? 'mp3' : 'mp4';
+                    const downloadResult = await downloadHttp(mediaUrl, `${contentItemId}_ai`, expectedExt);
+                    resolvedMediaPath = downloadResult.filePath;
+                    tempFiles.push(resolvedMediaPath);
+                } catch (downloadError) {
+                    jobLogger.warn('Failed to download media for transcript', {
+                        contentItemId,
+                        error: downloadError instanceof Error ? downloadError.message : 'Unknown error',
+                    });
+                }
+            }
+
+            if (operations.includes('transcript') && resolvedMediaPath) {
+                try {
+                    jobLogger.info('Generating transcript', { mediaPath: resolvedMediaPath });
 
                     // Extract audio if video file
-                    let audioPath = mediaPath;
-                    if (mediaPath.endsWith('.mp4') || mediaPath.endsWith('.webm')) {
+                    let audioPath = resolvedMediaPath;
+                    if (resolvedMediaPath.endsWith('.mp4') || resolvedMediaPath.endsWith('.webm')) {
                         audioPath = join(config.mediaTempDir, `${contentItemId}_audio.mp3`);
-                        await extractAudio(mediaPath, audioPath);
+                        await extractAudio(resolvedMediaPath, audioPath);
                         tempFiles.push(audioPath);
                     }
 

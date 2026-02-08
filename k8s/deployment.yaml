@@ -16,7 +16,7 @@ spec:
         app: aggregation-service
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "3001"
+        prometheus.io/port: "5002"
         prometheus.io/path: "/metrics"
     spec:
       securityContext:
@@ -28,7 +28,7 @@ spec:
           image: ghcr.io/your-org/aggregation-service:latest
           ports:
             - name: metrics
-              containerPort: 3001
+              containerPort: 5002
               protocol: TCP
           env:
             - name: CMS_BASE_URL
@@ -76,7 +76,7 @@ spec:
             - name: LOG_LEVEL
               value: "info"
             - name: METRICS_PORT
-              value: "3001"
+              value: "5002"
           resources:
             requests:
               cpu: 200m
@@ -123,7 +123,7 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 3001
+    - port: 5002
       targetPort: metrics
       protocol: TCP
       name: metrics

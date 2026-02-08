@@ -11,6 +11,7 @@ import { articleNormalizer } from './article.normalizer.js';
 import { videoNormalizer } from './video.normalizer.js';
 import { podcastNormalizer } from './podcast.normalizer.js';
 import { socialNormalizer } from './social.normalizer.js';
+import { manualNormalizer } from './manual.normalizer.js';
 
 // Register normalizers with their source types
 const normalizersBySource: Map<SourceType, Normalizer> = new Map([
@@ -19,6 +20,8 @@ const normalizersBySource: Map<SourceType, Normalizer> = new Map([
     ['PODCAST', podcastNormalizer],
     ['REDDIT', socialNormalizer],
     ['TWITTER', socialNormalizer],
+    ['UPLOAD', manualNormalizer],
+    ['MANUAL', manualNormalizer],
 ]);
 
 /**

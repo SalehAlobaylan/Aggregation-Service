@@ -101,7 +101,49 @@ export interface TwitterSourceConfig extends SourceConfig {
     settings: {
         searchQuery?: string;
         userId?: string;
-        mode: 'api' | 'scrape';
+        mode?: 'api' | 'scrape';
         minEngagement?: number;
+    };
+}
+
+/**
+ * Manual/Upload source config
+ */
+export interface ManualSourceConfig extends SourceConfig {
+    type: 'UPLOAD' | 'MANUAL';
+    settings: {
+        payload?: {
+            externalId?: string;
+            contentType: 'ARTICLE' | 'VIDEO' | 'PODCAST' | 'TWEET' | 'COMMENT';
+            title: string;
+            bodyText?: string;
+            excerpt?: string;
+            author?: string;
+            originalUrl?: string;
+            mediaUrl?: string;
+            thumbnailUrl?: string;
+            durationSec?: number;
+            publishedAt?: string;
+            sourceName?: string;
+            sourceFeedUrl?: string;
+            topicTags?: string[];
+            idempotencyKey?: string;
+            mediaReady?: boolean;
+            metadata?: Record<string, unknown>;
+        };
+    };
+}
+
+/**
+ * iTunes podcast discovery config
+ */
+export interface ItunesDiscoverySourceConfig extends SourceConfig {
+    type: 'PODCAST_DISCOVERY';
+    settings: {
+        searchTerm?: string;
+        term?: string;
+        category?: string;
+        limit?: number;
+        country?: string;
     };
 }

@@ -6,7 +6,7 @@ services:
     build: .
     container_name: aggregation-service
     environment:
-      - CMS_BASE_URL=http://host.docker.internal:3000/internal
+      - CMS_BASE_URL=http://host.docker.internal:8080/internal
       - CMS_SERVICE_TOKEN=dev-service-token
       - REDIS_URL=redis://redis:6379
       - STORAGE_ENDPOINT=http://minio:9000
@@ -18,7 +18,7 @@ services:
       - MEDIA_TEMP_DIR=/tmp/wahb-media
       - WORKER_CONCURRENCY=5
       - LOG_LEVEL=info
-      - METRICS_PORT=3001
+      - METRICS_PORT=5002
       - CB_FAILURE_THRESHOLD=5
       - CB_RESET_TIMEOUT_MS=30000
     depends_on:
@@ -29,7 +29,7 @@ services:
       whisper:
         condition: service_started
     ports:
-      - "3001:3001"
+      - "5002:5002"
     volumes:
       - ./config:/config:ro
       - media-temp:/tmp/wahb-media
