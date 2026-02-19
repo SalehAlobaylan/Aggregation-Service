@@ -31,6 +31,7 @@
   "license": "UNLICENSED",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.700.0",
+    "@fastify/cors": "^11.2.0",
     "@mozilla/readability": "^0.5.0",
     "@xenova/transformers": "^2.17.2",
     "bullmq": "^5.34.3",

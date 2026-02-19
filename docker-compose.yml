@@ -8,6 +8,11 @@ services:
     environment:
       - CMS_BASE_URL=http://host.docker.internal:8080/internal
       - CMS_SERVICE_TOKEN=dev-service-token
+      - JWT_SECRET=dev-jwt-secret
+      - ADMIN_JWT_ISSUER=cms-service
+      - ADMIN_JWT_AUDIENCE=platform-console
+      - ADMIN_ALLOWED_ROLES=admin,manager
+      - PLATFORM_CONSOLE_ORIGINS=http://localhost:3005,http://localhost:3000
       - REDIS_URL=redis://redis:6379
       - STORAGE_ENDPOINT=http://minio:9000
       - STORAGE_BUCKET=wahb-media

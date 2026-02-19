@@ -8,6 +8,7 @@ import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
 import type { SourceType } from '../../queues/schemas.js';
+import { verifyAdminAuth } from '../plugins/admin-auth.js';
 
 interface TriggerBody {
     sourceType: SourceType;
@@ -51,6 +52,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.post<{ Body: TriggerBody; Reply: TriggerResponse }>(
         '/admin/trigger',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { sourceType, url, name, settings } = request.body;
 
@@ -95,6 +97,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.post<{ Body: { feedUrl: string; name?: string }; Reply: TriggerResponse }>(
         '/admin/trigger/rss',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { feedUrl, name } = request.body;
 
@@ -132,6 +135,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         Reply: TriggerResponse
     }>(
         '/admin/trigger/youtube',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { channelId, playlistId, name } = request.body;
 
@@ -169,6 +173,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         Reply: TriggerResponse
     }>(
         '/admin/trigger/reddit',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { subreddit, sortBy, minScore } = request.body;
 
@@ -203,6 +208,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.get<{ Reply: QueueStatsResponse[] }>(
         '/admin/queues',
+        { preHandler: verifyAdminAuth },
         async (_request, reply) => {
             const stats: QueueStatsResponse[] = [];
 
@@ -232,6 +238,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.get<{ Params: { name: string }; Reply: QueueStatsResponse | { error: string } }>(
         '/admin/queues/:name/stats',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { name } = request.params;
             const queue = getQueue(name as any);
@@ -259,6 +266,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.get<{ Params: { id: string }; Querystring: { queue?: string }; Reply: JobResponse | { error: string } }>(
         '/admin/jobs/:id',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { id } = request.params;
             const { queue: queueName } = request.query;
@@ -300,6 +308,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.get<{ Params: { sourceType: string }; Querystring: { sourceId?: string } }>(
         '/admin/ratelimits/:sourceType',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { sourceType } = request.params;
             const { sourceId } = request.query;
@@ -317,7 +326,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      * Get all rate limit configurations
      * GET /admin/ratelimits
      */
-    fastify.get('/admin/ratelimits', async (_request, reply) => {
+    fastify.get('/admin/ratelimits', { preHandler: verifyAdminAuth }, async (_request, reply) => {
         const limits = rateLimiter.getRateLimits();
         return reply.send(limits);
     });
@@ -326,7 +335,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      * Get scheduled jobs
      * GET /admin/scheduled
      */
-    fastify.get('/admin/scheduled', async (_request, reply) => {
+    fastify.get('/admin/scheduled', { preHandler: verifyAdminAuth }, async (_request, reply) => {
         const jobs = await scheduler.getScheduledJobs();
         return reply.send(jobs);
     });
@@ -337,6 +346,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      */
     fastify.get<{ Querystring: { term: string; limit?: number; country?: string } }>(
         '/admin/itunes/search',
+        { preHandler: verifyAdminAuth },
         async (request, reply) => {
             const { term, limit, country } = request.query;
 
