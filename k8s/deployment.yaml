@@ -41,6 +41,31 @@ spec:
                 secretKeyRef:
                   name: aggregation-secrets
                   key: CMS_SERVICE_TOKEN
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aggregation-secrets
+                  key: JWT_SECRET
+            - name: ADMIN_JWT_ISSUER
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: ADMIN_JWT_ISSUER
+            - name: ADMIN_JWT_AUDIENCE
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: ADMIN_JWT_AUDIENCE
+            - name: ADMIN_ALLOWED_ROLES
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: ADMIN_ALLOWED_ROLES
+            - name: PLATFORM_CONSOLE_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: aggregation-config
+                  key: PLATFORM_CONSOLE_ORIGINS
             - name: REDIS_URL
               valueFrom:
                 configMapKeyRef:
@@ -136,6 +161,10 @@ metadata:
   name: aggregation-config
 data:
   CMS_BASE_URL: "http://cms-service.default.svc.cluster.local/internal"
+  ADMIN_JWT_ISSUER: "cms-service"
+  ADMIN_JWT_AUDIENCE: "platform-console"
+  ADMIN_ALLOWED_ROLES: "admin,manager"
+  PLATFORM_CONSOLE_ORIGINS: "https://wahb-console.salehspace.dev"
   REDIS_URL: "redis://redis-master.default.svc.cluster.local:6379"
   STORAGE_ENDPOINT: "https://your-storage.supabase.co/storage/v1"
   STORAGE_BUCKET: "wahb-media"

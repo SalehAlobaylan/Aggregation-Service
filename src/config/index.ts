@@ -9,6 +9,12 @@ import { z } from 'zod';
 const urlSchema = z.string().url('Must be a valid URL');
 const portSchema = z.coerce.number().int().min(1).max(65535);
 const positiveIntSchema = z.coerce.number().int().positive();
+const csvListSchema = z.string().transform((value) =>
+    value
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean)
+);
 
 // Configuration schema
 const configSchema = z.object({
@@ -16,6 +22,7 @@ const configSchema = z.object({
     cmsBaseUrl: urlSchema.describe('CMS internal API base URL'),
     cmsServiceToken: z.string().min(1, 'CMS service token is required'),
     redisUrl: z.string().min(1, 'Redis URL is required'),
+    jwtSecret: z.string().min(1, 'JWT secret is required for admin auth'),
 
     // Required - Storage (S3-compatible)
     storageEndpoint: urlSchema.describe('S3-compatible storage endpoint'),
@@ -69,6 +76,12 @@ const configSchema = z.object({
         (val) => val === undefined ? true : val,
         z.coerce.boolean().default(true)
     ),
+
+    // Admin Auth + CORS (Platform Console integration)
+    adminJwtIssuer: z.string().default('cms-service'),
+    adminJwtAudience: z.string().default('platform-console'),
+    adminAllowedRoles: csvListSchema.default(['admin', 'manager']),
+    platformConsoleOrigins: csvListSchema.default(['http://localhost:3005', 'http://localhost:3000']),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -81,6 +94,7 @@ function mapEnvToConfig(): Record<string, unknown> {
         cmsBaseUrl: process.env.CMS_BASE_URL,
         cmsServiceToken: process.env.CMS_SERVICE_TOKEN,
         redisUrl: process.env.REDIS_URL,
+        jwtSecret: process.env.JWT_SECRET,
 
         storageEndpoint: process.env.STORAGE_ENDPOINT,
         storageBucket: process.env.STORAGE_BUCKET,
@@ -117,6 +131,10 @@ function mapEnvToConfig(): Record<string, unknown> {
         twitterBearerToken: process.env.TWITTER_BEARER_TOKEN || null,
 
         enableItunesSearch: process.env.ENABLE_ITUNES_SEARCH,
+        adminJwtIssuer: process.env.ADMIN_JWT_ISSUER,
+        adminJwtAudience: process.env.ADMIN_JWT_AUDIENCE,
+        adminAllowedRoles: process.env.ADMIN_ALLOWED_ROLES,
+        platformConsoleOrigins: process.env.PLATFORM_CONSOLE_ORIGINS,
     };
 }
 
@@ -164,6 +182,7 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
     return {
         cmsBaseUrl: cfg.cmsBaseUrl,
         cmsServiceToken: '[REDACTED]',
+        jwtSecret: '[REDACTED]',
         redisUrl: cfg.redisUrl.replace(/\/\/.*@/, '//<redacted>@'),
         storageEndpoint: cfg.storageEndpoint,
         storageBucket: cfg.storageBucket,
@@ -179,6 +198,10 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
         youtubeApiKey: cfg.youtubeApiKey ? '[CONFIGURED]' : null,
         redditClientId: cfg.redditClientId ? '[CONFIGURED]' : null,
         twitterBearerToken: cfg.twitterBearerToken ? '[CONFIGURED]' : null,
+        adminJwtIssuer: cfg.adminJwtIssuer,
+        adminJwtAudience: cfg.adminJwtAudience,
+        adminAllowedRoles: cfg.adminAllowedRoles,
+        platformConsoleOrigins: cfg.platformConsoleOrigins,
     };
 }
 
