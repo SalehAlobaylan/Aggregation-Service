@@ -16,6 +16,14 @@ import { startServer, stopServer } from './server/index.js';
 async function main(): Promise<void> {
     logger.info('Starting Aggregation Service...');
     logger.info('Configuration loaded', getRedactedConfig(config));
+    logger.info('Connection targets', {
+        cmsBaseUrl: config.cmsBaseUrl,
+        redisUrl: config.redisUrl.replace(/\/\/.*@/, '//<redacted>@'),
+        storageEndpoint: config.storageEndpoint,
+        whisperApiUrl: config.whisperApiUrl,
+        metricsPort: config.metricsPort,
+        platformConsoleOrigins: config.platformConsoleOrigins,
+    });
 
     try {
         // Initialize Redis connection
