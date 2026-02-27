@@ -38,6 +38,7 @@ export interface NormalizeJob {
     sourceType: SourceType;
     rawItems: RawItem[];
     fetchJobId: string;
+    sourceSettings?: Record<string, unknown>;
 }
 
 export interface RawItem {

@@ -9,6 +9,9 @@ import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
 import type { SourceType } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
+import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
+import { fetchFromSource } from '../../fetchers/index.js';
+import { normalizeBatch } from '../../normalizers/index.js';
 
 interface TriggerBody {
     sourceType: SourceType;
@@ -45,7 +48,152 @@ interface JobResponse {
     timestamp: number;
 }
 
+interface DiscoverFeedsBody {
+    url: string;
+}
+
+interface DiscoverFeedsResponse {
+    success: boolean;
+    feeds: Array<{
+        url: string;
+        title?: string;
+        type: 'RSS' | 'ATOM' | 'XML';
+    }>;
+    message: string;
+}
+
+interface PreviewSourceBody {
+    sourceType: SourceType;
+    url: string;
+    name?: string;
+    settings?: Record<string, unknown>;
+    limit?: number;
+}
+
+interface PreviewSourceResponse {
+    success: boolean;
+    message: string;
+    fetched: number;
+    normalized: number;
+    skipped: number;
+    errors: number;
+    items: Array<{
+        idempotencyKey: string;
+        type: string;
+        title: string;
+        excerpt: string | null;
+        author: string | null;
+        originalUrl: string;
+        publishedAt: string | null;
+    }>;
+}
+
 export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
+    /**
+     * Discover feed URLs from a website URL
+     * POST /admin/discover
+     */
+    fastify.post<{ Body: DiscoverFeedsBody; Reply: DiscoverFeedsResponse }>(
+        '/admin/discover',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { url } = request.body;
+            if (!url || !url.trim()) {
+                return reply.status(400).send({
+                    success: false,
+                    feeds: [],
+                    message: 'url is required',
+                });
+            }
+
+            try {
+                const feeds = await feedDiscoveryService.discoverFeeds(url);
+                return reply.send({
+                    success: true,
+                    feeds,
+                    message: feeds.length > 0 ? 'Feed candidates found' : 'No feeds discovered for this URL',
+                });
+            } catch (error) {
+                logger.error('Feed discovery failed', error, { url });
+                return reply.status(500).send({
+                    success: false,
+                    feeds: [],
+                    message: error instanceof Error ? error.message : 'Failed to discover feeds',
+                });
+            }
+        }
+    );
+
+    /**
+     * Preview source ingestion without writing to CMS
+     * POST /admin/preview
+     */
+    fastify.post<{ Body: PreviewSourceBody; Reply: PreviewSourceResponse }>(
+        '/admin/preview',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { sourceType, url, name, settings, limit = 10 } = request.body;
+            if (!sourceType || !url) {
+                return reply.status(400).send({
+                    success: false,
+                    message: 'sourceType and url are required',
+                    fetched: 0,
+                    normalized: 0,
+                    skipped: 0,
+                    errors: 0,
+                    items: [],
+                });
+            }
+
+            const safeLimit = Math.max(1, Math.min(limit, 20));
+
+            try {
+                const result = await fetchFromSource({
+                    id: `preview-${Date.now()}`,
+                    type: sourceType,
+                    name: name || url,
+                    url,
+                    enabled: true,
+                    pollIntervalMs: 0,
+                    settings: settings || {},
+                });
+
+                const sampleItems = result.items.slice(0, safeLimit);
+                const normalization = normalizeBatch(sampleItems);
+                const previewItems = normalization.normalized.map((item) => ({
+                    idempotencyKey: item.idempotencyKey,
+                    type: item.type,
+                    title: item.title,
+                    excerpt: item.excerpt,
+                    author: item.author,
+                    originalUrl: item.originalUrl,
+                    publishedAt: item.publishedAt ? item.publishedAt.toISOString() : null,
+                }));
+
+                return reply.send({
+                    success: true,
+                    message: 'Preview generated successfully',
+                    fetched: result.items.length,
+                    normalized: previewItems.length,
+                    skipped: normalization.skipped,
+                    errors: result.metadata.errors + normalization.errors.length,
+                    items: previewItems,
+                });
+            } catch (error) {
+                logger.error('Source preview failed', error, { sourceType, url });
+                return reply.status(500).send({
+                    success: false,
+                    message: error instanceof Error ? error.message : 'Preview failed',
+                    fetched: 0,
+                    normalized: 0,
+                    skipped: 0,
+                    errors: 1,
+                    items: [],
+                });
+            }
+        }
+    );
+
     /**
      * Trigger a manual poll for any source type
      * POST /admin/trigger

@@ -59,6 +59,7 @@ export const fetchWorker = createWorker({
                             fetchedAt: item.fetchedAt,
                         })),
                         fetchJobId: job.id,
+                        sourceSettings: sourceConfig.settings,
                     },
                     {
                         priority: 2,
