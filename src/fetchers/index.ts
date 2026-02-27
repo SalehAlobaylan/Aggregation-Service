@@ -13,10 +13,12 @@ import { itunesFetcher } from './itunes.fetcher.js';
 import { redditFetcher } from './reddit.fetcher.js';
 import { twitterFetcher } from './twitter.fetcher.js';
 import { manualFetcher } from './manual.fetcher.js';
+import { websiteFetcher } from './website.fetcher.js';
 
 // Register all fetchers
 const fetchers: Map<SourceType, Fetcher> = new Map([
     ['RSS', rssFetcher],
+    ['WEBSITE', websiteFetcher],
     ['YOUTUBE', youtubeFetcher],
     ['PODCAST', podcastFetcher],
     ['PODCAST_DISCOVERY', itunesFetcher],

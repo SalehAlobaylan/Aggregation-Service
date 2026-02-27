@@ -149,3 +149,26 @@ export interface ItunesDiscoverySourceConfig extends SourceConfig {
         country?: string;
     };
 }
+
+/**
+ * Website scraper source config
+ */
+export interface WebsiteSourceConfig extends SourceConfig {
+    type: 'WEBSITE';
+    settings: {
+        // Optional override URL (if different from config.url)
+        url?: string;
+        selectors?: {
+            // Container selector for repeated items
+            item?: string;
+            // Selector inside item for article link
+            link?: string;
+            // Optional selectors for extracted fields
+            title?: string;
+            excerpt?: string;
+            author?: string;
+            date?: string;
+        };
+        maxItems?: number;
+    };
+}

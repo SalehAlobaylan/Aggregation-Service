@@ -8,7 +8,7 @@ import type { Normalizer, NormalizedItem } from './types.js';
 
 export const articleNormalizer: Normalizer = {
     contentType: 'ARTICLE',
-    sourceTypes: ['RSS'],
+    sourceTypes: ['RSS', 'WEBSITE'],
 
     normalize(item: RawFetchedItem): NormalizedItem {
         // Generate idempotency key
@@ -31,7 +31,7 @@ export const articleNormalizer: Normalizer = {
         return {
             idempotencyKey,
             type: 'ARTICLE',
-            source: 'RSS',
+            source: item.sourceType === 'WEBSITE' ? 'WEBSITE' : 'RSS',
             status: 'READY', // Articles are ready once we have text
 
             title: item.title,

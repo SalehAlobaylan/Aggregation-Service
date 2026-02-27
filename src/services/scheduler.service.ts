@@ -10,6 +10,7 @@ import type { SourceConfig } from '../fetchers/types.js';
 // Default polling intervals per source type (in milliseconds)
 const DEFAULT_POLL_INTERVALS: Record<SourceType, number> = {
     RSS: 900000,      // 15 minutes
+    WEBSITE: 1800000, // 30 minutes
     YOUTUBE: 3600000, // 1 hour (conserve quota)
     PODCAST: 3600000, // 1 hour
     PODCAST_DISCOVERY: 86400000, // 24 hours (discovery is slower cadence)

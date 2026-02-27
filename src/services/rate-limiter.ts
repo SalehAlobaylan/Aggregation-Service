@@ -22,6 +22,10 @@ function buildRateLimits(): Record<string, RateLimitConfig> {
             maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_RSS'] || '60'),
             windowMs,
         },
+        WEBSITE: {
+            maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_WEBSITE'] || '30'),
+            windowMs,
+        },
         YOUTUBE: {
             maxRequests: parseInt(process.env['RATE_LIMIT_MAX_REQUESTS_YOUTUBE'] || '100'),
             windowMs,

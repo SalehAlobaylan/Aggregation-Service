@@ -5,6 +5,7 @@
 // Source types
 export type SourceType =
     'RSS'
+    | 'WEBSITE'
     | 'YOUTUBE'
     | 'PODCAST'
     | 'PODCAST_DISCOVERY'

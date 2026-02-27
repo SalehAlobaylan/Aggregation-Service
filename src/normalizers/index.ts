@@ -16,6 +16,7 @@ import { manualNormalizer } from './manual.normalizer.js';
 // Register normalizers with their source types
 const normalizersBySource: Map<SourceType, Normalizer> = new Map([
     ['RSS', articleNormalizer],
+    ['WEBSITE', articleNormalizer],
     ['YOUTUBE', videoNormalizer],
     ['PODCAST', podcastNormalizer],
     ['REDDIT', socialNormalizer],
