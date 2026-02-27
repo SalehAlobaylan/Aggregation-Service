@@ -10,7 +10,7 @@ import { logger } from '../../observability/logger.js';
 import type { SourceType } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
-import { fetchFromSource } from '../../fetchers/index.js';
+import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
 import { normalizeBatch } from '../../normalizers/index.js';
 
 interface TriggerBody {
@@ -105,6 +105,22 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     message: 'url is required',
                 });
             }
+            if (url.trim().length > 2048) {
+                return reply.status(400).send({
+                    success: false,
+                    feeds: [],
+                    message: 'url is too long',
+                });
+            }
+
+            const rateCheck = await rateLimiter.consumeRateLimit('RSS', `discover:${request.ip}`);
+            if (!rateCheck.allowed) {
+                return reply.status(429).send({
+                    success: false,
+                    feeds: [],
+                    message: 'rate limit exceeded for discovery requests',
+                });
+            }
 
             try {
                 const feeds = await feedDiscoveryService.discoverFeeds(url);
@@ -141,6 +157,41 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     normalized: 0,
                     skipped: 0,
                     errors: 0,
+                    items: [],
+                });
+            }
+            if (!getSupportedSourceTypes().includes(sourceType)) {
+                return reply.status(400).send({
+                    success: false,
+                    message: `unsupported sourceType: ${sourceType}`,
+                    fetched: 0,
+                    normalized: 0,
+                    skipped: 0,
+                    errors: 1,
+                    items: [],
+                });
+            }
+            if (url.trim().length > 2048) {
+                return reply.status(400).send({
+                    success: false,
+                    message: 'url is too long',
+                    fetched: 0,
+                    normalized: 0,
+                    skipped: 0,
+                    errors: 1,
+                    items: [],
+                });
+            }
+
+            const rateCheck = await rateLimiter.consumeRateLimit(sourceType, `preview:${request.ip}`);
+            if (!rateCheck.allowed) {
+                return reply.status(429).send({
+                    success: false,
+                    message: 'rate limit exceeded for preview requests',
+                    fetched: 0,
+                    normalized: 0,
+                    skipped: 0,
+                    errors: 1,
                     items: [],
                 });
             }
