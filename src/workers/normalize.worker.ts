@@ -18,6 +18,14 @@ interface SourceFilters {
     min_engagement?: number;
 }
 
+interface ModerationConfig {
+    trusted_source?: boolean;
+    blocked_keywords?: string[];
+    min_content_length?: number;
+}
+
+type ModerationDecision = 'auto_approved' | 'needs_review' | 'auto_rejected';
+
 function parseSourceFilters(sourceSettings: Record<string, unknown> | undefined): SourceFilters {
     const rawFilters = (sourceSettings?.filters || {}) as Record<string, unknown>;
 
@@ -35,6 +43,20 @@ function parseSourceFilters(sourceSettings: Record<string, unknown> | undefined)
         include_keywords: includeKeywords,
         exclude_keywords: excludeKeywords,
         min_engagement: minEngagement,
+    };
+}
+
+function parseModerationConfig(sourceSettings: Record<string, unknown> | undefined): ModerationConfig {
+    const rawModeration = (sourceSettings?.moderation || {}) as Record<string, unknown>;
+
+    return {
+        trusted_source: Boolean(rawModeration.trusted_source),
+        blocked_keywords: Array.isArray(rawModeration.blocked_keywords)
+            ? rawModeration.blocked_keywords.filter((value): value is string => typeof value === 'string')
+            : [],
+        min_content_length: typeof rawModeration.min_content_length === 'number'
+            ? rawModeration.min_content_length
+            : 80,
     };
 }
 
@@ -99,11 +121,45 @@ function shouldSkipByFilters(
     return { skip: false };
 }
 
+function evaluateModerationDecision(
+    normalized: NormalizedItem,
+    moderationConfig: ModerationConfig
+): { decision: ModerationDecision; reason: string } {
+    if (moderationConfig.trusted_source) {
+        return { decision: 'auto_approved', reason: 'trusted_source' };
+    }
+
+    const combinedText = getItemText(normalized);
+    const blockedKeywords = moderationConfig.blocked_keywords || [];
+    if (blockedKeywords.length > 0) {
+        const matchedKeyword = blockedKeywords.find((keyword) =>
+            combinedText.includes(keyword.toLowerCase())
+        );
+        if (matchedKeyword) {
+            return { decision: 'auto_rejected', reason: `blocked_keyword:${matchedKeyword}` };
+        }
+    }
+
+    const minContentLength = moderationConfig.min_content_length ?? 80;
+    const textLength = combinedText.trim().length;
+    const titleLength = normalized.title.trim().length;
+
+    if (titleLength < 8) {
+        return { decision: 'needs_review', reason: 'short_title' };
+    }
+    if (textLength < minContentLength) {
+        return { decision: 'needs_review', reason: 'insufficient_content_length' };
+    }
+
+    return { decision: 'auto_approved', reason: 'rules_passed' };
+}
+
 export const normalizeWorker = createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, rawItems, fetchJobId, sourceSettings } = job.data;
         const sourceFilters = parseSourceFilters(sourceSettings);
+        const moderationConfig = parseModerationConfig(sourceSettings);
 
         jobLogger.info('Processing normalize job', {
             sourceId,
@@ -116,6 +172,9 @@ export const normalizeWorker = createWorker({
         let duplicates = 0;
         let filtered = 0;
         let failed = 0;
+        let moderationApproved = 0;
+        let moderationReview = 0;
+        let moderationRejected = 0;
         let mediaEnqueued = 0;
         let aiEnqueued = 0;
 
@@ -143,6 +202,26 @@ export const normalizeWorker = createWorker({
                     continue;
                 }
 
+                const moderation = evaluateModerationDecision(normalized, moderationConfig);
+                normalized.metadata = {
+                    ...normalized.metadata,
+                    moderation: {
+                        decision: moderation.decision,
+                        reason: moderation.reason,
+                        reviewed: false,
+                        evaluated_at: new Date().toISOString(),
+                    },
+                };
+                if (moderation.decision === 'auto_rejected') {
+                    normalized.status = 'ARCHIVED';
+                    moderationRejected++;
+                } else if (moderation.decision === 'needs_review') {
+                    normalized.status = 'PENDING';
+                    moderationReview++;
+                } else {
+                    moderationApproved++;
+                }
+
                 // Check for duplicates
                 const dedupResult = await dedupService.checkDedup(normalized.idempotencyKey);
                 if (dedupResult.isDuplicate) {
@@ -168,7 +247,7 @@ export const normalizeWorker = createWorker({
                     });
 
                     // Enqueue media jobs for VIDEO and PODCAST
-                    if (normalized.type === 'VIDEO' || normalized.type === 'PODCAST') {
+                    if ((normalized.type === 'VIDEO' || normalized.type === 'PODCAST') && normalized.status !== 'ARCHIVED') {
                         const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady);
                         const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
 
@@ -239,6 +318,9 @@ export const normalizeWorker = createWorker({
             duplicates,
             filtered,
             failed,
+            moderationApproved,
+            moderationReview,
+            moderationRejected,
             mediaEnqueued,
             aiEnqueued,
         });
