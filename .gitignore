@@ -30,3 +30,6 @@ coverage/
 # Temp
 tmp/
 temp/
+
+# Secrets
+monitoring/grafana-cloud-token

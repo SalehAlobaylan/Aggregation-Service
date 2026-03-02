@@ -3,6 +3,12 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+remote_write:
+  - url: https://prometheus-prod-53-prod-me-central-1.grafana.net/api/prom/push
+    basic_auth:
+      username: 3006974
+      password_file: /etc/prometheus/grafana-cloud-token
+
 alerting:
   alertmanagers:
     - static_configs:
@@ -18,12 +24,6 @@ scrape_configs:
       - targets: ['aggregation:5002']
     metrics_path: /metrics
     scrape_interval: 10s
-
-  # Redis metrics (via Redis Exporter if deployed)
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis-exporter:9121']
-    scrape_interval: 30s
 
   # Prometheus self-monitoring
   - job_name: 'prometheus'

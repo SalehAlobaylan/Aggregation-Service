@@ -114,6 +114,7 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./monitoring/grafana-cloud-token:/etc/prometheus/grafana-cloud-token:ro
       - prometheus-data:/prometheus
     restart: unless-stopped
 
