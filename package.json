@@ -19,7 +19,9 @@
     "test:integration": "vitest run tests/integration",
     "test:load": "tsx tests/load/synthetic-producer.ts",
     "test:media": "tsx src/scripts/test-media-job.ts",
-    "test:ai": "tsx src/scripts/test-ai-job.ts"
+    "test:ai": "tsx src/scripts/test-ai-job.ts",
+    "telegram:auth": "tsx src/scripts/telegram-auth.ts",
+    "retry-failed": "tsx src/scripts/retry-failed.ts"
   },
   "keywords": [
     "wahb",
@@ -40,11 +42,13 @@
     "fastify": "^5.2.1",
     "fluent-ffmpeg": "^2.1.3",
     "form-data": "^4.0.1",
+    "input": "^1.0.1",
     "ioredis": "^5.4.2",
     "jsdom": "^25.0.1",
     "pino": "^9.6.0",
     "prom-client": "^15.1.3",
     "rss-parser": "^3.13.0",
+    "telegram": "^2.26.22",
     "uuid": "^11.0.5",
     "zod": "^4.3.6"
   },

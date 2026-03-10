@@ -6,6 +6,7 @@
 export type SourceType =
     'RSS'
     | 'WEBSITE'
+    | 'TELEGRAM'
     | 'YOUTUBE'
     | 'PODCAST'
     | 'PODCAST_DISCOVERY'
@@ -54,7 +55,16 @@ export interface RawItem {
 export interface MediaJob {
     contentItemId: string;
     contentType: ContentType;
+    sourceType: SourceType;
     sourceUrl: string;
+    downloadRef?: {
+        channelUsername: string;
+        channelId?: string;
+        messageId: number;
+        mediaKind: 'audio' | 'voice' | 'video' | 'photo';
+        fileName?: string;
+        mimeType?: string;
+    };
     operations: ('download' | 'transcode' | 'thumbnail')[];
 }
 

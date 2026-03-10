@@ -14,6 +14,7 @@ import { config } from '../config/index.js';
 import {
     downloadYouTube,
     downloadHttp,
+    downloadTelegram,
     cleanupTempFile,
 } from '../media/downloader.js';
 import {
@@ -33,8 +34,7 @@ export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
     concurrency: 2, // Media processing is resource-intensive
     processor: async (job: Job<MediaJob>, jobLogger): Promise<void> => {
-        const { contentItemId, contentType, sourceUrl, operations } = job.data;
-        const sourceType = ((job.data as unknown as Record<string, unknown>).sourceType as string) || 'UNKNOWN';
+        const { contentItemId, contentType, sourceType, sourceUrl, operations, downloadRef } = job.data;
 
         jobLogger.info('Processing media job', {
             contentItemId,
@@ -51,7 +51,8 @@ export const mediaWorker = createWorker({
             await cmsClient.updateStatus(contentItemId, { status: 'PROCESSING' }, job.id);
 
             // 2. Check if already processed (idempotent)
-            const processedKey = getStorageKey(contentItemId, 'processed', 'mp4');
+            const artifactExtension = inferArtifactExtension(contentType, sourceType, downloadRef);
+            const processedKey = getStorageKey(contentItemId, 'processed', artifactExtension);
             if (await objectExists(processedKey)) {
                 jobLogger.info('Content already processed, skipping', { contentItemId });
 
@@ -67,7 +68,12 @@ export const mediaWorker = createWorker({
             let downloadResult;
             const isYouTube = sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be');
 
-            if (isYouTube) {
+            if (sourceType === 'TELEGRAM') {
+                if (!downloadRef) {
+                    throw new Error('Missing Telegram downloadRef for media job');
+                }
+                downloadResult = await downloadTelegram(downloadRef, contentItemId);
+            } else if (isYouTube) {
                 downloadResult = await downloadYouTube(sourceUrl, contentItemId);
             } else {
                 // Podcast enclosure or direct URL
@@ -85,11 +91,18 @@ export const mediaWorker = createWorker({
             const mediaInfo = await getMediaInfo(downloadResult.filePath);
             jobLogger.debug('Media info', { ...mediaInfo });
 
-            // 5. Transcode to MP4
+            // 5. Transcode/process media
             let processedPath: string;
             let duration: number;
+            let processedMimeType = 'video/mp4';
+            let isImageArtifact = false;
 
-            if (mediaInfo.hasVideo || contentType === 'VIDEO') {
+            if (contentType === 'ARTICLE' && sourceType === 'TELEGRAM' && downloadRef?.mediaKind === 'photo') {
+                processedPath = downloadResult.filePath;
+                duration = 0;
+                processedMimeType = inferImageMimeType(downloadResult.format);
+                isImageArtifact = true;
+            } else if (mediaInfo.hasVideo || contentType === 'VIDEO') {
                 // Video: transcode to MP4
                 const mp4Path = join(config.mediaTempDir, `${contentItemId}_processed.mp4`);
                 const result = await transcodeToMp4(downloadResult.filePath, mp4Path);
@@ -112,6 +125,9 @@ export const mediaWorker = createWorker({
             let thumbnailUrl: string | undefined;
 
             try {
+                if (isImageArtifact) {
+                    throw new Error('Skip thumbnail extraction for image artifacts');
+                }
                 thumbnailPath = join(config.mediaTempDir, `${contentItemId}_thumb.jpg`);
                 await extractThumbnail(processedPath, thumbnailPath, 2);
                 tempFiles.push(thumbnailPath);
@@ -125,12 +141,18 @@ export const mediaWorker = createWorker({
                 // Use YouTube thumbnail if available
                 if (downloadResult.thumbnailUrl) {
                     thumbnailUrl = downloadResult.thumbnailUrl;
+                } else if (isImageArtifact) {
+                    thumbnailUrl = undefined;
                 }
             }
 
-            // 7. Upload processed MP4
-            const mediaUrl = await uploadFile(processedKey, processedPath, 'video/mp4');
+            // 7. Upload processed artifact
+            const mediaUrl = await uploadFile(processedKey, processedPath, processedMimeType);
             jobLogger.info('Processed media uploaded', { mediaUrl });
+
+            if (isImageArtifact) {
+                thumbnailUrl = mediaUrl;
+            }
 
             // 8. Update CMS artifacts
             await cmsClient.updateArtifacts(contentItemId, {
@@ -147,7 +169,7 @@ export const mediaWorker = createWorker({
             });
 
             // 9. Enqueue AI job for transcript + embedding
-            await enqueueAIJob(job, contentItemId, contentType, processedPath);
+            await enqueueAIJob(job, contentItemId, contentType, isImageArtifact ? undefined : processedPath, mediaUrl);
 
             jobLogger.info('Media job completed successfully', { contentItemId });
 
@@ -194,12 +216,16 @@ async function enqueueAIJob(
         return;
     }
 
+    const operations = contentType === 'ARTICLE'
+        ? ['embedding']
+        : ['transcript', 'embedding'];
+
     await aiQueue.add(
         `ai-${contentType}-${contentItemId}`,
         {
             contentItemId,
             contentType,
-            operations: ['transcript', 'embedding'],
+            operations,
             textContent: {
                 title: '', // Will be fetched from CMS if needed
             },
@@ -212,4 +238,30 @@ async function enqueueAIJob(
     );
 
     job.log(`Enqueued AI job for ${contentItemId}`);
+}
+
+function inferImageMimeType(format: string): string {
+    const normalized = format.toLowerCase();
+    if (normalized === 'png') return 'image/png';
+    if (normalized === 'webp') return 'image/webp';
+    if (normalized === 'gif') return 'image/gif';
+    return 'image/jpeg';
+}
+
+function inferArtifactExtension(
+    contentType: string,
+    sourceType: string,
+    downloadRef?: {
+        mediaKind: 'audio' | 'voice' | 'video' | 'photo';
+        fileName?: string;
+    }
+): string {
+    if (contentType === 'ARTICLE' && sourceType === 'TELEGRAM' && downloadRef?.mediaKind === 'photo') {
+        const fileName = downloadRef.fileName?.toLowerCase() || '';
+        if (fileName.endsWith('.png')) return 'png';
+        if (fileName.endsWith('.webp')) return 'webp';
+        if (fileName.endsWith('.gif')) return 'gif';
+        return 'jpg';
+    }
+    return 'mp4';
 }

@@ -24,6 +24,15 @@ interface ModerationConfig {
     min_content_length?: number;
 }
 
+interface TelegramDownloadRef {
+    channelUsername: string;
+    channelId?: string;
+    messageId: number;
+    mediaKind: 'audio' | 'voice' | 'video' | 'photo';
+    fileName?: string;
+    mimeType?: string;
+}
+
 type ModerationDecision = 'auto_approved' | 'needs_review' | 'auto_rejected';
 
 function parseSourceFilters(sourceSettings: Record<string, unknown> | undefined): SourceFilters {
@@ -246,8 +255,14 @@ export const normalizeWorker = createWorker({
                         status: normalized.status,
                     });
 
-                    // Enqueue media jobs for VIDEO and PODCAST
-                    if ((normalized.type === 'VIDEO' || normalized.type === 'PODCAST') && normalized.status !== 'ARCHIVED') {
+                    // Enqueue media jobs for media-bearing content
+                    const telegramMediaKind = (normalized.metadata as Record<string, unknown>)?.mediaKind;
+                    const requiresMediaJob =
+                        normalized.type === 'VIDEO' ||
+                        normalized.type === 'PODCAST' ||
+                        (normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
+
+                    if (requiresMediaJob && normalized.status !== 'ARCHIVED') {
                         const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady);
                         const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
 
@@ -282,12 +297,16 @@ export const normalizeWorker = createWorker({
                             const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
 
                             if (mediaQueue) {
+                                const downloadRef = (normalized.metadata as Record<string, unknown>)?.telegramDownloadRef as TelegramDownloadRef | undefined;
+
                                 await mediaQueue.add(
                                     `media-${normalized.type}-${contentItemId}`,
                                     {
                                         contentItemId,
                                         contentType: normalized.type,
+                                        sourceType,
                                         sourceUrl,
+                                        downloadRef,
                                         operations: ['download', 'transcode', 'thumbnail'],
                                     },
                                     {

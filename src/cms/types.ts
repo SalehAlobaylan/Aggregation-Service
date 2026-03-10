@@ -4,7 +4,7 @@
 
 // Content types - must match queue schemas
 export type ContentType = 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
-export type SourceType = 'RSS' | 'WEBSITE' | 'PODCAST' | 'PODCAST_DISCOVERY' | 'YOUTUBE' | 'TWITTER' | 'REDDIT' | 'UPLOAD' | 'MANUAL';
+export type SourceType = 'RSS' | 'WEBSITE' | 'TELEGRAM' | 'PODCAST' | 'PODCAST_DISCOVERY' | 'YOUTUBE' | 'TWITTER' | 'REDDIT' | 'UPLOAD' | 'MANUAL';
 export type ContentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' | 'ARCHIVED';
 
 /**
@@ -156,6 +156,26 @@ export interface LinkTranscriptRequest {
 export interface UpdateEmbeddingRequest {
     embedding: number[];
     topic_tags?: string[];
+}
+
+/**
+ * GET /internal/content-items response item
+ * Lightweight projection used for retry/requeue operations
+ */
+export interface InternalContentListItem {
+    id: string;
+    type: ContentType;
+    source: SourceType;
+    status: ContentStatus;
+    original_url: string;
+    metadata: Record<string, unknown>;
+}
+
+export interface InternalContentListResponse {
+    data: InternalContentListItem[];
+    total: number;
+    page: number;
+    limit: number;
 }
 
 /**

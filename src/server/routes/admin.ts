@@ -12,6 +12,7 @@ import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
 import { normalizeBatch } from '../../normalizers/index.js';
+import { cmsClient } from '../../cms/client.js';
 
 interface TriggerBody {
     sourceType: SourceType;
@@ -46,6 +47,19 @@ interface JobResponse {
     processedOn?: number;
     finishedOn?: number;
     timestamp: number;
+}
+
+interface RetryFailedBody {
+    source?: string;
+    limit?: number;
+}
+
+interface RetryFailedResponse {
+    success: boolean;
+    message: string;
+    requeued: number;
+    total: number;
+    errors: string[];
 }
 
 interface DiscoverFeedsBody {
@@ -564,6 +578,101 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 logger.error('iTunes search endpoint error', error);
                 return reply.status(500).send({ error: 'iTunes search failed' });
             }
+        }
+    );
+
+    /**
+     * Requeue FAILED content items back into the media pipeline
+     * POST /admin/retry-failed
+     * Body: { source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
+     *
+     * - Fetches FAILED items from CMS (filtered by source if provided)
+     * - Resets each item's status to PENDING
+     * - Enqueues a fresh media job for each item
+     * Returns the count of successfully requeued items.
+     */
+    fastify.post<{ Body: RetryFailedBody; Reply: RetryFailedResponse }>(
+        '/admin/retry-failed',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { source, limit = 100 } = request.body ?? {};
+            const safeLimit = Math.max(1, Math.min(limit, 500));
+
+            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
+            if (!mediaQueue) {
+                return reply.status(503).send({
+                    success: false,
+                    message: 'Media queue is not available',
+                    requeued: 0,
+                    total: 0,
+                    errors: [],
+                });
+            }
+
+            let listResult;
+            try {
+                listResult = await cmsClient.listContentItems({
+                    status: 'FAILED',
+                    source: source?.toUpperCase(),
+                    limit: safeLimit,
+                });
+            } catch (err) {
+                logger.error('retry-failed: failed to list content items from CMS', err);
+                return reply.status(502).send({
+                    success: false,
+                    message: `Failed to fetch FAILED items from CMS: ${err instanceof Error ? err.message : String(err)}`,
+                    requeued: 0,
+                    total: 0,
+                    errors: [],
+                });
+            }
+
+            let requeued = 0;
+            const errors: string[] = [];
+
+            for (const item of listResult.data) {
+                try {
+                    // Reset status so the item can progress again
+                    await cmsClient.updateStatus(item.id, { status: 'PENDING' });
+
+                    const downloadRef = item.metadata?.telegramDownloadRef as
+                        | { channelUsername: string; messageId: number; mediaKind: 'audio' | 'voice' | 'video' | 'photo'; fileName?: string; mimeType?: string }
+                        | undefined;
+
+                    const operations: ('download' | 'transcode' | 'thumbnail')[] =
+                        item.source === 'TELEGRAM' && item.metadata?.mediaKind === 'photo'
+                            ? ['download']
+                            : ['download', 'transcode', 'thumbnail'];
+
+                    await mediaQueue.add(
+                        `retry-media-${item.source}-${item.id}`,
+                        {
+                            contentItemId: item.id,
+                            contentType: item.type,
+                            sourceType: item.source,
+                            sourceUrl: item.original_url,
+                            operations,
+                            downloadRef,
+                        },
+                        { priority: 3 }
+                    );
+
+                    requeued++;
+                    logger.info('retry-failed: requeued item', { contentItemId: item.id, source: item.source });
+                } catch (err) {
+                    const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
+                    errors.push(msg);
+                    logger.warn('retry-failed: failed to requeue item', { contentItemId: item.id, error: msg });
+                }
+            }
+
+            return reply.send({
+                success: true,
+                message: `Re-queued ${requeued} of ${listResult.data.length} FAILED items`,
+                requeued,
+                total: listResult.total,
+                errors,
+            });
         }
     );
 }

@@ -81,6 +81,37 @@ export interface YouTubeSourceConfig extends SourceConfig {
 }
 
 /**
+ * Telegram-specific media kinds supported by ingestion
+ */
+export type TelegramMediaType = 'audio' | 'voice' | 'video' | 'photo' | 'text';
+
+/**
+ * Telegram message locator used by media worker download step
+ */
+export interface TelegramDownloadRef {
+    channelUsername: string;
+    channelId?: string;
+    messageId: number;
+    mediaKind: TelegramMediaType;
+    fileName?: string;
+    mimeType?: string;
+}
+
+/**
+ * Telegram-specific config
+ */
+export interface TelegramSourceConfig extends SourceConfig {
+    type: 'TELEGRAM';
+    settings: {
+        channelUsername?: string;
+        minDurationSec?: number;
+        mediaTypes?: TelegramMediaType[];
+        maxDurationSec?: number;
+        maxResults?: number;
+    };
+}
+
+/**
  * Reddit-specific config
  */
 export interface RedditSourceConfig extends SourceConfig {

@@ -74,6 +74,7 @@ Examples:
             {
                 contentItemId,
                 contentType: args.type,
+                sourceType: args.url.includes('youtube.com') || args.url.includes('youtu.be') ? 'YOUTUBE' : 'PODCAST',
                 sourceUrl: args.url,
                 operations: ['download', 'transcode', 'thumbnail'],
             },

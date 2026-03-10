@@ -117,6 +117,7 @@ describe('Rate Limiter', () => {
             const limits = rateLimiter.getRateLimits();
 
             expect(limits.RSS).toBeDefined();
+            expect(limits.TELEGRAM).toBeDefined();
             expect(limits.YOUTUBE).toBeDefined();
             expect(limits.REDDIT).toBeDefined();
             expect(limits.TWITTER).toBeDefined();

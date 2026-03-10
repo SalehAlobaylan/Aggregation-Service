@@ -3,8 +3,9 @@
  * FFmpeg-based video/audio transcoding and thumbnail extraction
  */
 import ffmpeg from 'fluent-ffmpeg';
+import { deflateSync } from 'zlib';
 import { join } from 'path';
-import { stat, readFile, writeFile } from 'fs/promises';
+import { stat, writeFile } from 'fs/promises';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 
@@ -172,26 +173,63 @@ export function audioToMp4(
 }
 
 /**
- * Generate a simple placeholder image for audio-to-MP4 conversion
+ * Build a PNG chunk (length + type + data + CRC32)
  */
-async function generatePlaceholderImage(outputPath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-        ffmpeg()
-            .input('color=c=black:s=1280x720:d=1')
-            .inputFormat('lavfi')
-            .outputOptions(['-frames:v 1'])
-            .output(outputPath)
-            .on('end', () => {
-                logger.debug('Generated placeholder image', { outputPath });
-                resolve();
-            })
-            .on('error', reject)
-            .run();
-    });
+let _crcTable: Uint32Array | null = null;
+function crc32(buf: Buffer): number {
+    if (!_crcTable) {
+        _crcTable = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+            let c = i;
+            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            _crcTable[i] = c;
+        }
+    }
+    let crc = 0xFFFFFFFF;
+    for (const b of buf) crc = (_crcTable[(crc ^ b) & 0xFF]!) ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const typeBytes = Buffer.from(type, 'ascii');
+    const crcBuf = Buffer.alloc(4);
+    crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])));
+    return Buffer.concat([len, typeBytes, data, crcBuf]);
 }
 
 /**
- * Extract thumbnail from video at specified offset
+ * Generate a 1280×720 solid-black PNG without using ffmpeg or lavfi.
+ * Uses only Node's built-in zlib — works regardless of ffmpeg build flags.
+ */
+async function generatePlaceholderImage(outputPath: string): Promise<void> {
+    const W = 1280, H = 720;
+    // Each row: 1 filter byte (0 = None) + W*3 RGB bytes (all 0 = black)
+    const row = Buffer.alloc(1 + W * 3, 0);
+    const raw = Buffer.concat(Array.from({ length: H }, () => row));
+    const compressed = deflateSync(raw);
+
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(W, 0);
+    ihdr.writeUInt32BE(H, 4);
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 2; // RGB color type
+
+    const png = Buffer.concat([
+        Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), // PNG signature
+        pngChunk('IHDR', ihdr),
+        pngChunk('IDAT', compressed),
+        pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+
+    await writeFile(outputPath, png);
+    logger.debug('Generated placeholder image (pure Node.js)', { outputPath, size: png.length });
+}
+
+/**
+ * Extract thumbnail from video at specified offset.
+ * Writes to the exact outputPath provided (safe for concurrent jobs).
  */
 export function extractThumbnail(
     inputPath: string,
@@ -202,21 +240,18 @@ export function extractThumbnail(
         logger.info('Extracting thumbnail', { inputPath, outputPath, offsetSeconds });
 
         ffmpeg(inputPath)
-            .screenshots({
-                timestamps: [offsetSeconds],
-                filename: 'thumb.jpg',
-                folder: config.mediaTempDir,
-                size: '640x360',
-            })
+            .seekInput(offsetSeconds)
+            .outputOptions(['-vframes 1', '-vf scale=640:360'])
+            .output(outputPath)
             .on('end', () => {
-                const thumbPath = join(config.mediaTempDir, 'thumb.jpg');
-                logger.info('Thumbnail extracted', { thumbPath });
-                resolve(thumbPath);
+                logger.info('Thumbnail extracted', { outputPath });
+                resolve(outputPath);
             })
             .on('error', (err) => {
                 logger.error('Thumbnail extraction error', err);
                 reject(err);
-            });
+            })
+            .run();
     });
 }
 

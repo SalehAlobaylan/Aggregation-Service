@@ -62,6 +62,14 @@ const configSchema = z.object({
     youtubeApiKey: z.string().nullable().default(null),
     youtubeQuotaLimit: positiveIntSchema.default(10000),
 
+    // Optional - Telegram API
+    telegramApiId: z.preprocess(
+        (val) => (val === undefined || val === null || val === '') ? null : Number(val),
+        z.number().int().positive().nullable().default(null)
+    ),
+    telegramApiHash: z.string().nullable().default(null),
+    telegramSessionString: z.string().nullable().default(null),
+
     // Optional - Reddit OAuth
     redditClientId: z.string().nullable().default(null),
     redditClientSecret: z.string().nullable().default(null),
@@ -122,6 +130,10 @@ function mapEnvToConfig(): Record<string, unknown> {
 
         youtubeApiKey: process.env.YOUTUBE_API_KEY || null,
         youtubeQuotaLimit: process.env.YOUTUBE_QUOTA_LIMIT,
+
+        telegramApiId: process.env.TELEGRAM_API_ID,
+        telegramApiHash: process.env.TELEGRAM_API_HASH || null,
+        telegramSessionString: process.env.TELEGRAM_SESSION_STRING || null,
 
         redditClientId: process.env.REDDIT_CLIENT_ID || null,
         redditClientSecret: process.env.REDDIT_CLIENT_SECRET || null,
@@ -196,6 +208,9 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
         cbFailureThreshold: cfg.cbFailureThreshold,
         cbResetTimeoutMs: cfg.cbResetTimeoutMs,
         youtubeApiKey: cfg.youtubeApiKey ? '[CONFIGURED]' : null,
+        telegramApiId: cfg.telegramApiId ? '[CONFIGURED]' : null,
+        telegramApiHash: cfg.telegramApiHash ? '[CONFIGURED]' : null,
+        telegramSessionString: cfg.telegramSessionString ? '[CONFIGURED]' : null,
         redditClientId: cfg.redditClientId ? '[CONFIGURED]' : null,
         twitterBearerToken: cfg.twitterBearerToken ? '[CONFIGURED]' : null,
         adminJwtIssuer: cfg.adminJwtIssuer,

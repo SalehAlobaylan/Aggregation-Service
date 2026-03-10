@@ -10,6 +10,7 @@ import { rssFetcher } from './rss.fetcher.js';
 import { youtubeFetcher } from './youtube.fetcher.js';
 import { podcastFetcher } from './podcast.fetcher.js';
 import { itunesFetcher } from './itunes.fetcher.js';
+import { telegramFetcher } from './telegram.fetcher.js';
 import { redditFetcher } from './reddit.fetcher.js';
 import { twitterFetcher } from './twitter.fetcher.js';
 import { manualFetcher } from './manual.fetcher.js';
@@ -19,6 +20,7 @@ import { websiteFetcher } from './website.fetcher.js';
 const fetchers: Map<SourceType, Fetcher> = new Map([
     ['RSS', rssFetcher],
     ['WEBSITE', websiteFetcher],
+    ['TELEGRAM', telegramFetcher],
     ['YOUTUBE', youtubeFetcher],
     ['PODCAST', podcastFetcher],
     ['PODCAST_DISCOVERY', itunesFetcher],

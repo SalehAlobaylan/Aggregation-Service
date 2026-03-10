@@ -9,6 +9,7 @@ import type { Normalizer, NormalizedItem, NormalizationResult } from './types.js
 
 import { articleNormalizer } from './article.normalizer.js';
 import { videoNormalizer } from './video.normalizer.js';
+import { telegramNormalizer } from './telegram.normalizer.js';
 import { podcastNormalizer } from './podcast.normalizer.js';
 import { socialNormalizer } from './social.normalizer.js';
 import { manualNormalizer } from './manual.normalizer.js';
@@ -17,6 +18,7 @@ import { manualNormalizer } from './manual.normalizer.js';
 const normalizersBySource: Map<SourceType, Normalizer> = new Map([
     ['RSS', articleNormalizer],
     ['WEBSITE', articleNormalizer],
+    ['TELEGRAM', telegramNormalizer],
     ['YOUTUBE', videoNormalizer],
     ['PODCAST', podcastNormalizer],
     ['REDDIT', socialNormalizer],
