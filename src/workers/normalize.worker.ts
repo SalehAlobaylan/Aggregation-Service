@@ -28,7 +28,7 @@ interface TelegramDownloadRef {
     channelUsername: string;
     channelId?: string;
     messageId: number;
-    mediaKind: 'audio' | 'voice' | 'video' | 'photo';
+    mediaKind: 'audio' | 'voice' | 'video' | 'photo' | 'text';
     fileName?: string;
     mimeType?: string;
 }
@@ -255,12 +255,20 @@ export const normalizeWorker = createWorker({
                         status: normalized.status,
                     });
 
-                    // Enqueue media jobs for media-bearing content
-                    const telegramMediaKind = (normalized.metadata as Record<string, unknown>)?.mediaKind;
+                    // Routing decision based on content type and media kind
+                    const telegramMediaKind = (normalized.metadata as Record<string, unknown>)?.mediaKind as string | undefined;
+
+                    // Items that need the full media pipeline (download → transcode → thumbnail → AI)
                     const requiresMediaJob =
                         normalized.type === 'VIDEO' ||
                         normalized.type === 'PODCAST' ||
                         (normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
+
+                    // Text-only Telegram posts: skip media pipeline, go straight to AI for embedding
+                    const isTextArticle =
+                        normalized.type === 'ARTICLE' &&
+                        sourceType === 'TELEGRAM' &&
+                        telegramMediaKind === 'text';
 
                     if (requiresMediaJob && normalized.status !== 'ARCHIVED') {
                         const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady);
@@ -282,9 +290,7 @@ export const normalizeWorker = createWorker({
                                         },
                                         mediaUrl: normalized.mediaUrl,
                                     },
-                                    {
-                                        priority: 2,
-                                    }
+                                    { priority: 2 }
                                 );
 
                                 aiEnqueued++;
@@ -309,14 +315,37 @@ export const normalizeWorker = createWorker({
                                         downloadRef,
                                         operations: ['download', 'transcode', 'thumbnail'],
                                     },
-                                    {
-                                        priority: normalized.type === 'VIDEO' ? 2 : 3,
-                                    }
+                                    { priority: normalized.type === 'VIDEO' ? 2 : 3 }
                                 );
 
                                 mediaEnqueued++;
                                 jobLogger.debug('Enqueued media job', { contentItemId, type: normalized.type });
                             }
+                        }
+                    } else if (isTextArticle && normalized.status !== 'ARCHIVED') {
+                        // Text posts: body_text is already available — generate embedding directly
+                        const aiQueue = getQueue(QUEUE_NAMES.AI);
+                        if (aiQueue) {
+                            await aiQueue.add(
+                                `ai-text-article-${contentItemId}`,
+                                {
+                                    contentItemId,
+                                    contentType: normalized.type,
+                                    operations: ['embedding'],
+                                    textContent: {
+                                        title: normalized.title,
+                                        excerpt: normalized.excerpt || undefined,
+                                        bodyText: normalized.bodyText || undefined,
+                                    },
+                                },
+                                { priority: 2 }
+                            );
+
+                            aiEnqueued++;
+                            jobLogger.debug('Enqueued AI job for text article', {
+                                contentItemId,
+                                type: normalized.type,
+                            });
                         }
                     }
                 } else {

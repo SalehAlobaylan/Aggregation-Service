@@ -1,6 +1,10 @@
 /**
  * Telegram Normalizer
- * Normalizes Telegram audio/voice items to PODCAST content items.
+ * Maps Telegram messages to canonical content types:
+ *   audio / voice → PODCAST  (For You feed)
+ *   video         → VIDEO    (For You feed)
+ *   photo         → ARTICLE  (News feed — photo + caption)
+ *   text          → ARTICLE  (News feed — text-only post)
  */
 import { dedupService } from '../services/dedup.service.js';
 import { classifyNewsCandidate } from '../services/news-classifier.service.js';
@@ -45,6 +49,9 @@ export const telegramNormalizer: Normalizer = {
             ? ['news', ...news.categoryHints.map((category) => `news-${category}`)].slice(0, 4)
             : [];
 
+        // Text-only posts have no media to download; omit telegramDownloadRef
+        const isTextPost = mediaKind === 'text';
+
         return {
             idempotencyKey,
             type: contentType,
@@ -59,7 +66,7 @@ export const telegramNormalizer: Normalizer = {
             sourceName,
             sourceFeedUrl,
 
-            // Telegram media is downloaded in the media worker.
+            // Media is downloaded in the media worker (not needed for text posts)
             mediaUrl: null,
             thumbnailUrl: item.thumbnailUrl || null,
             originalUrl: item.url,
@@ -74,9 +81,11 @@ export const telegramNormalizer: Normalizer = {
                 mediaKind: item.metadata.mediaKind,
                 news,
                 newsSignals,
-                mimeType: item.metadata.mimeType,
-                fileName: item.metadata.fileName,
-                telegramDownloadRef: item.metadata.telegramDownloadRef,
+                ...(isTextPost ? {} : {
+                    mimeType: item.metadata.mimeType,
+                    fileName: item.metadata.fileName,
+                    telegramDownloadRef: item.metadata.telegramDownloadRef,
+                }),
                 fetchedAt: item.fetchedAt,
             },
             publishedAt,
@@ -87,11 +96,8 @@ export const telegramNormalizer: Normalizer = {
 function mapTelegramMediaKindToContentType(
     mediaKind: string
 ): NormalizedItem['type'] {
-    if (mediaKind === 'video') {
-        return 'VIDEO';
-    }
-    if (mediaKind === 'photo') {
-        return 'ARTICLE';
-    }
+    if (mediaKind === 'video') return 'VIDEO';
+    if (mediaKind === 'photo') return 'ARTICLE';
+    if (mediaKind === 'text') return 'ARTICLE';
     return 'PODCAST';
 }

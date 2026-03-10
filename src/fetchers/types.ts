@@ -105,9 +105,13 @@ export interface TelegramSourceConfig extends SourceConfig {
     settings: {
         channelUsername?: string;
         minDurationSec?: number;
-        mediaTypes?: TelegramMediaType[];
         maxDurationSec?: number;
+        mediaTypes?: TelegramMediaType[];
         maxResults?: number;
+        /** Only fetch messages newer than this many hours. Break iteration when exceeded. */
+        maxAgeHours?: number;
+        /** Minimum character count for text posts to be ingested (default 20). */
+        minTextLength?: number;
     };
 }
 

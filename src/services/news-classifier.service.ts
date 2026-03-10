@@ -1,5 +1,5 @@
 /**
- * Lightweight news classifier for ingestion-time scoring.
+ * Lightweight bilingual (English + Arabic) news classifier for ingestion-time scoring.
  * Produces a structured metadata.news object for downstream ranking/filtering.
  */
 
@@ -32,9 +32,13 @@ export interface NewsClassifierInput {
 }
 
 const NEWS_KEYWORD_WEIGHTS: Array<{ keyword: string; weight: number; category: string }> = [
+    // ── English ──────────────────────────────────────────────────────────────
     { keyword: 'breaking', weight: 8, category: 'general' },
     { keyword: 'urgent', weight: 7, category: 'general' },
     { keyword: 'news', weight: 5, category: 'general' },
+    { keyword: 'report', weight: 4, category: 'general' },
+    { keyword: 'update', weight: 3, category: 'general' },
+    { keyword: 'official', weight: 5, category: 'general' },
     { keyword: 'statement', weight: 4, category: 'politics' },
     { keyword: 'announced', weight: 4, category: 'politics' },
     { keyword: 'minister', weight: 6, category: 'politics' },
@@ -42,20 +46,74 @@ const NEWS_KEYWORD_WEIGHTS: Array<{ keyword: string; weight: number; category: s
     { keyword: 'president', weight: 6, category: 'politics' },
     { keyword: 'parliament', weight: 6, category: 'politics' },
     { keyword: 'election', weight: 6, category: 'politics' },
+    { keyword: 'decree', weight: 5, category: 'politics' },
     { keyword: 'economy', weight: 5, category: 'economy' },
     { keyword: 'inflation', weight: 5, category: 'economy' },
     { keyword: 'market', weight: 4, category: 'economy' },
+    { keyword: 'budget', weight: 5, category: 'economy' },
     { keyword: 'conflict', weight: 6, category: 'conflict' },
     { keyword: 'attack', weight: 6, category: 'conflict' },
     { keyword: 'ceasefire', weight: 6, category: 'conflict' },
     { keyword: 'earthquake', weight: 7, category: 'disaster' },
     { keyword: 'flood', weight: 6, category: 'disaster' },
     { keyword: 'storm', weight: 5, category: 'disaster' },
+    { keyword: 'fire', weight: 5, category: 'disaster' },
+
+    // ── Arabic ────────────────────────────────────────────────────────────────
+    // General
+    { keyword: 'عاجل', weight: 8, category: 'general' },       // urgent / breaking
+    { keyword: 'عاجلة', weight: 8, category: 'general' },      // breaking (fem.)
+    { keyword: 'أخبار', weight: 5, category: 'general' },      // news
+    { keyword: 'بيان', weight: 5, category: 'general' },       // statement
+    { keyword: 'تقرير', weight: 4, category: 'general' },      // report
+    { keyword: 'رسمي', weight: 5, category: 'general' },       // official
+    { keyword: 'رسمية', weight: 5, category: 'general' },      // official (fem.)
+    { keyword: 'تحديث', weight: 3, category: 'general' },      // update
+    { keyword: 'تنبيه', weight: 6, category: 'general' },      // alert
+    // Politics
+    { keyword: 'وزير', weight: 6, category: 'politics' },      // minister
+    { keyword: 'وزارة', weight: 5, category: 'politics' },     // ministry
+    { keyword: 'حكومة', weight: 6, category: 'politics' },     // government
+    { keyword: 'رئيس', weight: 6, category: 'politics' },      // president / head
+    { keyword: 'مجلس', weight: 5, category: 'politics' },      // council / parliament
+    { keyword: 'برلمان', weight: 6, category: 'politics' },    // parliament
+    { keyword: 'انتخابات', weight: 6, category: 'politics' },  // elections
+    { keyword: 'قرار', weight: 5, category: 'politics' },      // decision / decree
+    { keyword: 'مرسوم', weight: 5, category: 'politics' },     // royal decree
+    { keyword: 'ملك', weight: 6, category: 'politics' },       // king
+    { keyword: 'أمير', weight: 6, category: 'politics' },      // prince / emir
+    { keyword: 'سمو', weight: 5, category: 'politics' },       // highness
+    { keyword: 'ولي العهد', weight: 7, category: 'politics' }, // crown prince
+    { keyword: 'سفير', weight: 5, category: 'politics' },      // ambassador
+    { keyword: 'قمة', weight: 5, category: 'politics' },       // summit
+    { keyword: 'اتفاقية', weight: 5, category: 'politics' },   // agreement / treaty
+    // Economy
+    { keyword: 'اقتصاد', weight: 5, category: 'economy' },     // economy
+    { keyword: 'سوق', weight: 4, category: 'economy' },        // market
+    { keyword: 'تداول', weight: 4, category: 'economy' },      // trading
+    { keyword: 'ميزانية', weight: 5, category: 'economy' },    // budget
+    { keyword: 'نفط', weight: 4, category: 'economy' },        // oil
+    { keyword: 'ريال', weight: 3, category: 'economy' },       // riyal
+    { keyword: 'تضخم', weight: 5, category: 'economy' },       // inflation
+    { keyword: 'استثمار', weight: 4, category: 'economy' },    // investment
+    // Conflict
+    { keyword: 'هجوم', weight: 6, category: 'conflict' },      // attack
+    { keyword: 'صراع', weight: 6, category: 'conflict' },      // conflict
+    { keyword: 'معركة', weight: 6, category: 'conflict' },     // battle
+    { keyword: 'حرب', weight: 7, category: 'conflict' },       // war
+    { keyword: 'وقف إطلاق النار', weight: 6, category: 'conflict' }, // ceasefire
+    { keyword: 'اعتقال', weight: 5, category: 'conflict' },    // arrest
+    // Disaster
+    { keyword: 'زلزال', weight: 7, category: 'disaster' },     // earthquake
+    { keyword: 'فيضان', weight: 6, category: 'disaster' },     // flood
+    { keyword: 'حريق', weight: 5, category: 'disaster' },      // fire
+    { keyword: 'كارثة', weight: 6, category: 'disaster' },     // disaster
+    { keyword: 'إعصار', weight: 6, category: 'disaster' },     // hurricane / cyclone
 ];
 
-const NEWS_SOURCE_PATTERN = /\b(news|press|agency|journal|media|times|post|herald|official)\b/i;
-const ATTRIBUTION_PATTERN = /\b(according to|reported by|confirmed by|statement|announced|officials said)\b/i;
-const BREAKING_PREFIX_PATTERN = /^\s*(breaking|urgent|alert)\b/i;
+const NEWS_SOURCE_PATTERN = /\b(news|press|agency|journal|media|times|post|herald|official|أخبار|وكالة|صحيفة|جريدة|رسمي)\b/i;
+const ATTRIBUTION_PATTERN = /\b(according to|reported by|confirmed by|statement|announced|officials said|وفقاً?|حسب|أكد|أفاد|أعلن|صرّح|صرح)\b/i;
+const BREAKING_PREFIX_PATTERN = /^\s*(breaking|urgent|alert|عاجل|عاجلة|تنبيه)\b/i;
 
 export function classifyNewsCandidate(input: NewsClassifierInput): NewsClassification {
     const title = (input.title || '').trim();

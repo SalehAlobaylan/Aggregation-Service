@@ -1,6 +1,9 @@
 /**
  * Telegram Fetcher
- * Fetches audio/voice messages from public Telegram channels.
+ * Fetches media and text messages from public Telegram channels.
+ * Media types fetched are controlled by the source's media_types config:
+ *   audio / voice / video / photo → For You feed (PODCAST / VIDEO / ARTICLE)
+ *   text                          → News feed (ARTICLE)
  */
 import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
@@ -18,6 +21,8 @@ import type {
 
 const DEFAULT_MIN_DURATION_SEC = 120;
 const DEFAULT_MAX_RESULTS = 50;
+const DEFAULT_MIN_TEXT_LENGTH = 20;
+const MAX_RESULTS_CAP = 200;
 
 interface ParsedTelegramSettings {
     channelUsername: string;
@@ -25,6 +30,10 @@ interface ParsedTelegramSettings {
     maxDurationSec?: number;
     mediaTypes: TelegramMediaType[];
     maxResults: number;
+    /** Skip text/photo messages older than this many hours. Undefined = no age limit. */
+    maxAgeHours?: number;
+    /** Minimum character length for text posts to be ingested. */
+    minTextLength: number;
 }
 
 type TelegramSettingsInput = Record<string, unknown>;
@@ -86,7 +95,7 @@ export const telegramFetcher: Fetcher = {
                     }
                     scannedMessages++;
 
-                    const extracted = extractTelegramAudio(message);
+                    const extracted = extractTelegramContent(message);
                     if (!extracted) {
                         skipped++;
                         continue;
@@ -97,41 +106,86 @@ export const telegramFetcher: Fetcher = {
                         continue;
                     }
 
-                    const durationSec = extracted.durationSec;
-                    const appliesDurationFilter = extracted.mediaKind !== 'photo';
-                    if (appliesDurationFilter && (!durationSec || durationSec < settings.minDurationSec)) {
-                        skipped++;
-                        continue;
+                    // Age filter: Telegram iterates newest-first, so once we hit an old message
+                    // everything that follows is even older — break out early.
+                    if (settings.maxAgeHours !== undefined) {
+                        const rawDate = message.date as unknown;
+                        const messageDate = rawDate instanceof Date ? rawDate : null;
+                        if (messageDate) {
+                            const ageHours = (Date.now() - messageDate.getTime()) / (1000 * 60 * 60);
+                            if (ageHours > settings.maxAgeHours) {
+                                logger.debug('Telegram: stopping iteration — message exceeds max age', {
+                                    messageId: message.id,
+                                    ageHours: Math.round(ageHours),
+                                    maxAgeHours: settings.maxAgeHours,
+                                });
+                                break;
+                            }
+                        }
                     }
-                    if (
-                        appliesDurationFilter &&
-                        typeof settings.maxDurationSec === 'number' &&
-                        durationSec &&
-                        durationSec > settings.maxDurationSec
-                    ) {
-                        skipped++;
-                        continue;
+
+                    // Minimum text length filter (only for text-only posts)
+                    if (extracted.mediaKind === 'text') {
+                        const rawMessageText = (message.message as string | undefined) || '';
+                        if (rawMessageText.trim().length < settings.minTextLength) {
+                            skipped++;
+                            continue;
+                        }
+                    }
+
+                    // Duration filter only applies to timed media (audio, voice, video)
+                    const hasDurationFilter = extracted.mediaKind !== 'photo' && extracted.mediaKind !== 'text';
+                    if (hasDurationFilter) {
+                        const durationSec = extracted.durationSec;
+                        if (!durationSec || durationSec < settings.minDurationSec) {
+                            skipped++;
+                            continue;
+                        }
+                        if (
+                            typeof settings.maxDurationSec === 'number' &&
+                            durationSec > settings.maxDurationSec
+                        ) {
+                            skipped++;
+                            continue;
+                        }
                     }
 
                     lastMessageId = message.id;
-                    const title = extracted.title || message.message || `Telegram ${extracted.mediaKind} ${message.id}`;
-                    const description = message.message || '';
+                    const rawMessageText = (message.message as string | undefined) || '';
                     const rawDate = message.date as unknown;
                     const publishedAt = rawDate instanceof Date
                         ? rawDate.toISOString()
                         : undefined;
                     const originalUrl = `https://t.me/${publicChannel}/${message.id}`;
 
+                    // For text posts, derive title from message structure; for media, use embedded title
+                    const { title, body } = extracted.mediaKind === 'text'
+                        ? extractTitleAndBody(rawMessageText)
+                        : {
+                            title: extracted.title || rawMessageText || `Telegram ${extracted.mediaKind} ${message.id}`,
+                            body: rawMessageText,
+                        };
+
+                    // telegramDownloadRef only needed for media types (not text)
+                    const downloadRef = extracted.mediaKind !== 'text' ? {
+                        channelUsername: settings.channelUsername,
+                        channelId: getEntityId(entity),
+                        messageId: message.id,
+                        mediaKind: extracted.mediaKind,
+                        fileName: extracted.fileName,
+                        mimeType: extracted.mimeType,
+                    } : undefined;
+
                     const item: RawFetchedItem = {
                         externalId: `${publicChannel}:${message.id}`,
                         sourceType: 'TELEGRAM',
                         url: originalUrl,
                         title,
-                        content: description,
-                        excerpt: description.substring(0, 300),
+                        content: body,
+                        excerpt: body.substring(0, 300),
                         author: extracted.author || channelTitle,
                         publishedAt,
-                        duration: durationSec,
+                        duration: extracted.durationSec,
                         metadata: {
                             channelUsername: settings.channelUsername,
                             channelTitle,
@@ -140,18 +194,8 @@ export const telegramFetcher: Fetcher = {
                             mediaKind: extracted.mediaKind,
                             mimeType: extracted.mimeType,
                             fileName: extracted.fileName,
-                            newsSignals: inferNewsSignals({
-                                title,
-                                text: description,
-                            }),
-                            telegramDownloadRef: {
-                                channelUsername: settings.channelUsername,
-                                channelId: getEntityId(entity),
-                                messageId: message.id,
-                                mediaKind: extracted.mediaKind,
-                                fileName: extracted.fileName,
-                                mimeType: extracted.mimeType,
-                            },
+                            newsSignals: inferNewsSignals({ title, text: body }),
+                            ...(downloadRef ? { telegramDownloadRef: downloadRef } : {}),
                         },
                         fetchedAt: new Date().toISOString(),
                     };
@@ -206,21 +250,34 @@ function parseTelegramSettings(configInput: TelegramSourceConfig): ParsedTelegra
     const requestedMediaTypes = Array.isArray(rawMediaTypes)
         ? rawMediaTypes.filter(
             (value): value is TelegramMediaType =>
-                value === 'audio' || value === 'voice' || value === 'video' || value === 'photo'
+                value === 'audio' || value === 'voice' || value === 'video' || value === 'photo' || value === 'text'
         )
         : [];
+    // Default to audio+voice for backwards compatibility.
+    // Admins must explicitly add 'text' to fetch news text posts.
     const mediaTypes: TelegramMediaType[] = requestedMediaTypes.length > 0
         ? requestedMediaTypes
         : ['audio', 'voice'];
 
     const maxResultsCandidate = getNumber(raw, ['maxResults', 'max_results']);
     const maxResults = typeof maxResultsCandidate === 'number' && maxResultsCandidate > 0
-        ? Math.min(100, Math.floor(maxResultsCandidate))
+        ? Math.min(MAX_RESULTS_CAP, Math.floor(maxResultsCandidate))
         : DEFAULT_MAX_RESULTS;
+
     const maxDurationCandidate = getNumber(raw, ['maxDurationSec', 'max_duration_sec']);
     const maxDurationSec = typeof maxDurationCandidate === 'number' && maxDurationCandidate > 0
         ? Math.floor(maxDurationCandidate)
         : undefined;
+
+    const maxAgeHoursCandidate = getNumber(raw, ['maxAgeHours', 'max_age_hours']);
+    const maxAgeHours = typeof maxAgeHoursCandidate === 'number' && maxAgeHoursCandidate > 0
+        ? Math.floor(maxAgeHoursCandidate)
+        : undefined;
+
+    const minTextLengthCandidate = getNumber(raw, ['minTextLength', 'min_text_length']);
+    const minTextLength = typeof minTextLengthCandidate === 'number' && minTextLengthCandidate > 0
+        ? Math.floor(minTextLengthCandidate)
+        : DEFAULT_MIN_TEXT_LENGTH;
 
     return {
         channelUsername,
@@ -228,6 +285,8 @@ function parseTelegramSettings(configInput: TelegramSourceConfig): ParsedTelegra
         maxDurationSec,
         mediaTypes,
         maxResults,
+        maxAgeHours,
+        minTextLength,
     };
 }
 
@@ -314,9 +373,18 @@ function getArray(raw: TelegramSettingsInput, keys: string[]): unknown[] | undef
 export const telegramFetcherTestUtils = {
     normalizeTelegramChannel,
     parseTelegramSettings,
+    extractTelegramContent,
+    extractTitleAndBody,
 };
 
-function extractTelegramAudio(message: unknown): {
+/**
+ * Extracts content kind and metadata from a Telegram message.
+ * Returns null if the message cannot be mapped to any supported media type.
+ *
+ * Text-only messages (no media attachment) are returned as mediaKind='text'.
+ * Media messages (photo / audio / voice / video) return their respective kind.
+ */
+function extractTelegramContent(message: unknown): {
     mediaKind: TelegramMediaType;
     durationSec?: number;
     fileName?: string;
@@ -325,22 +393,28 @@ function extractTelegramAudio(message: unknown): {
     author?: string;
 } | null {
     const messageData = message as Record<string, unknown>;
+    const rawText = typeof messageData['message'] === 'string' ? messageData['message'].trim() : '';
     const media = messageData['media'] as Record<string, unknown> | undefined;
+
+    // Text-only message — no media attachment at all
+    // Length check is applied by the caller using settings.minTextLength
     if (!media) {
+        if (rawText.length > 0) {
+            return { mediaKind: 'text' };
+        }
         return null;
     }
 
-    const mediaClassName = media.constructor?.name;
+    // Photo message (may also have a text caption)
+    const mediaClassName = (media.constructor as { name?: string } | undefined)?.name;
     if (mediaClassName === 'MessageMediaPhoto') {
         return {
             mediaKind: 'photo',
-            fileName: undefined,
             mimeType: 'image/jpeg',
-            title: undefined,
-            author: undefined,
         };
     }
 
+    // Document-based media (audio / voice / video)
     const document = media['document'] as Record<string, unknown> | undefined;
     if (!document) {
         return null;
@@ -375,30 +449,44 @@ function extractTelegramAudio(message: unknown): {
             durationSec: videoAttribute.duration ? Number(videoAttribute.duration) : undefined,
             fileName: fileNameAttribute?.fileName,
             mimeType: typeof document['mimeType'] === 'string' ? document['mimeType'] : 'video/mp4',
-            title: undefined,
-            author: undefined,
         };
     }
 
     return null;
 }
 
+/**
+ * Splits a raw text-post message into a title and body.
+ * Many channels use a short first line as the headline.
+ *
+ * Rules (language-agnostic, works for Arabic and English):
+ *   1. If the first line is ≤150 chars AND there is more content → first line = title, rest = body
+ *   2. Otherwise → first 100 chars + "…" = title, full text = body
+ */
+function extractTitleAndBody(text: string): { title: string; body: string } {
+    const trimmed = text.trim();
+    const newlineIdx = trimmed.search(/\n+/);
+
+    if (newlineIdx > 0 && newlineIdx <= 150) {
+        const firstLine = trimmed.slice(0, newlineIdx).trim();
+        const rest = trimmed.slice(newlineIdx).trim();
+        if (firstLine.length > 0 && rest.length > 0) {
+            return { title: firstLine, body: trimmed };
+        }
+    }
+
+    const title = trimmed.length > 100 ? `${trimmed.slice(0, 100)}…` : trimmed;
+    return { title, body: trimmed };
+}
+
 const NEWS_KEYWORDS = [
-    'breaking',
-    'news',
-    'urgent',
-    'report',
-    'update',
-    'official',
-    'statement',
-    'announced',
-    'minister',
-    'government',
-    'president',
-    'parliament',
-    'election',
-    'economy',
-    'conflict',
+    // English
+    'breaking', 'news', 'urgent', 'report', 'update', 'official',
+    'statement', 'announced', 'minister', 'government', 'president',
+    'parliament', 'election', 'economy', 'conflict',
+    // Arabic
+    'عاجل', 'أخبار', 'بيان', 'تقرير', 'رسمي', 'وزير',
+    'حكومة', 'رئيس', 'انتخابات', 'اقتصاد', 'هجوم', 'زلزال',
 ];
 
 function inferNewsSignals(input: { title: string; text: string }): {
