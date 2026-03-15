@@ -474,6 +474,45 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     );
 
     /**
+     * Purge all jobs from a queue or all queues
+     * POST /admin/queues/purge
+     */
+    fastify.post<{ Body: { queue?: string; includeFailed?: boolean } }>(
+        '/admin/queues/purge',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { queue: queueName, includeFailed = true } = request.body || {};
+            const purged: Record<string, number> = {};
+
+            const queuesToPurge = queueName
+                ? [queueName]
+                : Object.values(QUEUE_NAMES);
+
+            for (const qName of queuesToPurge) {
+                const queue = getQueue(qName as any);
+                if (!queue) continue;
+
+                let count = 0;
+                if (includeFailed) {
+                    await queue.clean(0, 0, 'failed');
+                    count = (await queue.getJobCounts()).failed || 0;
+                }
+                await queue.clean(0, 0, 'completed');
+                await queue.clean(0, 0, 'wait');
+                
+                purged[qName] = count;
+                logger.info('Queue purged', { queue: qName, failedRemoved: count });
+            }
+
+            return reply.send({
+                success: true,
+                message: `Purged ${Object.keys(purged).length} queue(s)`,
+                purged,
+            });
+        }
+    );
+
+    /**
      * Get job by ID from any queue
      * GET /admin/jobs/:id
      */
