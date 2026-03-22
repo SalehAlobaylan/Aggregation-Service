@@ -11,6 +11,7 @@ import { getQueue, QUEUE_NAMES, type DLQJob } from '../queues/index.js';
 export interface WorkerConfig {
     queueName: string;
     concurrency?: number;
+    timeoutMs?: number;
     processor: (job: Job, jobLogger: ReturnType<typeof createLogger>) => Promise<void>;
 }
 
@@ -18,7 +19,12 @@ export interface WorkerConfig {
  * Create a worker with standard event handlers and metrics
  */
 export function createWorker(workerConfig: WorkerConfig): Worker {
-    const { queueName, concurrency = config.workerConcurrency, processor } = workerConfig;
+    const {
+        queueName,
+        concurrency = config.workerConcurrency,
+        timeoutMs = config.defaultJobTimeoutMs,
+        processor,
+    } = workerConfig;
 
     const worker = new Worker(
         queueName,
@@ -32,7 +38,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
             jobLogger.info(`Job started`, { name: job.name, data: job.data });
 
             try {
-                await processor(job, jobLogger);
+                await withTimeout(processor(job, jobLogger), timeoutMs, queueName, job.id);
 
                 const durationSec = (Date.now() - startTime) / 1000;
                 jobDuration.labels(queueName, job.data?.sourceType || 'unknown').observe(durationSec);
@@ -46,6 +52,8 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
         {
             connection: getRedisConnection(),
             concurrency,
+            stalledInterval: config.stalledIntervalMs,
+            maxStalledCount: config.maxStalledCount,
         }
     );
 
@@ -77,7 +85,11 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
 
     worker.on('stalled', (jobId: string) => {
         jobsTotal.labels(queueName, 'stalled').inc();
-        logger.warn(`Job ${jobId} stalled in queue ${queueName}`);
+        logger.warn(`Job ${jobId} stalled in queue ${queueName}`, {
+            stalledIntervalMs: config.stalledIntervalMs,
+            maxStalledCount: config.maxStalledCount,
+            note: 'Job will be automatically failed and moved to DLQ after maxStalledCount is reached',
+        });
     });
 
     worker.on('error', (error: Error) => {
@@ -89,6 +101,22 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
     });
 
     return worker;
+}
+
+/**
+ * Race a promise against a timeout. Throws a named error if the timeout fires first.
+ */
+function withTimeout(promise: Promise<void>, ms: number, queueName: string, jobId?: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`Job timed out after ${ms}ms in queue ${queueName} (jobId: ${jobId ?? 'unknown'})`));
+        }, ms);
+
+        promise.then(
+            (val) => { clearTimeout(timer); resolve(val); },
+            (err) => { clearTimeout(timer); reject(err); }
+        );
+    });
 }
 
 /**

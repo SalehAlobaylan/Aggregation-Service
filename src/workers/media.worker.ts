@@ -33,6 +33,7 @@ import {
 export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
     concurrency: 2, // Media processing is resource-intensive
+    timeoutMs: config.mediaJobTimeoutMs, // 30 min default — FFmpeg transcodes can be slow
     processor: async (job: Job<MediaJob>, jobLogger): Promise<void> => {
         const { contentItemId, contentType, sourceType, sourceUrl, operations, downloadRef } = job.data;
 

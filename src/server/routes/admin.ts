@@ -13,6 +13,7 @@ import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
+import { getAllWorkers } from '../../workers/index.js';
 
 interface TriggerBody {
     sourceType: SourceType;
@@ -476,37 +477,86 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     /**
      * Purge all jobs from a queue or all queues
      * POST /admin/queues/purge
+     *
+     * This removes ALL jobs: waiting, delayed, failed, completed AND active.
+     * Workers are paused during the purge so in-progress jobs are killed.
      */
-    fastify.post<{ Body: { queue?: string; includeFailed?: boolean } }>(
+    fastify.post<{ Body: { queue?: string; states?: string[]; includeFailed?: boolean } }>(
         '/admin/queues/purge',
         { preHandler: verifyAdminAuth },
         async (request, reply) => {
-            const { queue: queueName, includeFailed = true } = request.body || {};
+            const { queue: queueName, states, includeFailed = true } = request.body || {};
             const purged: Record<string, number> = {};
+
+            // If states array is provided, use it; otherwise fall back to legacy includeFailed behavior
+            const allStates = ['waiting', 'delayed', 'active', 'completed', 'failed'];
+            const statesToPurge = states && states.length > 0
+                ? states.filter(s => allStates.includes(s))
+                : [...(includeFailed ? allStates : allStates.filter(s => s !== 'failed'))];
+
+            const needsPause = statesToPurge.includes('active');
 
             const queuesToPurge = queueName
                 ? [queueName]
                 : Object.values(QUEUE_NAMES);
 
+            // Pause workers only if we're killing active jobs
+            if (needsPause) {
+                const workers = getAllWorkers();
+                for (const worker of workers) {
+                    try { await worker.pause(); } catch (_) { /* already paused */ }
+                }
+            }
+
             for (const qName of queuesToPurge) {
                 const queue = getQueue(qName as any);
                 if (!queue) continue;
 
-                let count = 0;
-                if (includeFailed) {
-                    await queue.clean(0, 0, 'failed');
-                    count = (await queue.getJobCounts()).failed || 0;
+                let removedCount = 0;
+
+                if (statesToPurge.includes('failed')) {
+                    const r = await queue.clean(0, 0, 'failed');
+                    removedCount += r.length;
                 }
-                await queue.clean(0, 0, 'completed');
-                await queue.clean(0, 0, 'wait');
-                
-                purged[qName] = count;
-                logger.info('Queue purged', { queue: qName, failedRemoved: count });
+                if (statesToPurge.includes('completed')) {
+                    const r = await queue.clean(0, 0, 'completed');
+                    removedCount += r.length;
+                }
+                if (statesToPurge.includes('waiting')) {
+                    const r = await queue.clean(0, 0, 'wait');
+                    removedCount += r.length;
+                    await queue.drain();
+                }
+                if (statesToPurge.includes('delayed')) {
+                    const r = await queue.clean(0, 0, 'delayed');
+                    removedCount += r.length;
+                }
+                if (statesToPurge.includes('active')) {
+                    const activeJobs = await queue.getActive();
+                    for (const job of activeJobs) {
+                        try {
+                            await job.moveToFailed(new Error('Purged by admin'), '0', true);
+                            await job.remove();
+                            removedCount++;
+                        } catch (_) { /* job may have finished */ }
+                    }
+                }
+
+                purged[qName] = removedCount;
+                logger.info('Queue purged', { queue: qName, states: statesToPurge, removedCount });
+            }
+
+            // Resume workers if we paused them
+            if (needsPause) {
+                const workers = getAllWorkers();
+                for (const worker of workers) {
+                    try { worker.resume(); } catch (_) { /* ignore */ }
+                }
             }
 
             return reply.send({
                 success: true,
-                message: `Purged ${Object.keys(purged).length} queue(s)`,
+                message: `Purged ${Object.keys(purged).length} queue(s) — states: ${statesToPurge.join(', ')}`,
                 purged,
             });
         }

@@ -176,6 +176,16 @@ export const youtubeFetcher: Fetcher = {
             ? Math.floor(maxAgeHoursCandidate)
             : undefined;
 
+        const minDurationMinCandidate = getNumber(rawSettings, ['minDurationMinutes', 'min_duration_minutes']);
+        const minDurationSec = typeof minDurationMinCandidate === 'number' && minDurationMinCandidate > 0
+            ? Math.floor(minDurationMinCandidate * 60)
+            : undefined;
+
+        const maxDurationMinCandidate = getNumber(rawSettings, ['maxDurationMinutes', 'max_duration_minutes']);
+        const maxDurationSec = typeof maxDurationMinCandidate === 'number' && maxDurationMinCandidate > 0
+            ? Math.floor(maxDurationMinCandidate * 60)
+            : undefined;
+
         let { channelId, playlistId } = ytConfig.settings as {
             channelId?: string;
             playlistId?: string;
@@ -368,6 +378,27 @@ export const youtubeFetcher: Fetcher = {
                 
                 if (skipped > 0) {
                     logger.info('Filtered out old videos', { maxAgeHours, skipped, remaining: filteredItems.length });
+                }
+            }
+
+            // Apply duration filter (min/max minutes)
+            if (minDurationSec || maxDurationSec) {
+                const beforeCount = filteredItems.length;
+                filteredItems = filteredItems.filter(item => {
+                    const dur = item.duration;
+                    if (dur === undefined || dur === null) return true; // keep items without duration info
+                    if (minDurationSec && dur < minDurationSec) return false;
+                    if (maxDurationSec && dur > maxDurationSec) return false;
+                    return true;
+                });
+                const durationSkipped = beforeCount - filteredItems.length;
+                if (durationSkipped > 0) {
+                    logger.info('Filtered videos by duration', {
+                        minDurationSec,
+                        maxDurationSec,
+                        skipped: durationSkipped,
+                        remaining: filteredItems.length,
+                    });
                 }
             }
 

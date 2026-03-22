@@ -42,6 +42,12 @@ const configSchema = z.object({
     workerConcurrency: positiveIntSchema.default(5),
     queueNames: z.string().default('fetch,normalize,media,ai').transform(s => s.split(',')),
 
+    // Job Timeouts & Stall Detection
+    mediaJobTimeoutMs: positiveIntSchema.default(1800000),  // 30 min — FFmpeg can be slow
+    defaultJobTimeoutMs: positiveIntSchema.default(300000), // 5 min — fetch/normalize/ai
+    stalledIntervalMs: positiveIntSchema.default(30000),    // 30s between stall checks
+    maxStalledCount: positiveIntSchema.default(1),          // fail job after 1 stall detection
+
     // Logging & Metrics
     logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
     metricsPort: portSchema.default(5002),
@@ -116,6 +122,10 @@ function mapEnvToConfig(): Record<string, unknown> {
 
         workerConcurrency: process.env.WORKER_CONCURRENCY,
         queueNames: process.env.QUEUE_NAMES,
+        mediaJobTimeoutMs: process.env.MEDIA_JOB_TIMEOUT_MS,
+        defaultJobTimeoutMs: process.env.DEFAULT_JOB_TIMEOUT_MS,
+        stalledIntervalMs: process.env.STALLED_INTERVAL_MS,
+        maxStalledCount: process.env.MAX_STALLED_COUNT,
         logLevel: process.env.LOG_LEVEL,
         metricsPort: process.env.METRICS_PORT,
 
