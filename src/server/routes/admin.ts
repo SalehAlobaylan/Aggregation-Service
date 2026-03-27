@@ -764,4 +764,94 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
             });
         }
     );
+
+    /**
+     * Enqueue media jobs for PENDING content items that were never processed.
+     * POST /admin/retry-pending
+     * Body: { source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
+     *
+     * Unlike retry-failed (which resets FAILED→PENDING), this targets items
+     * already in PENDING status whose media jobs were never enqueued or got lost.
+     */
+    fastify.post<{ Body: RetryFailedBody; Reply: RetryFailedResponse }>(
+        '/admin/retry-pending',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { source, limit = 200 } = request.body ?? {};
+            const safeLimit = Math.max(1, Math.min(limit, 500));
+
+            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
+            if (!mediaQueue) {
+                return reply.status(503).send({
+                    success: false,
+                    message: 'Media queue is not available',
+                    requeued: 0,
+                    total: 0,
+                    errors: [],
+                });
+            }
+
+            let listResult;
+            try {
+                listResult = await cmsClient.listContentItems({
+                    status: 'PENDING',
+                    source: source?.toUpperCase(),
+                    limit: safeLimit,
+                });
+            } catch (err) {
+                logger.error('retry-pending: failed to list content items from CMS', err);
+                return reply.status(502).send({
+                    success: false,
+                    message: `Failed to fetch PENDING items from CMS: ${err instanceof Error ? err.message : String(err)}`,
+                    requeued: 0,
+                    total: 0,
+                    errors: [],
+                });
+            }
+
+            let requeued = 0;
+            const errors: string[] = [];
+
+            for (const item of listResult.data) {
+                try {
+                    const downloadRef = item.metadata?.telegramDownloadRef as
+                        | { channelUsername: string; messageId: number; mediaKind: 'audio' | 'voice' | 'video' | 'photo'; fileName?: string; mimeType?: string }
+                        | undefined;
+
+                    const operations: ('download' | 'transcode' | 'thumbnail')[] =
+                        item.source === 'TELEGRAM' && item.metadata?.mediaKind === 'photo'
+                            ? ['download']
+                            : ['download', 'transcode', 'thumbnail'];
+
+                    await mediaQueue.add(
+                        `retry-pending-${item.source}-${item.id}`,
+                        {
+                            contentItemId: item.id,
+                            contentType: item.type,
+                            sourceType: item.source,
+                            sourceUrl: item.original_url,
+                            operations,
+                            downloadRef,
+                        },
+                        { priority: 5 }
+                    );
+
+                    requeued++;
+                    logger.info('retry-pending: enqueued item', { contentItemId: item.id, source: item.source });
+                } catch (err) {
+                    const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
+                    errors.push(msg);
+                    logger.warn('retry-pending: failed to enqueue item', { contentItemId: item.id, error: msg });
+                }
+            }
+
+            return reply.send({
+                success: true,
+                message: `Enqueued ${requeued} of ${listResult.data.length} PENDING items for media processing`,
+                requeued,
+                total: listResult.total,
+                errors,
+            });
+        }
+    );
 }

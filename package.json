@@ -21,7 +21,8 @@
     "test:media": "tsx src/scripts/test-media-job.ts",
     "test:ai": "tsx src/scripts/test-ai-job.ts",
     "telegram:auth": "tsx src/scripts/telegram-auth.ts",
-    "retry-failed": "tsx src/scripts/retry-failed.ts"
+    "retry-failed": "tsx src/scripts/retry-failed.ts",
+    "retry-pending": "tsx src/scripts/retry-pending.ts"
   },
   "keywords": [
     "wahb",

@@ -10,7 +10,7 @@ import { cmsClient } from '../cms/client.js';
 import { config } from '../config/index.js';
 
 // AI services
-import { transcribe, type TranscriptResult } from '../ai/whisper.js';
+import { transcribeWithTimestamps, type TranscriptResult } from '../ai/whisper.js';
 import {
     generateEmbedding,
     buildEmbeddingText,
@@ -69,8 +69,8 @@ export const aiWorker = createWorker({
                         tempFiles.push(audioPath);
                     }
 
-                    // Transcribe using Whisper
-                    const result: TranscriptResult = await transcribe(audioPath);
+                    // Transcribe using Whisper (with timestamps for segment-level timing)
+                    const result: TranscriptResult = await transcribeWithTimestamps(audioPath);
                     transcriptText = result.text;
 
                     if (transcriptText && transcriptText.length > 0) {
@@ -78,6 +78,7 @@ export const aiWorker = createWorker({
                         const transcriptResponse = await cmsClient.createTranscript({
                             content_item_id: contentItemId,
                             full_text: transcriptText,
+                            word_timestamps: result.segments,
                             language: result.language || 'en',
                         }, job.id);
 
