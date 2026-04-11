@@ -78,7 +78,11 @@ export const aiWorker = createWorker({
                         const transcriptResponse = await cmsClient.createTranscript({
                             content_item_id: contentItemId,
                             full_text: transcriptText,
-                            word_timestamps: result.segments,
+                            word_timestamps: result.segments?.map((segment) => ({
+                                word: segment.text,
+                                start: segment.start,
+                                end: segment.end,
+                            })),
                             language: result.language || 'en',
                         }, job.id);
 

@@ -54,7 +54,7 @@ RUN chown -R aggregation:nodejs /app /tmp/wahb-media
 # Switch to non-root user
 USER aggregation
 
-# Expose metrics port
+# Expose metrics/admin port used by the service
 EXPOSE 5002
 
 # Health check
