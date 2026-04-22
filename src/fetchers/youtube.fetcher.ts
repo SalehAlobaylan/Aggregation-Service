@@ -281,40 +281,81 @@ export const youtubeFetcher: Fetcher = {
                 if (fetchShorts) {
                     targetPlaylistId = relatedPlaylists?.shorts;
                     if (!targetPlaylistId) {
-                        logger.warn('Channel has no shorts playlist', { channelId });
-                        return {
-                            items: [],
-                            hasMore: false,
-                            metadata: { totalFetched: 0, skipped: 0, errors: 0 },
-                        };
+                        logger.warn('Channel has no shorts playlist, falling back to search API', { channelId });
+
+                        if (!(await trackQuota(QUOTA_COSTS.search))) {
+                            throw new Error('YouTube quota exceeded');
+                        }
+
+                        const searchUrl = new URL(`${YOUTUBE_API_BASE}/search`);
+                        searchUrl.searchParams.set('part', 'snippet');
+                        searchUrl.searchParams.set('channelId', channelId);
+                        searchUrl.searchParams.set('type', 'video');
+                        searchUrl.searchParams.set('order', 'date');
+                        searchUrl.searchParams.set('videoDuration', 'short');
+                        searchUrl.searchParams.set('maxResults', maxResults.toString());
+                        searchUrl.searchParams.set('key', apiKey);
+                        if (cursor) searchUrl.searchParams.set('pageToken', cursor);
+
+                        const searchResponse = await fetch(searchUrl.toString());
+                        if (!searchResponse.ok) {
+                            throw new Error(`YouTube search API error: ${searchResponse.status}`);
+                        }
+
+                        const searchData = await searchResponse.json();
+                        nextCursor = searchData.nextPageToken;
+                        videoIds = (searchData.items || [])
+                            .map((item: { id?: { videoId?: string } }) => item.id?.videoId)
+                            .filter((id: string | undefined): id is string => !!id);
+                    } else {
+                        logger.info('Fetching from shorts playlist', { channelId, playlistId: targetPlaylistId });
+
+                        // Now fetch from selected playlist
+                        if (!(await trackQuota(QUOTA_COSTS.playlistItems))) {
+                            throw new Error('YouTube quota exceeded');
+                        }
+
+                        const playlistUrl = new URL(`${YOUTUBE_API_BASE}/playlistItems`);
+                        playlistUrl.searchParams.set('part', 'snippet');
+                        playlistUrl.searchParams.set('playlistId', targetPlaylistId);
+                        playlistUrl.searchParams.set('maxResults', maxResults.toString());
+                        playlistUrl.searchParams.set('key', apiKey);
+                        if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
+
+                        const response = await fetch(playlistUrl.toString());
+                        const data = await response.json();
+                        nextCursor = data.nextPageToken;
+
+                        videoIds = data.items?.map((item: { snippet: { resourceId: { videoId: string } } }) =>
+                            item.snippet.resourceId.videoId
+                        ) || [];
                     }
-                    logger.info('Fetching from shorts playlist', { channelId, playlistId: targetPlaylistId });
                 } else {
                     targetPlaylistId = relatedPlaylists?.uploads;
                     if (!targetPlaylistId) {
                         throw new Error('Could not find uploads playlist for channel');
                     }
+
+                    // Now fetch from selected playlist
+                    if (!(await trackQuota(QUOTA_COSTS.playlistItems))) {
+                        throw new Error('YouTube quota exceeded');
+                    }
+
+                    const playlistUrl = new URL(`${YOUTUBE_API_BASE}/playlistItems`);
+                    playlistUrl.searchParams.set('part', 'snippet');
+                    playlistUrl.searchParams.set('playlistId', targetPlaylistId);
+                    playlistUrl.searchParams.set('maxResults', maxResults.toString());
+                    playlistUrl.searchParams.set('key', apiKey);
+                    if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
+
+                    const response = await fetch(playlistUrl.toString());
+                    const data = await response.json();
+                    nextCursor = data.nextPageToken;
+
+                    videoIds = data.items?.map((item: { snippet: { resourceId: { videoId: string } } }) =>
+                        item.snippet.resourceId.videoId
+                    ) || [];
                 }
-
-                // Now fetch from selected playlist
-                if (!(await trackQuota(QUOTA_COSTS.playlistItems))) {
-                    throw new Error('YouTube quota exceeded');
-                }
-
-                const playlistUrl = new URL(`${YOUTUBE_API_BASE}/playlistItems`);
-                playlistUrl.searchParams.set('part', 'snippet');
-                playlistUrl.searchParams.set('playlistId', targetPlaylistId);
-                playlistUrl.searchParams.set('maxResults', maxResults.toString());
-                playlistUrl.searchParams.set('key', apiKey);
-                if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
-
-                const response = await fetch(playlistUrl.toString());
-                const data = await response.json();
-                nextCursor = data.nextPageToken;
-
-                videoIds = data.items?.map((item: { snippet: { resourceId: { videoId: string } } }) =>
-                    item.snippet.resourceId.videoId
-                ) || [];
             }
 
             // Fetch video details for duration

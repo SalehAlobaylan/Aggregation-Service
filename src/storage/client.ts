@@ -40,7 +40,8 @@ export function getStorageKey(
  * Get public URL for a storage key
  */
 export function getPublicUrl(key: string): string {
-    return `${config.storagePublicUrl}/${config.storageBucket}/${key}`;
+    const base = config.storagePublicUrl.replace(/\/$/, '');
+    return `${base}/${key}`;
 }
 
 /**

@@ -12,6 +12,14 @@ export const fetchWorker = createWorker({
     queueName: QUEUE_NAMES.FETCH,
     processor: async (job: Job<FetchJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, config, triggeredBy, triggeredAt } = job.data;
+        const sourceSettings = (config.settings as Record<string, unknown>) || {};
+
+        const configuredMaxResults = getPositiveInteger(
+            sourceSettings.max_results,
+            sourceSettings.maxResults
+        );
+
+        const fetchedSoFar = getPositiveInteger(config.fetchedSoFar, 0) || 0;
 
         jobLogger.info('Processing fetch job', {
             sourceId,
@@ -34,17 +42,45 @@ export const fetchWorker = createWorker({
         // Fetch content from source
         const result = await fetchFromSource(sourceConfig, config.cursor as string | undefined);
 
+        const remainingAllowed =
+            typeof configuredMaxResults === 'number' && configuredMaxResults > 0
+                ? Math.max(configuredMaxResults - fetchedSoFar, 0)
+                : undefined;
+
+        const itemsForThisRun =
+            typeof remainingAllowed === 'number'
+                ? result.items.slice(0, remainingAllowed)
+                : result.items;
+
+        const droppedByConfiguredCap = result.items.length - itemsForThisRun.length;
+        if (droppedByConfiguredCap > 0) {
+            jobLogger.info('Trimmed fetched items to respect configured max_results', {
+                sourceId,
+                sourceType,
+                fetchedSoFar,
+                configuredMaxResults,
+                dropped: droppedByConfiguredCap,
+            });
+        }
+
         jobLogger.info('Fetch completed', {
             sourceId,
             sourceType,
             totalFetched: result.metadata.totalFetched,
+            acceptedForRun: itemsForThisRun.length,
             skipped: result.metadata.skipped,
             errors: result.metadata.errors,
             hasMore: result.hasMore,
         });
 
+        const totalFetchedSoFar = fetchedSoFar + itemsForThisRun.length;
+        const reachedMaxResults =
+            typeof configuredMaxResults === 'number' && configuredMaxResults > 0
+                ? totalFetchedSoFar >= configuredMaxResults
+                : false;
+
         // If we got items, enqueue normalize job
-        if (result.items.length > 0) {
+        if (itemsForThisRun.length > 0) {
             const normalizeQueue = getQueue(QUEUE_NAMES.NORMALIZE);
 
             if (normalizeQueue) {
@@ -53,7 +89,7 @@ export const fetchWorker = createWorker({
                     {
                         sourceId,
                         sourceType,
-                        rawItems: result.items.map(item => ({
+                        rawItems: itemsForThisRun.map(item => ({
                             externalId: item.externalId,
                             rawData: item,
                             fetchedAt: item.fetchedAt,
@@ -69,13 +105,13 @@ export const fetchWorker = createWorker({
                 jobLogger.info('Enqueued normalize job', {
                     sourceId,
                     sourceType,
-                    itemCount: result.items.length,
+                    itemCount: itemsForThisRun.length,
                 });
             }
         }
 
         // If there's more content to fetch, enqueue continuation job
-        if (result.hasMore && result.cursor) {
+        if (result.hasMore && result.cursor && !reachedMaxResults) {
             const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
 
             if (fetchQueue) {
@@ -87,6 +123,7 @@ export const fetchWorker = createWorker({
                         config: {
                             ...config,
                             cursor: result.cursor,
+                            fetchedSoFar: totalFetchedSoFar,
                         },
                         triggeredBy: 'schedule',
                         triggeredAt: new Date().toISOString(),
@@ -101,8 +138,26 @@ export const fetchWorker = createWorker({
                     sourceId,
                     sourceType,
                     cursor: result.cursor,
+                    fetchedSoFar: totalFetchedSoFar,
+                    configuredMaxResults,
                 });
             }
+        } else if (reachedMaxResults) {
+            jobLogger.info('Reached configured max_results, stopping pagination', {
+                sourceId,
+                sourceType,
+                fetchedSoFar: totalFetchedSoFar,
+                configuredMaxResults,
+            });
         }
     },
 });
+
+function getPositiveInteger(...values: unknown[]): number | undefined {
+    for (const value of values) {
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+            return Math.floor(value);
+        }
+    }
+    return undefined;
+}
