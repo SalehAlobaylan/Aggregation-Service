@@ -18,6 +18,19 @@ import type {
     ApiResponse,
     ContentItem,
     InternalContentListResponse,
+    ListStoragePoliciesResponse,
+    ListStorageCandidatesResponse,
+    ArchiveItemsRequest,
+    ArchiveItemsResponse,
+    CreateSweepRunRequest,
+    MoveToColdRequest,
+    MoveToColdResponse,
+    QualityProfile,
+    QualityRule,
+    QualityCandidatesResponse,
+    WriteQualityHistoryRequest,
+    UpdateContentItemQualityRequest,
+    UpdateContentItemQualityResponse,
 } from './types.js';
 
 // Circuit breaker for CMS calls
@@ -254,6 +267,201 @@ export const cmsClient = {
         if (params.page) qs.set('page', String(params.page));
         const query = qs.toString() ? `?${qs.toString()}` : '';
         return makeRequest<InternalContentListResponse>('GET', `/content-items${query}`, undefined, requestId);
+    },
+
+    // ---------------------------------------------------------------
+    // Storage management
+    // ---------------------------------------------------------------
+
+    /**
+     * GET /internal/storage/policies
+     */
+    async listStoragePolicies(requestId?: string): Promise<ListStoragePoliciesResponse> {
+        return makeRequest<ListStoragePoliciesResponse>(
+            'GET',
+            '/storage/policies',
+            undefined,
+            requestId
+        );
+    },
+
+    /**
+     * GET /internal/storage/candidates
+     */
+    async listStorageCandidates(
+        params: {
+            tenant_id: string;
+            min_age_days?: number;
+            max_view_count?: number;
+            limit?: number;
+            delete_failed_immediately?: boolean;
+            max_bytes?: number;
+        },
+        requestId?: string
+    ): Promise<ListStorageCandidatesResponse> {
+        const qs = new URLSearchParams();
+        qs.set('tenant_id', params.tenant_id);
+        if (params.min_age_days !== undefined) qs.set('min_age_days', String(params.min_age_days));
+        if (params.max_view_count !== undefined) qs.set('max_view_count', String(params.max_view_count));
+        if (params.limit !== undefined) qs.set('limit', String(params.limit));
+        if (params.delete_failed_immediately !== undefined) qs.set('delete_failed_immediately', String(params.delete_failed_immediately));
+        if (params.max_bytes !== undefined) qs.set('max_bytes', String(params.max_bytes));
+        return makeRequest<ListStorageCandidatesResponse>(
+            'GET',
+            `/storage/candidates?${qs.toString()}`,
+            undefined,
+            requestId
+        );
+    },
+
+    /**
+     * POST /internal/storage/archive
+     */
+    async archiveItems(
+        data: ArchiveItemsRequest,
+        requestId?: string
+    ): Promise<ArchiveItemsResponse> {
+        return makeProtectedRequest<ArchiveItemsResponse>(
+            'POST',
+            '/storage/archive',
+            data,
+            requestId
+        );
+    },
+
+    /**
+     * POST /internal/storage/move-to-cold
+     */
+    async moveItemsToCold(
+        data: MoveToColdRequest,
+        requestId?: string
+    ): Promise<MoveToColdResponse> {
+        return makeProtectedRequest<MoveToColdResponse>(
+            'POST',
+            '/storage/move-to-cold',
+            data,
+            requestId
+        );
+    },
+
+    /**
+     * POST /internal/storage/sweep-runs
+     */
+    async createSweepRun(
+        data: CreateSweepRunRequest,
+        requestId?: string
+    ): Promise<unknown> {
+        return makeProtectedRequest<unknown>(
+            'POST',
+            '/storage/sweep-runs',
+            data,
+            requestId
+        );
+    },
+
+    // ---------------------------------------------------------------
+    // Quality management
+    // ---------------------------------------------------------------
+
+    /**
+     * GET /internal/quality/rules?enabled=true
+     */
+    async listQualityRules(
+        params: { enabled?: boolean } = {},
+        requestId?: string
+    ): Promise<{ data: QualityRule[] }> {
+        const qs = new URLSearchParams();
+        if (params.enabled !== undefined) qs.set('enabled', String(params.enabled));
+        const query = qs.toString() ? `?${qs.toString()}` : '';
+        return makeRequest<{ data: QualityRule[] }>(
+            'GET',
+            `/quality/rules${query}`,
+            undefined,
+            requestId
+        );
+    },
+
+    /**
+     * GET /internal/quality/profiles/:id
+     */
+    async getQualityProfile(id: number, requestId?: string): Promise<QualityProfile> {
+        return makeRequest<QualityProfile>(
+            'GET',
+            `/quality/profiles/${id}`,
+            undefined,
+            requestId
+        );
+    },
+
+    /**
+     * GET /internal/quality/profiles/default?tenant_id=X
+     * Returns null if no default is configured (404 from CMS).
+     */
+    async getDefaultQualityProfile(tenantId?: string, requestId?: string): Promise<QualityProfile | null> {
+        const qs = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : '';
+        try {
+            return await makeRequest<QualityProfile>(
+                'GET',
+                `/quality/profiles/default${qs}`,
+                undefined,
+                requestId
+            );
+        } catch (err) {
+            // 404 → no default configured. Caller falls back to DEFAULT_ENCODE_PROFILE.
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('404')) return null;
+            throw err;
+        }
+    },
+
+    /**
+     * GET /internal/quality/candidates?rule_id=N&tenant_id=X&limit=K
+     */
+    async listQualityCandidates(
+        params: { rule_id: number; tenant_id?: string; limit?: number },
+        requestId?: string
+    ): Promise<QualityCandidatesResponse> {
+        const qs = new URLSearchParams();
+        qs.set('rule_id', String(params.rule_id));
+        if (params.tenant_id) qs.set('tenant_id', params.tenant_id);
+        if (params.limit) qs.set('limit', String(params.limit));
+        return makeRequest<QualityCandidatesResponse>(
+            'GET',
+            `/quality/candidates?${qs.toString()}`,
+            undefined,
+            requestId
+        );
+    },
+
+    /**
+     * POST /internal/quality/history
+     */
+    async writeQualityHistory(
+        data: WriteQualityHistoryRequest,
+        requestId?: string
+    ): Promise<{ id: number }> {
+        return makeProtectedRequest<{ id: number }>(
+            'POST',
+            '/quality/history',
+            data,
+            requestId
+        );
+    },
+
+    /**
+     * PATCH /internal/content-items/:id/quality
+     */
+    async updateContentItemQuality(
+        id: string,
+        data: UpdateContentItemQualityRequest,
+        requestId?: string
+    ): Promise<UpdateContentItemQualityResponse> {
+        return makeProtectedRequest<UpdateContentItemQualityResponse>(
+            'PATCH',
+            `/content-items/${id}/quality`,
+            data,
+            requestId
+        );
     },
 
     /**

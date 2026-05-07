@@ -16,6 +16,9 @@ export interface MediaInfo {
     format: string;
     hasVideo: boolean;
     hasAudio: boolean;
+    bitrateKbps?: number;
+    videoCodec?: string;
+    audioCodec?: string;
 }
 
 export interface TranscodeResult {
@@ -24,7 +27,88 @@ export interface TranscodeResult {
 }
 
 /**
- * Get media file information using ffprobe
+ * EncodeProfile drives `transcodeToMp4`. The Quality Management System lets
+ * admins create named profiles in CMS; the worker resolves them and passes
+ * the parameters here. When `undefined` is supplied, DEFAULT_ENCODE_PROFILE
+ * is used (matches the historical hard-coded recipe).
+ */
+export interface EncodeProfile {
+    videoCodec: 'h264' | 'h265' | 'av1';
+    /** 0 = no resolution cap. Always downscale-only — never upscale a small input. */
+    maxHeight: number;
+    /** kbps target. 0 = use CRF mode instead. */
+    targetBitrateKbps: number;
+    crf: number;
+    preset: string;
+    audioCodec: 'aac' | 'opus';
+    audioBitrateKbps: number;
+}
+
+export const DEFAULT_ENCODE_PROFILE: EncodeProfile = {
+    videoCodec: 'h264',
+    maxHeight: 0,
+    targetBitrateKbps: 0,
+    crf: 23,
+    preset: 'fast',
+    audioCodec: 'aac',
+    audioBitrateKbps: 128,
+};
+
+function videoCodecFlag(codec: EncodeProfile['videoCodec']): string {
+    switch (codec) {
+        case 'h265':
+            return 'libx265';
+        case 'av1':
+            return 'libaom-av1';
+        case 'h264':
+        default:
+            return 'libx264';
+    }
+}
+
+function audioCodecFlag(codec: EncodeProfile['audioCodec']): string {
+    return codec === 'opus' ? 'libopus' : 'aac';
+}
+
+/**
+ * Build the FFmpeg outputOptions array for a given encode profile. Pulled out
+ * so it can be shared between `transcodeToMp4` and `audioToMp4`, and so it is
+ * unit-testable without booting ffmpeg.
+ */
+export function buildEncodeOptions(profile: EncodeProfile): string[] {
+    const opts: string[] = [];
+    opts.push(`-c:v ${videoCodecFlag(profile.videoCodec)}`);
+    opts.push(`-preset ${profile.preset}`);
+
+    // Keep mobile compatibility for h264. h265/av1 ignore profile:baseline.
+    if (profile.videoCodec === 'h264') {
+        opts.push('-profile:v baseline', '-level 3.0');
+    }
+
+    if (profile.targetBitrateKbps > 0) {
+        const k = profile.targetBitrateKbps;
+        opts.push(`-b:v ${k}k`, `-maxrate ${Math.round(k * 1.5)}k`, `-bufsize ${k * 2}k`);
+    } else {
+        opts.push(`-crf ${profile.crf}`);
+    }
+
+    if (profile.maxHeight > 0) {
+        // Downscale-only: only shrink if the input is taller than the cap.
+        // -2 keeps the width even (required by yuv420p). Using force_original_aspect_ratio=decrease
+        // is the cleanest "fit inside" for arbitrary input aspect ratios.
+        opts.push(`-vf scale=-2:'min(${profile.maxHeight},ih)'`);
+    }
+
+    opts.push(`-c:a ${audioCodecFlag(profile.audioCodec)}`);
+    opts.push(`-b:a ${profile.audioBitrateKbps}k`);
+    opts.push('-movflags +faststart', '-pix_fmt yuv420p');
+    return opts;
+}
+
+/**
+ * Get media file information using ffprobe.
+ * Returns container bitrate (when reported) so the Quality system can project
+ * post-re-encode size without downloading the file twice.
  */
 export function getMediaInfo(inputPath: string): Promise<MediaInfo> {
     return new Promise((resolve, reject) => {
@@ -36,6 +120,12 @@ export function getMediaInfo(inputPath: string): Promise<MediaInfo> {
 
             const videoStream = metadata.streams.find(s => s.codec_type === 'video');
             const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+            const fmtBitrate = (metadata.format as { bit_rate?: string | number }).bit_rate;
+            const bitrateBps = typeof fmtBitrate === 'string' ? parseInt(fmtBitrate, 10) : fmtBitrate;
+            const bitrateKbps =
+                typeof bitrateBps === 'number' && Number.isFinite(bitrateBps) && bitrateBps > 0
+                    ? Math.round(bitrateBps / 1000)
+                    : undefined;
 
             resolve({
                 duration: metadata.format.duration || 0,
@@ -44,35 +134,30 @@ export function getMediaInfo(inputPath: string): Promise<MediaInfo> {
                 format: metadata.format.format_name || 'unknown',
                 hasVideo: !!videoStream,
                 hasAudio: !!audioStream,
+                bitrateKbps,
+                videoCodec: videoStream?.codec_name,
+                audioCodec: audioStream?.codec_name,
             });
         });
     });
 }
 
 /**
- * Transcode video to MP4 (H.264/AAC baseline for mobile compatibility)
+ * Transcode video to MP4 using the supplied encode profile (or the default).
  */
 export function transcodeToMp4(
     inputPath: string,
-    outputPath: string
+    outputPath: string,
+    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE
 ): Promise<TranscodeResult> {
     return new Promise((resolve, reject) => {
-        logger.info('Starting MP4 transcode', { inputPath, outputPath });
+        logger.info('Starting MP4 transcode', { inputPath, outputPath, profile });
 
         let duration = 0;
+        const opts = buildEncodeOptions(profile);
 
         ffmpeg(inputPath)
-            .outputOptions([
-                '-c:v libx264',           // H.264 video codec
-                '-preset fast',           // Balance speed/quality
-                '-profile:v baseline',    // Mobile compatibility
-                '-level 3.0',
-                '-crf 23',                // Quality (lower = better)
-                '-c:a aac',               // AAC audio codec
-                '-b:a 128k',              // Audio bitrate
-                '-movflags +faststart',   // Enable streaming
-                '-pix_fmt yuv420p',       // Pixel format compatibility
-            ])
+            .outputOptions(opts)
             .output(outputPath)
             .on('start', (cmd) => {
                 logger.debug('FFmpeg command', { cmd });
@@ -94,7 +179,7 @@ export function transcodeToMp4(
                     });
 
                     resolve({ outputPath, duration });
-                } catch (error) {
+                } catch {
                     // Still resolve even if we can't get duration
                     resolve({ outputPath, duration: 0 });
                 }

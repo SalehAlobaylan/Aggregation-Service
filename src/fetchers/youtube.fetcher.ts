@@ -57,7 +57,7 @@ async function resolveCustomUrlToChannelId(customUrl: string, apiKey: string): P
     return data.items?.[0]?.id || null;
 }
 
-async function resolveUrlToChannelId(urlStr: string, apiKey: string): Promise<{ channelId: string; isShorts?: boolean } | null> {
+async function resolveUrlToChannelId(urlStr: string, apiKey: string): Promise<{ channelId?: string; playlistId?: string; searchQuery?: string; isShorts?: boolean } | null> {
     try {
         const url = new URL(urlStr);
         const path = url.pathname;
@@ -78,6 +78,21 @@ async function resolveUrlToChannelId(urlStr: string, apiKey: string): Promise<{ 
             .replace(/\/join$/, '')
             .replace(/\/members$/, '');
         
+        const playlistIdParam = url.searchParams.get('list') || undefined;
+        if (path.includes('/playlist') || path.includes('/watch')) {
+            if (playlistIdParam) {
+                return { playlistId: playlistIdParam };
+            }
+        }
+
+        if (path.includes('/hashtag/')) {
+            const rawTag = path.split('/hashtag/')[1] || '';
+            const tag = decodeURIComponent(rawTag).split('/')[0]?.trim();
+            if (tag) {
+                return { searchQuery: `#${tag.replace(/^#/, '')}` };
+            }
+        }
+
         const username = cleanPath.replace('/@', '').replace('/channel/', '').replace('/c/', '').replace('/user/', '').replace('/', '');
 
         if (cleanPath.includes('/@')) {
@@ -186,9 +201,10 @@ export const youtubeFetcher: Fetcher = {
             ? Math.floor(maxDurationMinCandidate * 60)
             : undefined;
 
-        let { channelId, playlistId } = ytConfig.settings as {
+        let { channelId, playlistId, searchQuery } = ytConfig.settings as {
             channelId?: string;
             playlistId?: string;
+            searchQuery?: string;
         };
 
         const items: RawFetchedItem[] = [];
@@ -207,18 +223,28 @@ export const youtubeFetcher: Fetcher = {
         try {
             const apiKey = getApiKey();
 
-            if (!channelId && !playlistId && config.url) {
-                logger.info('Resolving YouTube URL to channel ID', { url: config.url });
+            if (!channelId && !playlistId && !searchQuery && config.url) {
+                logger.info('Resolving YouTube URL to channel/playlist', { url: config.url });
                 const resolved = await resolveUrlToChannelId(config.url, apiKey);
                 if (resolved) {
                     channelId = resolved.channelId;
-                    if (resolved.isShorts) {
+                    playlistId = resolved.playlistId;
+                    searchQuery = resolved.searchQuery;
+                    if (resolved.isShorts && channelId) {
                         playlistId = 'shorts'; // Marker to fetch shorts playlist later
                         logger.info('URL targets shorts, will fetch from shorts playlist', { channelId });
                     }
-                    logger.info('Resolved channel ID', { channelId });
+                    if (channelId) {
+                        logger.info('Resolved channel ID', { channelId });
+                    }
+                    if (playlistId) {
+                        logger.info('Resolved playlist ID', { playlistId });
+                    }
+                    if (searchQuery) {
+                        logger.info('Resolved search query', { searchQuery });
+                    }
                 } else {
-                    logger.warn('Could not resolve channel ID from URL', { url: config.url });
+                    logger.warn('Could not resolve channel or playlist from URL', { url: config.url });
                     return {
                         items: [],
                         hasMore: false,
@@ -235,7 +261,7 @@ export const youtubeFetcher: Fetcher = {
 
             let videoIds: string[] = [];
 
-            // Determine fetch mode: playlist or channel uploads
+            // Determine fetch mode: playlist, search, or channel uploads
             if (playlistId) {
                 // Fetch from playlist
                 if (!(await trackQuota(QUOTA_COSTS.playlistItems))) {
@@ -261,6 +287,30 @@ export const youtubeFetcher: Fetcher = {
                     item.snippet.resourceId.videoId
                 ) || [];
 
+            } else if (searchQuery) {
+                if (!(await trackQuota(QUOTA_COSTS.search))) {
+                    throw new Error('YouTube quota exceeded');
+                }
+
+                const searchUrl = new URL(`${YOUTUBE_API_BASE}/search`);
+                searchUrl.searchParams.set('part', 'snippet');
+                searchUrl.searchParams.set('type', 'video');
+                searchUrl.searchParams.set('order', 'date');
+                searchUrl.searchParams.set('q', searchQuery);
+                searchUrl.searchParams.set('maxResults', maxResults.toString());
+                searchUrl.searchParams.set('key', apiKey);
+                if (cursor) searchUrl.searchParams.set('pageToken', cursor);
+
+                const searchResponse = await fetch(searchUrl.toString());
+                if (!searchResponse.ok) {
+                    throw new Error(`YouTube search API error: ${searchResponse.status}`);
+                }
+
+                const searchData = await searchResponse.json();
+                nextCursor = searchData.nextPageToken;
+                videoIds = (searchData.items || [])
+                    .map((item: { id?: { videoId?: string } }) => item.id?.videoId)
+                    .filter((id: string | undefined): id is string => !!id);
             } else if (channelId) {
                 // Get channel's uploads or shorts playlist
                 if (!(await trackQuota(QUOTA_COSTS.channels))) {

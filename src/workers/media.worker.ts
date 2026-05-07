@@ -4,6 +4,7 @@
  */
 import { Job } from 'bullmq';
 import { join } from 'path';
+import { stat } from 'fs/promises';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type MediaJob } from '../queues/index.js';
 import { getQueue } from '../queues/index.js';
@@ -29,6 +30,7 @@ import {
     objectExists,
     getPublicUrl,
 } from '../storage/client.js';
+import { resolveDefaultIngestProfile } from '../services/quality.service.js';
 
 export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
@@ -104,9 +106,11 @@ export const mediaWorker = createWorker({
                 processedMimeType = inferImageMimeType(downloadResult.format);
                 isImageArtifact = true;
             } else if (mediaInfo.hasVideo || contentType === 'VIDEO') {
-                // Video: transcode to MP4
+                // Video: transcode to MP4 using the operator-configured default
+                // quality profile (or the built-in fallback if none is set).
                 const mp4Path = join(config.mediaTempDir, `${contentItemId}_processed.mp4`);
-                const result = await transcodeToMp4(downloadResult.filePath, mp4Path);
+                const { profile: ingestProfile } = await resolveDefaultIngestProfile();
+                const result = await transcodeToMp4(downloadResult.filePath, mp4Path, ingestProfile);
                 processedPath = result.outputPath;
                 duration = result.duration;
                 tempFiles.push(processedPath);
@@ -125,6 +129,7 @@ export const mediaWorker = createWorker({
             let thumbnailPath: string | undefined;
             let thumbnailUrl: string | undefined;
 
+            let thumbnailBytes = 0;
             try {
                 if (isImageArtifact) {
                     throw new Error('Skip thumbnail extraction for image artifacts');
@@ -136,7 +141,12 @@ export const mediaWorker = createWorker({
                 // Upload thumbnail
                 const thumbKey = getStorageKey(contentItemId, 'thumbnail', 'jpg');
                 thumbnailUrl = await uploadFile(thumbKey, thumbnailPath, 'image/jpeg');
-                jobLogger.info('Thumbnail uploaded', { thumbnailUrl });
+                try {
+                    thumbnailBytes = (await stat(thumbnailPath)).size;
+                } catch {
+                    thumbnailBytes = 0;
+                }
+                jobLogger.info('Thumbnail uploaded', { thumbnailUrl, thumbnailBytes });
             } catch (thumbError) {
                 jobLogger.warn('Thumbnail extraction failed (non-blocking)', { error: thumbError });
                 // Use YouTube thumbnail if available
@@ -151,15 +161,35 @@ export const mediaWorker = createWorker({
             const mediaUrl = await uploadFile(processedKey, processedPath, processedMimeType);
             jobLogger.info('Processed media uploaded', { mediaUrl });
 
+            let processedBytes = 0;
+            try {
+                processedBytes = (await stat(processedPath)).size;
+            } catch {
+                processedBytes = 0;
+            }
+
             if (isImageArtifact) {
                 thumbnailUrl = mediaUrl;
             }
 
-            // 8. Update CMS artifacts
+            // 8. Update CMS artifacts (size accounting includes processed + thumbnail)
+            // Quality bookkeeping is included on first ingest so the Quality
+            // system has a baseline to project savings against. CMS treats
+            // original_* fields as write-once, so re-runs don't clobber them.
+            let originalSourceBytes = 0;
+            try { originalSourceBytes = (await stat(downloadResult.filePath)).size; } catch { /* ignore */ }
+            const originalBitrateKbps = mediaInfo.bitrateKbps ?? undefined;
+            const { profileId: ingestProfileId } = await resolveDefaultIngestProfile();
+
             await cmsClient.updateArtifacts(contentItemId, {
                 media_url: mediaUrl,
                 thumbnail_url: thumbnailUrl,
                 duration_sec: Math.round(duration),
+                file_size_bytes: processedBytes + thumbnailBytes,
+                original_size_bytes: originalSourceBytes > 0 ? originalSourceBytes : undefined,
+                original_bitrate_kbps: originalBitrateKbps,
+                current_bitrate_kbps: originalBitrateKbps,
+                current_quality_profile_id: ingestProfileId ?? undefined,
             }, job.id);
 
             jobLogger.info('CMS artifacts updated', {

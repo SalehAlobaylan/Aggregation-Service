@@ -13,7 +13,18 @@ import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
-import { getAllWorkers } from '../../workers/index.js';
+import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
+import { syncRepeatableQualitySweepers } from '../../workers/quality-sweeper.worker.js';
+import { probeContentItem } from '../../services/quality.service.js';
+import type { QualityReencodeJob } from '../../queues/schemas.js';
+import {
+    computeStorageUsage,
+    deleteContentObjects,
+    deleteObjectsByKeys,
+    isColdTierConfigured,
+} from '../../storage/client.js';
+import { runSweepForTenant, reconcileStorage } from '../../services/storage.service.js';
+import type { StorageSweepJob } from '../../queues/schemas.js';
 
 interface TriggerBody {
     sourceType: SourceType;
@@ -852,6 +863,337 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 total: listResult.total,
                 errors,
             });
+        }
+    );
+
+    // -----------------------------------------------------------------
+    // Storage management
+    // -----------------------------------------------------------------
+
+    /**
+     * GET /admin/storage/stats
+     * Live bucket usage for primary (and cold, if configured), grouped by
+     * artifact type. Cached briefly to avoid hammering S3.
+     */
+    interface StatsPayload {
+        used_bytes: number;
+        object_count: number;
+        by_artifact_type: Record<string, number>;
+        cold_enabled: boolean;
+        cold?: {
+            used_bytes: number;
+            object_count: number;
+            by_artifact_type: Record<string, number>;
+        };
+    }
+    let cachedStats: { at: number; data: StatsPayload } | null = null;
+    const STORAGE_STATS_TTL_MS = 60 * 1000;
+
+    fastify.get(
+        '/admin/storage/stats',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            if (cachedStats && Date.now() - cachedStats.at < STORAGE_STATS_TTL_MS) {
+                return reply.send(cachedStats.data);
+            }
+            try {
+                const primary = await computeStorageUsage('primary');
+                const payload: StatsPayload = {
+                    used_bytes: primary.usedBytes,
+                    object_count: primary.objectCount,
+                    by_artifact_type: primary.byArtifactType,
+                    cold_enabled: isColdTierConfigured(),
+                };
+                if (payload.cold_enabled) {
+                    try {
+                        const cold = await computeStorageUsage('cold');
+                        payload.cold = {
+                            used_bytes: cold.usedBytes,
+                            object_count: cold.objectCount,
+                            by_artifact_type: cold.byArtifactType,
+                        };
+                    } catch (coldErr) {
+                        logger.warn('storage.stats: cold tier query failed', { error: (coldErr as Error).message });
+                    }
+                }
+                cachedStats = { at: Date.now(), data: payload };
+                return reply.send(payload);
+            } catch (err) {
+                logger.error('storage.stats: failed', err);
+                return reply.status(502).send({
+                    error: err instanceof Error ? err.message : 'storage stats failed',
+                });
+            }
+        }
+    );
+
+    interface DeleteObjectsBody {
+        keys?: string[];
+        content_ids?: string[];
+        artifacts?: string[];
+        tier?: 'primary' | 'cold';
+    }
+
+    /**
+     * POST /admin/storage/delete-objects
+     * Either delete a list of explicit S3 keys, or all artifacts for a list of content IDs.
+     * Defaults to primary tier; pass `tier: 'cold'` to delete from cold storage.
+     */
+    fastify.post<{ Body: DeleteObjectsBody }>(
+        '/admin/storage/delete-objects',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { keys, content_ids: contentIds, artifacts, tier = 'primary' } = request.body ?? {};
+            try {
+                let deletedCount = 0;
+                let freedBytes = 0;
+                const errors: string[] = [];
+
+                if (keys && keys.length > 0) {
+                    const out = await deleteObjectsByKeys(keys, tier);
+                    deletedCount += out.deletedCount;
+                    freedBytes += out.freedBytes;
+                    errors.push(...out.errors);
+                }
+                if (contentIds && contentIds.length > 0) {
+                    for (const id of contentIds) {
+                        const out = await deleteContentObjects(id, artifacts, tier);
+                        deletedCount += out.deletedCount;
+                        freedBytes += out.freedBytes;
+                        errors.push(...out.errors);
+                    }
+                }
+                cachedStats = null;
+                return reply.send({ deleted_count: deletedCount, freed_bytes: freedBytes, errors });
+            } catch (err) {
+                logger.error('storage.delete-objects: failed', err);
+                return reply.status(500).send({ error: err instanceof Error ? err.message : 'delete failed' });
+            }
+        }
+    );
+
+    interface SweepBody {
+        tenant_id?: string;
+        trigger?: 'auto' | 'manual';
+    }
+
+    /**
+     * POST /admin/storage/sweep
+     * Run one sweep cycle inline (no BullMQ) for the given tenant. Used by the
+     * "Run sweep now" button in Platform-Console.
+     */
+    fastify.post<{ Body: SweepBody }>(
+        '/admin/storage/sweep',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const tenantId = (request.body?.tenant_id ?? 'default').trim();
+            const trigger = request.body?.trigger === 'auto' ? 'auto' : 'manual';
+
+            try {
+                const policies = await cmsClient.listStoragePolicies();
+                const policy =
+                    policies.all.find(p => p.tenant_id === tenantId) ??
+                    policies.global ??
+                    null;
+                if (!policy) {
+                    return reply.status(404).send({ error: 'No policy found' });
+                }
+                const effective = { ...policy, tenant_id: tenantId };
+                const result = await runSweepForTenant(effective, trigger);
+                cachedStats = null;
+                return reply.send({
+                    success: true,
+                    deleted_count: result.deletedCount,
+                    freed_bytes: result.freedBytes,
+                    skipped: result.skipped,
+                    reason: result.reason,
+                    error: result.error,
+                });
+            } catch (err) {
+                logger.error('storage.sweep: failed', err);
+                return reply.status(500).send({ error: err instanceof Error ? err.message : 'sweep failed' });
+            }
+        }
+    );
+
+    /**
+     * POST /admin/storage/policy-changed
+     * Tells Aggregation to re-register repeatable BullMQ sweepers based on the
+     * current set of CMS policies. Called by CMS after a PUT to the policy.
+     */
+    fastify.post(
+        '/admin/storage/policy-changed',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            try {
+                await syncRepeatableSweepers();
+                return reply.send({ success: true });
+            } catch (err) {
+                logger.error('storage.policy-changed: failed', err);
+                return reply.status(500).send({ error: err instanceof Error ? err.message : 'sync failed' });
+            }
+        }
+    );
+
+    /**
+     * GET /admin/storage/reconcile
+     * Walks S3 + CMS to find orphan objects and missing artifacts.
+     */
+    fastify.get(
+        '/admin/storage/reconcile',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            try {
+                const out = await reconcileStorage();
+                return reply.send({
+                    orphan_keys: out.orphanKeys,
+                    missing_objects: out.missingObjects,
+                    orphan_count: out.orphanCount,
+                    missing_count: out.missingCount,
+                });
+            } catch (err) {
+                logger.error('storage.reconcile: failed', err);
+                return reply.status(500).send({ error: err instanceof Error ? err.message : 'reconcile failed' });
+            }
+        }
+    );
+
+    // Make TypeScript happy about the unused enqueue helper (kept for future
+    // policy-changed-driven enqueue path).
+    void (async () => {
+        const _: StorageSweepJob = { tenantId: '', trigger: 'auto' };
+        return _;
+    });
+
+    // -------------------------------------------------------------------------
+    // Quality Management endpoints
+    // -------------------------------------------------------------------------
+
+    interface ProbeBody {
+        content_item_id: string;
+        tier?: 'primary' | 'cold';
+    }
+
+    /**
+     * POST /admin/quality/probe
+     * Live ffprobe of a content item's primary media artifact. Returns the
+     * raw container info (duration, dims, bitrate, codecs) so the Console can
+     * compute projected savings against arbitrary profiles client-side.
+     */
+    fastify.post<{ Body: ProbeBody }>(
+        '/admin/quality/probe',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { content_item_id, tier } = request.body ?? ({} as ProbeBody);
+            if (!content_item_id) {
+                return reply.status(400).send({ error: 'content_item_id is required' });
+            }
+            try {
+                const out = await probeContentItem(content_item_id, tier ?? 'primary');
+                return reply.send(out);
+            } catch (err) {
+                logger.error('quality.probe: failed', err, { content_item_id });
+                return reply.status(500).send({
+                    error: err instanceof Error ? err.message : 'probe failed',
+                });
+            }
+        }
+    );
+
+    interface ReencodeItemRef {
+        content_item_id: string;
+        target_profile_id: number;
+    }
+
+    interface ReencodeBody {
+        items: ReencodeItemRef[];
+        trigger?: 'manual' | 'rule' | 'ingest';
+        rule_id?: number | null;
+        tenant_id?: string;
+    }
+
+    /**
+     * POST /admin/quality/re-encode
+     * Enqueues one re-encode job per item onto the QUALITY_REENCODE queue.
+     * Manual jobs (default trigger) get default priority so they jump ahead of
+     * rule-driven sweeps.
+     */
+    fastify.post<{ Body: ReencodeBody }>(
+        '/admin/quality/re-encode',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const body = request.body;
+            if (!body?.items || !Array.isArray(body.items) || body.items.length === 0) {
+                return reply.status(400).send({ error: 'items[] is required' });
+            }
+            const queue = getQueue(QUEUE_NAMES.QUALITY_REENCODE);
+            if (!queue) {
+                return reply.status(503).send({ error: 'QUALITY_REENCODE queue not initialised' });
+            }
+            const trigger: 'manual' | 'rule' | 'ingest' = body.trigger ?? 'manual';
+            const tenantId = body.tenant_id ?? 'default';
+            let enqueued = 0;
+            for (const ref of body.items) {
+                if (!ref.content_item_id || !ref.target_profile_id) continue;
+                const payload: QualityReencodeJob = {
+                    contentItemId: ref.content_item_id,
+                    targetProfileId: ref.target_profile_id,
+                    tenantId,
+                    ruleId: body.rule_id ?? undefined,
+                    trigger,
+                };
+                await queue.add('reencode', payload, {
+                    priority: trigger === 'manual' ? 0 : 5,
+                    attempts: 2,
+                    backoff: { type: 'exponential', delay: 30_000 },
+                    removeOnComplete: { age: 86400, count: 500 },
+                    removeOnFail: { age: 86400 },
+                });
+                enqueued++;
+            }
+            const queueDepth = await queue.getWaitingCount() + await queue.getActiveCount();
+            return reply.send({ success: true, enqueued, queue_depth: queueDepth });
+        }
+    );
+
+    /**
+     * POST /admin/quality/rule-changed
+     * Sync repeatable quality sweepers from CMS. Pinged by CMS after any rule
+     * create/update/delete.
+     */
+    fastify.post(
+        '/admin/quality/rule-changed',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            try {
+                await syncRepeatableQualitySweepers();
+                return reply.send({ success: true });
+            } catch (err) {
+                logger.error('quality.rule-changed: failed', err);
+                return reply.status(500).send({ error: err instanceof Error ? err.message : 'sync failed' });
+            }
+        }
+    );
+
+    /**
+     * GET /admin/quality/queue-depth
+     * Live queue stats for the in-flight badge in Console.
+     */
+    fastify.get(
+        '/admin/quality/queue-depth',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            const queue = getQueue(QUEUE_NAMES.QUALITY_REENCODE);
+            if (!queue) {
+                return reply.send({ active: 0, waiting: 0, delayed: 0, failed: 0 });
+            }
+            const [active, waiting, delayed, failed] = await Promise.all([
+                queue.getActiveCount(),
+                queue.getWaitingCount(),
+                queue.getDelayedCount(),
+                queue.getFailedCount(),
+            ]);
+            return reply.send({ active, waiting, delayed, failed });
         }
     );
 }

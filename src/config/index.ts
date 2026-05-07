@@ -24,13 +24,24 @@ const configSchema = z.object({
     redisUrl: z.string().min(1, 'Redis URL is required'),
     jwtSecret: z.string().min(1, 'JWT secret is required for admin auth'),
 
-    // Required - Storage (S3-compatible)
+    // Required - Storage (S3-compatible) — primary/hot tier
     storageEndpoint: urlSchema.describe('S3-compatible storage endpoint'),
     storageBucket: z.string().min(1, 'Storage bucket name is required'),
     storageAccessKey: z.string().default('minioadmin'),
     storageSecretKey: z.string().default('minioadmin'),
     storagePublicUrl: urlSchema.default('http://localhost:9000'),
     storageRegion: z.string().default('us-east-1'),
+
+    // Optional - Cold tier (any S3-compatible bucket — R2, B2, Wasabi, AWS S3, etc.).
+    // When configured, the storage worker can move purge candidates here instead
+    // of deleting them outright.
+    coldStorageEnabled: z.coerce.boolean().default(false),
+    coldStorageEndpoint: z.string().nullable().default(null),
+    coldStorageBucket: z.string().nullable().default(null),
+    coldStorageAccessKey: z.string().nullable().default(null),
+    coldStorageSecretKey: z.string().nullable().default(null),
+    coldStoragePublicUrl: z.string().nullable().default(null),
+    coldStorageRegion: z.string().default('us-east-1'),
 
     // AI Services
     whisperApiUrl: urlSchema.default('http://whisper:9000'),
@@ -116,6 +127,14 @@ function mapEnvToConfig(): Record<string, unknown> {
         storageSecretKey: process.env.STORAGE_SECRET_KEY,
         storagePublicUrl: process.env.STORAGE_PUBLIC_URL,
         storageRegion: process.env.STORAGE_REGION,
+
+        coldStorageEnabled: process.env.COLD_STORAGE_ENABLED,
+        coldStorageEndpoint: process.env.COLD_STORAGE_ENDPOINT || null,
+        coldStorageBucket: process.env.COLD_STORAGE_BUCKET || null,
+        coldStorageAccessKey: process.env.COLD_STORAGE_ACCESS_KEY || null,
+        coldStorageSecretKey: process.env.COLD_STORAGE_SECRET_KEY || null,
+        coldStoragePublicUrl: process.env.COLD_STORAGE_PUBLIC_URL || null,
+        coldStorageRegion: process.env.COLD_STORAGE_REGION,
 
         whisperApiUrl: process.env.WHISPER_API_URL,
         mediaTempDir: process.env.MEDIA_TEMP_DIR,

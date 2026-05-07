@@ -76,6 +76,7 @@ export interface YouTubeSourceConfig extends SourceConfig {
     settings: {
         channelId?: string;
         playlistId?: string;
+        searchQuery?: string;
         maxResults?: number;
     };
 }

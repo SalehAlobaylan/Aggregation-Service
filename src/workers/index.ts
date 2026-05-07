@@ -9,6 +9,9 @@ import { fetchWorker } from './fetch.worker.js';
 import { normalizeWorker } from './normalize.worker.js';
 import { mediaWorker } from './media.worker.js';
 import { aiWorker } from './ai.worker.js';
+import { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
+import { qualityWorker } from './quality.worker.js';
+import { qualitySweeperWorker, syncRepeatableQualitySweepers } from './quality-sweeper.worker.js';
 
 // All registered workers
 const workers: Worker[] = [
@@ -16,6 +19,9 @@ const workers: Worker[] = [
     normalizeWorker,
     mediaWorker,
     aiWorker,
+    storageWorker,
+    qualityWorker,
+    qualitySweeperWorker,
 ];
 
 /**
@@ -31,7 +37,13 @@ export function getAllWorkers(): Worker[] {
 export function startWorkers(): void {
     logger.info('Starting all workers...');
     // Workers start automatically when created
-    // This function is for explicit initialization in the future
+    // Schedule repeatable storage sweepers (best-effort — non-fatal if CMS is down)
+    syncRepeatableSweepers().catch(err => {
+        logger.error('Failed to sync repeatable storage sweepers', err);
+    });
+    syncRepeatableQualitySweepers().catch(err => {
+        logger.error('Failed to sync repeatable quality sweepers', err);
+    });
 }
 
 /**
@@ -59,4 +71,7 @@ export { fetchWorker } from './fetch.worker.js';
 export { normalizeWorker } from './normalize.worker.js';
 export { mediaWorker } from './media.worker.js';
 export { aiWorker } from './ai.worker.js';
+export { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
+export { qualityWorker } from './quality.worker.js';
+export { qualitySweeperWorker, syncRepeatableQualitySweepers } from './quality-sweeper.worker.js';
 export { createWorker } from './base-worker.js';

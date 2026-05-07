@@ -85,6 +85,47 @@ export interface AIJob {
 }
 
 /**
+ * Storage Sweep Job - one circulation tick for one tenant
+ */
+export interface StorageSweepJob {
+    tenantId: string;
+    trigger: 'auto' | 'manual';
+}
+
+/**
+ * Quality Re-encode Job - one item, one target profile.
+ * Workflow: download → ffprobe → ffmpeg(profile) → upload to versioned key →
+ * patch CMS → schedule grace-period cleanup of the prior key.
+ */
+export interface QualityReencodeJob {
+    contentItemId: string;
+    targetProfileId: number;
+    tenantId: string;
+    ruleId?: number;
+    trigger: 'manual' | 'rule' | 'ingest';
+}
+
+/**
+ * Quality cleanup job — delayed deletion of the old versioned media key
+ * once the URL swap has propagated past any in-flight reads.
+ */
+export interface QualityCleanupJob {
+    contentItemId: string;
+    keyToDelete: string;
+    tier: 'primary' | 'cold';
+}
+
+/**
+ * Quality Sweep Job - one tick of one rule. The sweeper worker pulls
+ * candidates from CMS and enqueues individual re-encode jobs.
+ */
+export interface QualitySweepJob {
+    ruleId: number;
+    tenantId: string;
+    trigger: 'auto' | 'manual';
+}
+
+/**
  * DLQ Job - failed job moved to dead letter queue
  */
 export interface DLQJob {
@@ -102,6 +143,9 @@ export const QUEUE_NAMES = {
     NORMALIZE: 'normalize-queue',
     MEDIA: 'media-queue',
     AI: 'ai-queue',
+    STORAGE_SWEEP: 'storage-sweep-queue',
+    QUALITY_REENCODE: 'quality-reencode-queue',
+    QUALITY_SWEEP: 'quality-sweep-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 
