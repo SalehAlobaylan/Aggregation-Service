@@ -26,11 +26,12 @@ import type {
     MoveToColdRequest,
     MoveToColdResponse,
     QualityProfile,
-    QualityRule,
-    QualityCandidatesResponse,
-    WriteQualityHistoryRequest,
+    ResolveProfileResponse,
     UpdateContentItemQualityRequest,
     UpdateContentItemQualityResponse,
+    InternalContentItem,
+    WriteOpMetricsRequest,
+    OpBudgetStatus,
 } from './types.js';
 
 // Circuit breaker for CMS calls
@@ -359,30 +360,34 @@ export const cmsClient = {
         );
     },
 
-    // ---------------------------------------------------------------
-    // Quality management
-    // ---------------------------------------------------------------
-
     /**
-     * GET /internal/quality/rules?enabled=true
+     * GET /internal/content-items/:id
+     * Returns the full record needed by the quality worker (tier, media_url,
+     * media_version, current profile id). Single source of truth — replaces
+     * the prior pattern of deriving source key from `getStorageKey()` and
+     * assuming primary tier.
      */
-    async listQualityRules(
-        params: { enabled?: boolean } = {},
-        requestId?: string
-    ): Promise<{ data: QualityRule[] }> {
-        const qs = new URLSearchParams();
-        if (params.enabled !== undefined) qs.set('enabled', String(params.enabled));
-        const query = qs.toString() ? `?${qs.toString()}` : '';
-        return makeRequest<{ data: QualityRule[] }>(
+    async getContentItem(id: string, requestId?: string): Promise<InternalContentItem> {
+        return makeRequest<InternalContentItem>(
             'GET',
-            `/quality/rules${query}`,
+            `/content-items/${id}`,
             undefined,
             requestId
         );
     },
 
+    // ---------------------------------------------------------------
+    // Quality / Ingest configuration
+    //
+    // Phase 7: ingest profile resolution + per-item quality patch.
+    // (rule / candidates / history endpoints were removed; re-encoding old
+    // content is now driven by Storage policies with archive_action='re_encode'.)
+    // ---------------------------------------------------------------
+
     /**
      * GET /internal/quality/profiles/:id
+     * Used by the re-encode worker (invoked from Storage sweeps) when the
+     * storage policy specifies an explicit re_encode_target_profile_id.
      */
     async getQualityProfile(id: number, requestId?: string): Promise<QualityProfile> {
         return makeRequest<QualityProfile>(
@@ -394,58 +399,32 @@ export const cmsClient = {
     },
 
     /**
-     * GET /internal/quality/profiles/default?tenant_id=X
-     * Returns null if no default is configured (404 from CMS).
+     * GET /internal/quality/profiles/resolve?tenant_id=X&source_type=Y
+     *
+     * Returns the most-specific matching profile (and the resolution-rung tag).
+     * Returns null when CMS responds 404 (no rung matched and no global
+     * default exists) — caller falls back to DEFAULT_ENCODE_PROFILE.
      */
-    async getDefaultQualityProfile(tenantId?: string, requestId?: string): Promise<QualityProfile | null> {
-        const qs = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : '';
+    async resolveQualityProfile(
+        params: { tenant_id?: string; source_type?: string },
+        requestId?: string
+    ): Promise<ResolveProfileResponse | null> {
+        const qs = new URLSearchParams();
+        if (params.tenant_id) qs.set('tenant_id', params.tenant_id);
+        if (params.source_type) qs.set('source_type', params.source_type);
+        const query = qs.toString() ? `?${qs.toString()}` : '';
         try {
-            return await makeRequest<QualityProfile>(
+            return await makeRequest<ResolveProfileResponse>(
                 'GET',
-                `/quality/profiles/default${qs}`,
+                `/quality/profiles/resolve${query}`,
                 undefined,
                 requestId
             );
         } catch (err) {
-            // 404 → no default configured. Caller falls back to DEFAULT_ENCODE_PROFILE.
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes('404')) return null;
             throw err;
         }
-    },
-
-    /**
-     * GET /internal/quality/candidates?rule_id=N&tenant_id=X&limit=K
-     */
-    async listQualityCandidates(
-        params: { rule_id: number; tenant_id?: string; limit?: number },
-        requestId?: string
-    ): Promise<QualityCandidatesResponse> {
-        const qs = new URLSearchParams();
-        qs.set('rule_id', String(params.rule_id));
-        if (params.tenant_id) qs.set('tenant_id', params.tenant_id);
-        if (params.limit) qs.set('limit', String(params.limit));
-        return makeRequest<QualityCandidatesResponse>(
-            'GET',
-            `/quality/candidates?${qs.toString()}`,
-            undefined,
-            requestId
-        );
-    },
-
-    /**
-     * POST /internal/quality/history
-     */
-    async writeQualityHistory(
-        data: WriteQualityHistoryRequest,
-        requestId?: string
-    ): Promise<{ id: number }> {
-        return makeProtectedRequest<{ id: number }>(
-            'POST',
-            '/quality/history',
-            data,
-            requestId
-        );
     },
 
     /**
@@ -460,6 +439,40 @@ export const cmsClient = {
             'PATCH',
             `/content-items/${id}/quality`,
             data,
+            requestId
+        );
+    },
+
+    // ---------------------------------------------------------------
+    // Storage operations telemetry
+    // ---------------------------------------------------------------
+
+    /**
+     * POST /internal/storage/op-metrics
+     * Hourly flush from the SDK middleware counter. CMS UPSERTs by adding
+     * `count` to the existing daily row, so re-flushing the same delta is
+     * NOT idempotent — caller must already have drained its in-memory bucket.
+     */
+    async writeOpMetrics(data: WriteOpMetricsRequest, requestId?: string): Promise<{ success: boolean; written: number }> {
+        return makeProtectedRequest<{ success: boolean; written: number }>(
+            'POST',
+            '/storage/op-metrics',
+            data,
+            requestId
+        );
+    },
+
+    /**
+     * GET /internal/storage/op-budget?tenant_id=X
+     * Used by the storage + quality sweepers to short-circuit before
+     * enqueueing work when the soft cap has been hit.
+     */
+    async getStorageOpBudget(tenantId: string, requestId?: string): Promise<OpBudgetStatus> {
+        const qs = `?tenant_id=${encodeURIComponent(tenantId)}`;
+        return makeRequest<OpBudgetStatus>(
+            'GET',
+            `/storage/op-budget${qs}`,
+            undefined,
             requestId
         );
     },

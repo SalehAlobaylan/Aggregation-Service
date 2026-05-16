@@ -67,14 +67,19 @@ export const qualityWorker = createWorker({
             throw new Error(result.error ?? 'unknown re-encode failure');
         }
 
-        // Schedule the prior key for deletion after the grace period.
+        // Idempotent skips don't have an old key to clean up.
+        if (result.skippedIdempotent) return;
+
+        // Schedule the prior key for deletion after the grace period. Tier
+        // MUST come from the result — cold-tier items have their old key on
+        // the cold bucket, not primary.
         if (result.oldKey && result.newKey && result.oldKey !== result.newKey) {
             const queue = getQueue(QUEUE_NAMES.QUALITY_REENCODE) as Queue | undefined;
             if (queue) {
                 const cleanup: QualityCleanupJob = {
                     contentItemId: data.contentItemId,
                     keyToDelete: result.oldKey,
-                    tier: 'primary',
+                    tier: result.tier,
                 };
                 await queue.add('cleanup-old-version', cleanup, {
                     delay: CLEANUP_GRACE_MS,
@@ -85,6 +90,7 @@ export const qualityWorker = createWorker({
                 jobLogger.info('Quality cleanup scheduled', {
                     contentItemId: data.contentItemId,
                     key: result.oldKey,
+                    tier: result.tier,
                     delayMs: CLEANUP_GRACE_MS,
                 });
             }

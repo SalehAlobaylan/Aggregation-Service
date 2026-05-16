@@ -43,6 +43,14 @@ const configSchema = z.object({
     coldStoragePublicUrl: z.string().nullable().default(null),
     coldStorageRegion: z.string().default('us-east-1'),
 
+    // Cloudflare R2 Analytics — optional. When set, the op-metrics flush
+    // worker also pulls per-bucket Class A/B counts from the GraphQL API
+    // hourly. Without this, the Operations panel only shows internal SDK
+    // calls (massively understates real Class B at scale).
+    cloudflareAccountId:    z.string().nullable().default(null),
+    cloudflareApiToken:     z.string().nullable().default(null),
+    cloudflareR2BucketName: z.string().nullable().default(null),
+
     // AI Services
     whisperApiUrl: urlSchema.default('http://whisper:9000'),
 
@@ -135,6 +143,10 @@ function mapEnvToConfig(): Record<string, unknown> {
         coldStorageSecretKey: process.env.COLD_STORAGE_SECRET_KEY || null,
         coldStoragePublicUrl: process.env.COLD_STORAGE_PUBLIC_URL || null,
         coldStorageRegion: process.env.COLD_STORAGE_REGION,
+
+        cloudflareAccountId:    process.env.CLOUDFLARE_ACCOUNT_ID || null,
+        cloudflareApiToken:     process.env.CLOUDFLARE_API_TOKEN || null,
+        cloudflareR2BucketName: process.env.CLOUDFLARE_R2_BUCKET_NAME || null,
 
         whisperApiUrl: process.env.WHISPER_API_URL,
         mediaTempDir: process.env.MEDIA_TEMP_DIR,

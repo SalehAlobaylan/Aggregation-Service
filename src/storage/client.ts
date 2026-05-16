@@ -19,6 +19,7 @@ import { stat } from 'fs/promises';
 import { lookup } from 'mime-types';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
+import { attachOpCounter } from './op-counter.js';
 
 // -----------------------------------------------------------------------------
 // Two-tier storage: primary (hot) is the bucket every upload lands in. cold is
@@ -50,6 +51,12 @@ const coldClient = config.coldStorageEnabled && config.coldStorageEndpoint
         forcePathStyle: true,
     })
     : null;
+
+// Attach the op counter to every constructed S3 client so we can track
+// Class A / Class B operation counts against the free-tier budget. Adds one
+// in-memory increment per `client.send(...)`; no call-site changes needed.
+attachOpCounter(primaryClient, 'primary');
+if (coldClient) attachOpCounter(coldClient, 'cold');
 
 // Backwards-compat alias for existing callers that imported s3Client directly.
 const s3Client = primaryClient;

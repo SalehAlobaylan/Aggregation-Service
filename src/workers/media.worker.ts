@@ -23,6 +23,8 @@ import {
     audioToMp4,
     extractThumbnail,
     getMediaInfo,
+    containerExtension,
+    containerMime,
 } from '../media/transcoder.js';
 import {
     uploadFile,
@@ -30,7 +32,8 @@ import {
     objectExists,
     getPublicUrl,
 } from '../storage/client.js';
-import { resolveDefaultIngestProfile } from '../services/quality.service.js';
+import { resolveIngestProfile, preflightCheck } from '../services/quality.service.js';
+import { lookup as lookupMime } from 'mime-types';
 
 export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
@@ -94,11 +97,50 @@ export const mediaWorker = createWorker({
             const mediaInfo = await getMediaInfo(downloadResult.filePath);
             jobLogger.debug('Media info', { ...mediaInfo });
 
-            // 5. Transcode/process media
+            // 5. Resolve the ingest profile for this (tenant, source_type).
+            // We don't have a tenant_id on MediaJob today (items are tenant-
+            // scoped via CMS but the worker job doesn't carry it). Pass the
+            // source_type only — CMS will pick the most-specific match
+            // available (typically global+source or global+global).
+            const { profile: ingestProfile, profileId: ingestProfileId, rawProfile } =
+                await resolveIngestProfile(undefined, sourceType);
+
+            // 5a. Pre-flight: enforce profile constraints (allowed MIME types,
+            // max input size, max input duration). Fail-fast before any
+            // transcode work runs.
+            let originalSourceBytes = 0;
+            try { originalSourceBytes = (await stat(downloadResult.filePath)).size; } catch { /* ignore */ }
+            const downloadedMime = (lookupMime(downloadResult.filePath) || undefined) as string | undefined;
+            const preflightFailure = preflightCheck(
+                {
+                    mimeType: downloadedMime,
+                    sizeBytes: originalSourceBytes > 0 ? originalSourceBytes : null,
+                    durationSec: mediaInfo.duration > 0 ? Math.round(mediaInfo.duration) : null,
+                },
+                rawProfile,
+            );
+            if (preflightFailure) {
+                jobLogger.warn('Media pre-flight rejected the input', {
+                    contentItemId,
+                    reason: preflightFailure,
+                });
+                await cmsClient.updateStatus(contentItemId, {
+                    status: 'FAILED',
+                    failure_reason: preflightFailure,
+                }, job.id);
+                return; // stop here — no S3 writes, no AI enqueue
+            }
+
+            // 6. Transcode/process media
             let processedPath: string;
             let duration: number;
             let processedMimeType = 'video/mp4';
             let isImageArtifact = false;
+
+            // Container is profile-driven. Image artifacts always pass through
+            // and ignore the container choice.
+            const outExt = containerExtension(rawProfile?.output_container);
+            const outMime = containerMime(rawProfile?.output_container);
 
             if (contentType === 'ARTICLE' && sourceType === 'TELEGRAM' && downloadRef?.mediaKind === 'photo') {
                 processedPath = downloadResult.filePath;
@@ -106,36 +148,38 @@ export const mediaWorker = createWorker({
                 processedMimeType = inferImageMimeType(downloadResult.format);
                 isImageArtifact = true;
             } else if (mediaInfo.hasVideo || contentType === 'VIDEO') {
-                // Video: transcode to MP4 using the operator-configured default
-                // quality profile (or the built-in fallback if none is set).
-                const mp4Path = join(config.mediaTempDir, `${contentItemId}_processed.mp4`);
-                const { profile: ingestProfile } = await resolveDefaultIngestProfile();
-                const result = await transcodeToMp4(downloadResult.filePath, mp4Path, ingestProfile);
+                const outPath = join(config.mediaTempDir, `${contentItemId}_processed.${outExt}`);
+                const result = await transcodeToMp4(downloadResult.filePath, outPath, ingestProfile);
                 processedPath = result.outputPath;
                 duration = result.duration;
+                processedMimeType = outMime;
                 tempFiles.push(processedPath);
             } else {
-                // Audio-only (podcast): convert to MP4 with placeholder visual
-                const mp4Path = join(config.mediaTempDir, `${contentItemId}_processed.mp4`);
-                const result = await audioToMp4(downloadResult.filePath, mp4Path);
+                // Audio-only: still use the still-image MP4 wrapper because
+                // For You feed needs a video container. The audio side of the
+                // ingest profile (codec + bitrate) is honoured by audioToMp4.
+                const outPath = join(config.mediaTempDir, `${contentItemId}_processed.mp4`);
+                const result = await audioToMp4(downloadResult.filePath, outPath, undefined, ingestProfile);
                 processedPath = result.outputPath;
                 duration = result.duration || mediaInfo.duration;
+                processedMimeType = 'video/mp4';
                 tempFiles.push(processedPath);
             }
 
             jobLogger.info('Transcode complete', { processedPath, duration });
 
-            // 6. Extract thumbnail
+            // 7. Extract thumbnail with profile-driven offset + maxHeight.
             let thumbnailPath: string | undefined;
             let thumbnailUrl: string | undefined;
-
             let thumbnailBytes = 0;
             try {
                 if (isImageArtifact) {
                     throw new Error('Skip thumbnail extraction for image artifacts');
                 }
                 thumbnailPath = join(config.mediaTempDir, `${contentItemId}_thumb.jpg`);
-                await extractThumbnail(processedPath, thumbnailPath, 2);
+                const thumbOffset = rawProfile?.thumbnail_offset_seconds ?? 2;
+                const thumbMaxH = rawProfile?.thumbnail_max_height ?? 360;
+                await extractThumbnail(processedPath, thumbnailPath, thumbOffset, thumbMaxH);
                 tempFiles.push(thumbnailPath);
 
                 // Upload thumbnail
@@ -157,8 +201,11 @@ export const mediaWorker = createWorker({
                 }
             }
 
-            // 7. Upload processed artifact
-            const mediaUrl = await uploadFile(processedKey, processedPath, processedMimeType);
+            // 8. Upload processed artifact (key extension matches container).
+            const containerProcessedKey = isImageArtifact
+                ? processedKey
+                : getStorageKey(contentItemId, 'processed', outExt);
+            const mediaUrl = await uploadFile(containerProcessedKey, processedPath, processedMimeType);
             jobLogger.info('Processed media uploaded', { mediaUrl });
 
             let processedBytes = 0;
@@ -172,14 +219,12 @@ export const mediaWorker = createWorker({
                 thumbnailUrl = mediaUrl;
             }
 
-            // 8. Update CMS artifacts (size accounting includes processed + thumbnail)
+            // 9. Update CMS artifacts (size accounting includes processed + thumbnail).
             // Quality bookkeeping is included on first ingest so the Quality
             // system has a baseline to project savings against. CMS treats
             // original_* fields as write-once, so re-runs don't clobber them.
-            let originalSourceBytes = 0;
-            try { originalSourceBytes = (await stat(downloadResult.filePath)).size; } catch { /* ignore */ }
+            // originalSourceBytes was computed above during pre-flight.
             const originalBitrateKbps = mediaInfo.bitrateKbps ?? undefined;
-            const { profileId: ingestProfileId } = await resolveDefaultIngestProfile();
 
             await cmsClient.updateArtifacts(contentItemId, {
                 media_url: mediaUrl,

@@ -194,15 +194,24 @@ export function transcodeToMp4(
 
 /**
  * Convert audio to MP4 with a static visual (for For You feed requirement)
- * Creates an MP4 container with audio + placeholder image
+ * Creates an MP4 container with audio + placeholder image.
+ *
+ * The audio side honours the supplied EncodeProfile (codec + bitrate) so an
+ * operator-configured default like `audio_bitrate_kbps=64` actually applies
+ * to fresh podcast ingests. The video side stays pinned to libx264 +
+ * `-tune stillimage` regardless of profile — the cover is a single static
+ * image, so codec choice and bitrate-mode tweaks are wasted on it. We do
+ * pull the preset from the profile so a slower preset benefits the cover
+ * encode too.
  */
 export function audioToMp4(
     inputPath: string,
     outputPath: string,
-    coverImagePath?: string
+    coverImagePath?: string,
+    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE
 ): Promise<TranscodeResult> {
     return new Promise(async (resolve, reject) => {
-        logger.info('Starting audio-to-MP4 conversion', { inputPath, outputPath });
+        logger.info('Starting audio-to-MP4 conversion', { inputPath, outputPath, profile });
 
         // Use provided cover or create a placeholder
         let imagePath = coverImagePath;
@@ -223,13 +232,15 @@ export function audioToMp4(
             .inputOptions(['-loop 1'])  // Loop still image
             .input(inputPath)
             .outputOptions([
+                // Video stays pinned — see docstring for why.
                 '-c:v libx264',
-                '-preset fast',
+                `-preset ${profile.preset}`,
                 '-profile:v baseline',
                 '-level 3.0',
                 '-tune stillimage',       // Optimize for still image
-                '-c:a aac',
-                '-b:a 128k',
+                // Audio honours the profile.
+                `-c:a ${audioCodecFlag(profile.audioCodec)}`,
+                `-b:a ${profile.audioBitrateKbps}k`,
                 '-pix_fmt yuv420p',
                 '-shortest',              // End when audio ends
                 '-movflags +faststart',
@@ -313,20 +324,33 @@ async function generatePlaceholderImage(outputPath: string): Promise<void> {
 }
 
 /**
- * Extract thumbnail from video at specified offset.
+ * Extract thumbnail from video at the specified offset.
+ *
+ * `maxHeight` caps the thumbnail height (preserving aspect ratio); the
+ * default 360 matches the historical hardcoded behaviour. `offsetSeconds`
+ * picks the timecode to grab — values larger than the clip's duration cause
+ * ffmpeg to fall back to the last keyframe.
+ *
  * Writes to the exact outputPath provided (safe for concurrent jobs).
  */
 export function extractThumbnail(
     inputPath: string,
     outputPath: string,
-    offsetSeconds: number = 2
+    offsetSeconds: number = 2,
+    maxHeight: number = 360,
 ): Promise<string> {
     return new Promise((resolve, reject) => {
-        logger.info('Extracting thumbnail', { inputPath, outputPath, offsetSeconds });
+        logger.info('Extracting thumbnail', { inputPath, outputPath, offsetSeconds, maxHeight });
+
+        // -2 keeps width even (yuv420p requirement); min(...) ensures we
+        // only downscale, never upscale a small input.
+        const scaleFilter = maxHeight > 0
+            ? `scale=-2:'min(${maxHeight},ih)'`
+            : `scale=-2:360`;
 
         ffmpeg(inputPath)
             .seekInput(offsetSeconds)
-            .outputOptions(['-vframes 1', '-vf scale=640:360'])
+            .outputOptions(['-vframes 1', `-vf ${scaleFilter}`])
             .output(outputPath)
             .on('end', () => {
                 logger.info('Thumbnail extracted', { outputPath });
@@ -338,6 +362,32 @@ export function extractThumbnail(
             })
             .run();
     });
+}
+
+/**
+ * Map an output_container profile value to its file extension.
+ * Restricted to single-file containers; HLS / DASH would emit a manifest +
+ * segments and need a different upload path.
+ */
+export function containerExtension(container: string | undefined): string {
+    switch ((container ?? 'mp4').toLowerCase()) {
+        case 'webm': return 'webm';
+        case 'mov': return 'mov';
+        case 'mp4':
+        default: return 'mp4';
+    }
+}
+
+/**
+ * Map an output_container profile value to its MIME type.
+ */
+export function containerMime(container: string | undefined): string {
+    switch ((container ?? 'mp4').toLowerCase()) {
+        case 'webm': return 'video/webm';
+        case 'mov': return 'video/quicktime';
+        case 'mp4':
+        default: return 'video/mp4';
+    }
 }
 
 /**

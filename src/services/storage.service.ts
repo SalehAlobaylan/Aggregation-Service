@@ -16,10 +16,13 @@ import {
 } from '../storage/client.js';
 import { logger } from '../observability/logger.js';
 import type { StoragePolicy, MoveToColdItem } from '../cms/types.js';
+import { getQueue, QUEUE_NAMES, type QualityReencodeJob } from '../queues/index.js';
 
 export interface SweepResult {
     tenantId: string;
     deletedCount: number;
+    movedToColdCount?: number;
+    reEncodedCount?: number;
     freedBytes: number;
     skipped: boolean;
     reason?: string;
@@ -42,7 +45,35 @@ export async function runSweepForTenant(
         return { tenantId, deletedCount: 0, freedBytes: 0, skipped: true, reason: 'policy disabled' };
     }
 
+    // Soft cap: auto sweeps respect the Class A budget so a runaway sweep can't
+    // blow through the free tier. Manual triggers bypass — operator override.
+    if (trigger === 'auto') {
+        try {
+            const budget = await cmsClient.getStorageOpBudget(tenantId);
+            if (budget.class_a_status === 'cap') {
+                logger.warn('Storage sweep skipped — Class A budget cap reached', {
+                    tenantId,
+                    used: budget.class_a_used,
+                    budget: budget.class_a_budget,
+                });
+                return {
+                    tenantId,
+                    deletedCount: 0,
+                    freedBytes: 0,
+                    skipped: true,
+                    reason: 'class_a_budget_cap',
+                };
+            }
+        } catch (err) {
+            // CMS unreachable for budget check — let the sweep run rather than
+            // silently freezing. The budget is a soft guardrail, not a hard one.
+            logger.warn('Storage sweep: budget check failed, proceeding without cap', { err });
+        }
+    }
+
     let deletedCount = 0;
+    let movedToColdCount = 0;
+    let reEncodedCount = 0;
     let freedBytes = 0;
     let errorMessage: string | undefined;
 
@@ -104,7 +135,48 @@ export async function runSweepForTenant(
             });
         }
 
-        if (moveToCold) {
+        if (action === 're_encode') {
+            // Enqueue one QUALITY_REENCODE job per candidate. We don't wait
+            // for them here — they run async on the quality.worker queue and
+            // patch CMS as each completes. The sweep run row records the
+            // count enqueued; cumulative byte savings emerge via the
+            // per-item `current_quality_profile_id` + `file_size_bytes`
+            // updates the re-encode worker performs.
+            const queue = getQueue(QUEUE_NAMES.QUALITY_REENCODE);
+            if (!queue) {
+                logger.error('storage.sweep: QUALITY_REENCODE queue not initialised; cannot re-encode', { tenantId });
+                errorMessage = 'quality_queue_not_initialised';
+            } else {
+                for (const candidate of candidates.data) {
+                    // Pick the explicit target if set on the policy; otherwise
+                    // pass 0 — the re-encode worker reads the per-item resolved
+                    // ingest profile when it sees targetProfileId<=0.
+                    const targetId = policy.re_encode_target_profile_id ?? 0;
+                    const payload: QualityReencodeJob = {
+                        contentItemId: candidate.id,
+                        targetProfileId: targetId,
+                        tenantId,
+                        trigger: trigger === 'manual' ? 'manual' : 'rule',
+                    };
+                    try {
+                        await queue.add('reencode', payload, {
+                            // Storage-driven re-encodes are lower priority than
+                            // direct admin actions so they queue behind manual work.
+                            priority: trigger === 'manual' ? 0 : 5,
+                            attempts: 2,
+                            backoff: { type: 'exponential', delay: 30_000 },
+                            removeOnComplete: { age: 86400, count: 500 },
+                            removeOnFail: { age: 86400 },
+                        });
+                        reEncodedCount++;
+                    } catch (err) {
+                        logger.error('storage.sweep: failed to enqueue re-encode', err, {
+                            contentId: candidate.id,
+                        });
+                    }
+                }
+            }
+        } else if (moveToCold) {
             const movedItems: MoveToColdItem[] = [];
             for (const candidate of candidates.data) {
                 try {
@@ -119,7 +191,9 @@ export async function runSweepForTenant(
                         // we don't lie about the URL change.
                         continue;
                     }
-                    deletedCount += moveResult.movedCount;
+                    // Track moves separately from deletes so the sweep-run row
+                    // distinguishes the two actions.
+                    movedToColdCount += moveResult.movedCount;
                     freedBytes += moveResult.bytesMoved || candidate.file_size_bytes;
                     movedItems.push({
                         id: candidate.id,
@@ -196,6 +270,8 @@ export async function runSweepForTenant(
             started_at: startedAt,
             finished_at: finishedAt,
             deleted_count: deletedCount,
+            moved_to_cold_count: movedToColdCount,
+            re_encoded_count: reEncodedCount,
             freed_bytes: freedBytes,
             trigger,
             error: errorMessage,
@@ -207,6 +283,8 @@ export async function runSweepForTenant(
     return {
         tenantId,
         deletedCount,
+        movedToColdCount,
+        reEncodedCount,
         freedBytes,
         skipped: false,
         error: errorMessage,

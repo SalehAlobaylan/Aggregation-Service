@@ -14,7 +14,8 @@ import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.j
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
 import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
-import { syncRepeatableQualitySweepers } from '../../workers/quality-sweeper.worker.js';
+// quality-sweeper worker removed in Phase 7; re-encoding is now driven by
+// the storage sweeper (when archive_action='re_encode').
 import { probeContentItem } from '../../services/quality.service.js';
 import type { QualityReencodeJob } from '../../queues/schemas.js';
 import {
@@ -1100,80 +1101,12 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         }
     );
 
-    interface ReencodeItemRef {
-        content_item_id: string;
-        target_profile_id: number;
-    }
-
-    interface ReencodeBody {
-        items: ReencodeItemRef[];
-        trigger?: 'manual' | 'rule' | 'ingest';
-        rule_id?: number | null;
-        tenant_id?: string;
-    }
-
-    /**
-     * POST /admin/quality/re-encode
-     * Enqueues one re-encode job per item onto the QUALITY_REENCODE queue.
-     * Manual jobs (default trigger) get default priority so they jump ahead of
-     * rule-driven sweeps.
-     */
-    fastify.post<{ Body: ReencodeBody }>(
-        '/admin/quality/re-encode',
-        { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const body = request.body;
-            if (!body?.items || !Array.isArray(body.items) || body.items.length === 0) {
-                return reply.status(400).send({ error: 'items[] is required' });
-            }
-            const queue = getQueue(QUEUE_NAMES.QUALITY_REENCODE);
-            if (!queue) {
-                return reply.status(503).send({ error: 'QUALITY_REENCODE queue not initialised' });
-            }
-            const trigger: 'manual' | 'rule' | 'ingest' = body.trigger ?? 'manual';
-            const tenantId = body.tenant_id ?? 'default';
-            let enqueued = 0;
-            for (const ref of body.items) {
-                if (!ref.content_item_id || !ref.target_profile_id) continue;
-                const payload: QualityReencodeJob = {
-                    contentItemId: ref.content_item_id,
-                    targetProfileId: ref.target_profile_id,
-                    tenantId,
-                    ruleId: body.rule_id ?? undefined,
-                    trigger,
-                };
-                await queue.add('reencode', payload, {
-                    priority: trigger === 'manual' ? 0 : 5,
-                    attempts: 2,
-                    backoff: { type: 'exponential', delay: 30_000 },
-                    removeOnComplete: { age: 86400, count: 500 },
-                    removeOnFail: { age: 86400 },
-                });
-                enqueued++;
-            }
-            const queueDepth = await queue.getWaitingCount() + await queue.getActiveCount();
-            return reply.send({ success: true, enqueued, queue_depth: queueDepth });
-        }
-    );
-
-    /**
-     * POST /admin/quality/rule-changed
-     * Sync repeatable quality sweepers from CMS. Pinged by CMS after any rule
-     * create/update/delete.
-     */
-    fastify.post(
-        '/admin/quality/rule-changed',
-        { preHandler: verifyAdminAuth },
-        async (_request, reply) => {
-            try {
-                await syncRepeatableQualitySweepers();
-                return reply.send({ success: true });
-            } catch (err) {
-                logger.error('quality.rule-changed: failed', err);
-                return reply.status(500).send({ error: err instanceof Error ? err.message : 'sync failed' });
-            }
-        }
-    );
+    // POST /admin/quality/re-encode removed in Phase 7 — re-encoding is
+    // orchestrated entirely from inside Aggregation by the storage sweep
+    // worker (when archive_action='re_encode'). The CMS no longer calls a
+    // re-encode HTTP endpoint; storage.service enqueues onto QUALITY_REENCODE
+    // directly via getQueue(). Manual one-shot re-encodes are surfaced through
+    // the storage "Run sweep now" button instead.
 
     /**
      * GET /admin/quality/queue-depth

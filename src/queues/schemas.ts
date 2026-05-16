@@ -115,15 +115,9 @@ export interface QualityCleanupJob {
     tier: 'primary' | 'cold';
 }
 
-/**
- * Quality Sweep Job - one tick of one rule. The sweeper worker pulls
- * candidates from CMS and enqueues individual re-encode jobs.
- */
-export interface QualitySweepJob {
-    ruleId: number;
-    tenantId: string;
-    trigger: 'auto' | 'manual';
-}
+// QualitySweepJob removed in Phase 7 — re-encoding old content is now
+// orchestrated by the storage sweep worker (when archive_action='re_encode'),
+// which enqueues directly onto QUALITY_REENCODE.
 
 /**
  * DLQ Job - failed job moved to dead letter queue
@@ -145,7 +139,6 @@ export const QUEUE_NAMES = {
     AI: 'ai-queue',
     STORAGE_SWEEP: 'storage-sweep-queue',
     QUALITY_REENCODE: 'quality-reencode-queue',
-    QUALITY_SWEEP: 'quality-sweep-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 

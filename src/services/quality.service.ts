@@ -11,7 +11,7 @@ import { mkdir, stat } from 'fs/promises';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 import { cmsClient } from '../cms/client.js';
-import type { QualityProfile, QualityRule } from '../cms/types.js';
+import type { QualityProfile } from '../cms/types.js';
 import {
     deleteObjectsByKeys,
     getObjectStream,
@@ -77,7 +77,38 @@ export interface ReencodeResult {
     durationMs: number;
     oldKey?: string;
     newKey?: string;
+    /** Storage tier the new key was written to. Cleanup of the old key must use the same tier. */
+    tier: StorageTier;
     error?: string;
+    /** True when the item was already at the target profile and ffmpeg was skipped. */
+    skippedIdempotent?: boolean;
+}
+
+/**
+ * Strip the configured public URL prefix from a media URL to recover the
+ * underlying S3 key. Returns null if the URL is not on either of the
+ * configured tier prefixes (e.g. a CDN-fronted URL we don't control, or a
+ * legacy URL from before this prefix existed).
+ *
+ * Used by the quality worker to figure out which key to download for
+ * re-encode — we cannot assume `processed.mp4` once an item has been
+ * re-encoded once before (it'll be `processed.v2.mp4`, then v3, ...).
+ */
+export function keyFromUrl(url: string | null | undefined): string | null {
+    if (!url) return null;
+    const stripPrefix = (u: string, prefix: string | null | undefined): string | null => {
+        if (!prefix) return null;
+        const normalized = prefix.replace(/\/$/, '');
+        if (u.startsWith(normalized + '/')) {
+            return u.slice(normalized.length + 1);
+        }
+        return null;
+    };
+    return (
+        stripPrefix(url, config.storagePublicUrl) ??
+        stripPrefix(url, config.coldStoragePublicUrl) ??
+        null
+    );
 }
 
 /**
@@ -102,6 +133,13 @@ export async function reencodeOneItem(args: {
 }): Promise<ReencodeResult> {
     const start = Date.now();
     const { contentItemId, targetProfileId, tenantId, ruleId, trigger } = args;
+    // tenantId / ruleId are kept on the args for compatibility with the
+    // BullMQ job payload shape (storage sweeps fill them in for telemetry),
+    // but the per-history-row writes that consumed them were dropped in
+    // Phase 7 — sweep accounting now lives on storage_sweep_runs instead.
+    void tenantId;
+    void ruleId;
+    void trigger;
 
     const result: ReencodeResult = {
         success: false,
@@ -110,35 +148,61 @@ export async function reencodeOneItem(args: {
         originalSizeBytes: 0,
         originalBitrateKbps: 0,
         durationMs: 0,
+        tier: 'primary',
     };
 
     let tempIn: string | undefined;
     let tempOut: string | undefined;
 
     try {
-        // 1. Pull item + profile concurrently.
-        const [profile, candidates] = await Promise.all([
-            cmsClient.getQualityProfile(targetProfileId),
-            // Use the candidates endpoint as a fast item lookup — it returns
-            // the storage tier and current version.
-            cmsClient
-                .listQualityCandidates({ rule_id: 0, tenant_id: tenantId, limit: 0 })
-                .catch(() => null),
-        ]);
-        // candidates is intentionally optional; we don't actually want a list,
-        // we want the per-item fields. Easier: call CMS for the item directly.
-        void candidates; // silence linter
+        // 1. Pull the item record first — we need its source_type for the
+        // "auto" profile-resolution path AND its tier/version/URL regardless
+        // of which path we take.
+        const item = await cmsClient.getContentItem(contentItemId);
 
-        // Resolve tier + current version + URL via the artifacts metadata. We
-        // don't have a direct "get item" internal endpoint exposed yet; the
-        // worker is given enough info in the job payload by the caller, so
-        // here we re-derive from the deterministic key. The job-level caller
-        // (BullMQ worker) is responsible for fetching the item record and
-        // passing tier/key/version in via a richer args bag if we extend the
-        // shape later. For now, default to primary tier and the unversioned
-        // historical key, then upload to v2.
-        const tier: StorageTier = 'primary';
-        const sourceKey = getStorageKey(contentItemId, 'processed', 'mp4');
+        // Resolve the profile. Storage sweeps pass targetProfileId=0 to mean
+        // "auto-pick the resolved ingest profile for this item" (the
+        // re_encode_target_profile_id field on StoragePolicy was null).
+        // Manual triggers pass a concrete id directly.
+        let profile: import('../cms/types.js').QualityProfile;
+        if (targetProfileId > 0) {
+            profile = await cmsClient.getQualityProfile(targetProfileId);
+        } else {
+            // Auto-resolve: pick the most-specific profile for this item's
+            // (tenant, source) tuple. CMS guarantees source_type is set
+            // (empty string when unknown) so the resolver always gets a value.
+            const sourceFromItem = item.source_type || undefined;
+            const resolved = await resolveIngestProfile(item.tenant_id, sourceFromItem);
+            if (!resolved.rawProfile) {
+                throw new Error('re_encode: no profile available (CMS has no global default and no explicit target)');
+            }
+            profile = resolved.rawProfile;
+        }
+
+        // Idempotency: if the item is already at this profile, skip ffmpeg.
+        if (item.current_quality_profile_id === profile.id) {
+            logger.info('Quality re-encode skipped — already at target profile', {
+                contentItemId,
+                targetProfileId: profile.id,
+            });
+            result.success = true;
+            result.skippedIdempotent = true;
+            result.originalSizeBytes = item.file_size_bytes;
+            result.originalBitrateKbps = item.current_bitrate_kbps ?? 0;
+            result.newSizeBytes = item.file_size_bytes;
+            result.newBitrateKbps = result.originalBitrateKbps;
+            result.durationMs = Date.now() - start;
+            return result;
+        }
+
+        const tier: StorageTier = item.storage_tier === 'cold' ? 'cold' : 'primary';
+        result.tier = tier;
+
+        // Derive source key from the live media_url so we pick up versioned
+        // keys (`processed.v3.mp4`) — never assume the unversioned key.
+        // Falls back to the deterministic v1 key only when the URL is missing.
+        const sourceKey =
+            keyFromUrl(item.media_url) ?? getStorageKey(contentItemId, 'processed', 'mp4');
 
         // 2. Download.
         const downloaded = await downloadToTemp(contentItemId, sourceKey, tier);
@@ -160,15 +224,18 @@ export async function reencodeOneItem(args: {
         const outInfo = await getMediaInfo(tempOut).catch(() => null);
         if (outInfo?.bitrateKbps) result.newBitrateKbps = outInfo.bitrateKbps;
 
-        // 5. Upload to a versioned key. Versioning avoids CDN cache poisoning
-        // and lets us delete the prior key after a grace window.
-        const newVersion = nextVersion(contentItemId);
+        // 5. Upload to the next versioned key on the same tier. Versioning
+        // avoids CDN cache poisoning and lets us delete the prior key after a
+        // grace window. The version counter is read from the DB (media_version)
+        // — no in-memory cache, so concurrent workers and restarts are safe.
+        const newVersion = item.media_version + 1;
         const newKey = versionedKey(contentItemId, newVersion);
         await uploadFile(newKey, tempOut, 'video/mp4', tier);
         result.newKey = newKey;
         result.oldKey = sourceKey;
 
-        // 6. Patch CMS.
+        // 6. Patch CMS — bump_version increments media_version atomically
+        // server-side, so the next worker call to getContentItem sees N+1.
         const newUrl = getPublicUrl(newKey, tier);
         const patch = await cmsClient.updateContentItemQuality(contentItemId, {
             media_url: newUrl,
@@ -180,29 +247,17 @@ export async function reencodeOneItem(args: {
         result.mediaUrl = newUrl;
         logger.info('Quality re-encode patched CMS', {
             contentItemId,
+            tier,
             oldKey: sourceKey,
             newKey,
             mediaVersion: patch.media_version,
         });
 
-        // 7. Write history. Worker layer schedules cleanup of the prior key.
+        // 7. Mark success. Re-encode history is now folded into the storage
+        // sweep-run row (storage_sweep_runs.re_encoded_count + freed_bytes)
+        // since Storage is the orchestrator that requested this work.
         result.durationMs = Date.now() - start;
         result.success = true;
-
-        await cmsClient.writeQualityHistory({
-            content_item_id: contentItemId,
-            tenant_id: tenantId,
-            from_profile_id: null,
-            to_profile_id: profile.id,
-            original_size_bytes: result.originalSizeBytes,
-            new_size_bytes: result.newSizeBytes,
-            original_bitrate_kbps: result.originalBitrateKbps,
-            new_bitrate_kbps: result.newBitrateKbps,
-            duration_ms: result.durationMs,
-            trigger,
-            rule_id: ruleId ?? null,
-            error: '',
-        });
 
         return result;
     } catch (err) {
@@ -210,25 +265,9 @@ export async function reencodeOneItem(args: {
         result.error = msg;
         result.durationMs = Date.now() - start;
         logger.error('Quality re-encode failed', err, { contentItemId, targetProfileId });
-
-        // Best-effort history row.
-        await cmsClient
-            .writeQualityHistory({
-                content_item_id: contentItemId,
-                tenant_id: tenantId,
-                from_profile_id: null,
-                to_profile_id: targetProfileId,
-                original_size_bytes: result.originalSizeBytes,
-                new_size_bytes: 0,
-                original_bitrate_kbps: result.originalBitrateKbps,
-                new_bitrate_kbps: 0,
-                duration_ms: result.durationMs,
-                trigger,
-                rule_id: ruleId ?? null,
-                error: msg,
-            })
-            .catch(() => undefined);
-
+        // Failure is reported back to the BullMQ worker via the error in the
+        // result object; storage.service consumes it when updating the sweep
+        // run row. We don't write a separate history table any more.
         return result;
     } finally {
         if (tempIn) await cleanupTempFile(tempIn).catch(() => undefined);
@@ -251,28 +290,11 @@ export function versionedKey(contentItemId: string, version: number): string {
     return `content/${contentItemId}/processed.v${version}.mp4`;
 }
 
-// In-memory hint of "next version to mint" per contentItemId — populated lazily
-// from CMS. Worker layer is single-process; for multi-replica we'd persist this
-// on the ContentItem (`media_version` already exists).
-const versionCache = new Map<string, number>();
-
-function nextVersion(contentItemId: string): number {
-    const current = versionCache.get(contentItemId) ?? 1;
-    const next = current + 1;
-    versionCache.set(contentItemId, next);
-    return next;
-}
-
-/**
- * Reset the version hint for a content item — used in tests.
- */
-export function _resetVersionCache(): void {
-    versionCache.clear();
-}
-
 /**
  * Delete a key on the given tier. Used by the cleanup queue after the grace
- * period to drop the pre-re-encode artifact.
+ * period to drop the pre-re-encode artifact. The tier MUST match the tier the
+ * new versioned key was written to — otherwise we risk deleting an unrelated
+ * object on the wrong bucket (or no-op'ing when we should clean up cold).
  */
 export async function deleteOldVersion(key: string, tier: StorageTier): Promise<void> {
     const r = await deleteObjectsByKeys([key], tier);
@@ -323,68 +345,110 @@ export async function probeContentItem(
 }
 
 // =============================================================================
-// Default profile helper for ingest
+// Ingest profile resolution
+//
+// Phase 7: replaces the old "single global default" lookup with a scoped
+// resolver that picks the most-specific profile for (tenant, source_type).
+// Cached per-(tenant, sourceType) tuple for 60s to keep the ingest hot path
+// from hitting CMS on every job.
 // =============================================================================
 
-let defaultProfileCache: { profile: EncodeProfile | null; profileId: number | null; expiresAt: number } | null = null;
-const DEFAULT_PROFILE_TTL_MS = 60_000;
+interface CachedResolution {
+    profile: EncodeProfile;
+    profileId: number | null;
+    rawProfile: import('../cms/types.js').QualityProfile | null;
+    expiresAt: number;
+}
+const ingestResolveCache = new Map<string, CachedResolution>();
+const RESOLVE_TTL_MS = 60_000;
+
+function resolveCacheKey(tenantId: string | undefined, sourceType: string | undefined): string {
+    return `${tenantId ?? ''}|${sourceType ?? ''}`;
+}
 
 /**
- * Resolve the operator-configured default profile (or fall back to
- * DEFAULT_ENCODE_PROFILE). Cached for 60s so the ingest hot path doesn't hit
- * CMS for every job.
+ * Resolve the operator-configured ingest profile for the given (tenant,
+ * sourceType) combination. Falls back to DEFAULT_ENCODE_PROFILE when CMS has
+ * no matching profile or is unreachable.
+ *
+ * Returns the EncodeProfile (for ffmpeg) AND the raw CMS profile (for
+ * pre-flight checks like MIME whitelist / size / duration limits).
  */
-export async function resolveDefaultIngestProfile(
-    tenantId?: string
-): Promise<{ profile: EncodeProfile; profileId: number | null }> {
+export async function resolveIngestProfile(
+    tenantId?: string,
+    sourceType?: string
+): Promise<{
+    profile: EncodeProfile;
+    profileId: number | null;
+    rawProfile: import('../cms/types.js').QualityProfile | null;
+}> {
     const now = Date.now();
-    if (defaultProfileCache && defaultProfileCache.expiresAt > now) {
+    const key = resolveCacheKey(tenantId, sourceType);
+    const cached = ingestResolveCache.get(key);
+    if (cached && cached.expiresAt > now) {
         return {
-            profile: defaultProfileCache.profile ?? DEFAULT_ENCODE_PROFILE,
-            profileId: defaultProfileCache.profileId,
+            profile: cached.profile,
+            profileId: cached.profileId,
+            rawProfile: cached.rawProfile,
         };
     }
     try {
-        const p = await cmsClient.getDefaultQualityProfile(tenantId);
-        defaultProfileCache = {
-            profile: p ? toEncodeProfile(p) : null,
-            profileId: p?.id ?? null,
-            expiresAt: now + DEFAULT_PROFILE_TTL_MS,
+        const resp = await cmsClient.resolveQualityProfile({
+            tenant_id: tenantId,
+            source_type: sourceType,
+        });
+        const profile = resp ? toEncodeProfile(resp.profile) : DEFAULT_ENCODE_PROFILE;
+        const out = {
+            profile,
+            profileId: resp?.profile.id ?? null,
+            rawProfile: resp?.profile ?? null,
         };
-        return {
-            profile: p ? toEncodeProfile(p) : DEFAULT_ENCODE_PROFILE,
-            profileId: p?.id ?? null,
-        };
+        ingestResolveCache.set(key, { ...out, expiresAt: now + RESOLVE_TTL_MS });
+        return out;
     } catch (err) {
-        logger.warn('resolveDefaultIngestProfile: CMS lookup failed; using built-in default', { err });
-        defaultProfileCache = {
-            profile: null,
-            profileId: null,
-            expiresAt: now + DEFAULT_PROFILE_TTL_MS,
-        };
-        return { profile: DEFAULT_ENCODE_PROFILE, profileId: null };
+        logger.warn('resolveIngestProfile: CMS lookup failed; using built-in default', { err, tenantId, sourceType });
+        const out = { profile: DEFAULT_ENCODE_PROFILE, profileId: null, rawProfile: null };
+        ingestResolveCache.set(key, { ...out, expiresAt: now + RESOLVE_TTL_MS });
+        return out;
     }
 }
 
+/** Test-only — flush the cache so resolution starts fresh. */
+export function _resetIngestResolveCacheForTest(): void {
+    ingestResolveCache.clear();
+}
+
 // =============================================================================
-// Sweep helper for the rule-driven worker
+// Pre-flight checks — applied before any download / transcode work runs.
+// Returns null when the input is acceptable, or a string failure_reason when
+// it should be rejected.
 // =============================================================================
 
-/**
- * Run one tick for a given rule: fetch candidates, enqueue re-encode jobs.
- * Pulled out of the worker so the admin "test rule" endpoint can dry-run it.
- */
-export async function fetchSweepCandidates(rule: QualityRule, tenantId: string, limit = 50): Promise<{
-    items: { contentItemId: string }[];
-    targetProfileId: number;
-}> {
-    const resp = await cmsClient.listQualityCandidates({
-        rule_id: rule.id,
-        tenant_id: tenantId,
-        limit,
-    });
-    return {
-        items: resp.data.map(d => ({ contentItemId: d.content_item_id })),
-        targetProfileId: resp.target_profile_id,
-    };
+export interface PreflightInput {
+    mimeType?: string | null;
+    sizeBytes?: number | null;
+    durationSec?: number | null;
+}
+
+export function preflightCheck(
+    input: PreflightInput,
+    rawProfile: import('../cms/types.js').QualityProfile | null
+): string | null {
+    if (!rawProfile) return null;
+
+    const allowed = rawProfile.allowed_input_mime_types;
+    if (allowed && allowed.length > 0 && input.mimeType) {
+        const got = input.mimeType.toLowerCase();
+        const ok = allowed.some(t => t.toLowerCase() === got);
+        if (!ok) {
+            return `disallowed_input_mime: got ${got}, allowed=[${allowed.join(',')}]`;
+        }
+    }
+    if (rawProfile.max_input_size_bytes && input.sizeBytes && input.sizeBytes > rawProfile.max_input_size_bytes) {
+        return `input_too_large: ${input.sizeBytes} > ${rawProfile.max_input_size_bytes}`;
+    }
+    if (rawProfile.max_input_duration_sec && input.durationSec && input.durationSec > rawProfile.max_input_duration_sec) {
+        return `input_too_long: ${input.durationSec}s > ${rawProfile.max_input_duration_sec}s`;
+    }
+    return null;
 }
