@@ -5,10 +5,11 @@
 import { FastifyInstance } from 'fastify';
 import { isRedisConnected } from '../../queues/redis.js';
 import { cmsClient } from '../../cms/client.js';
+import { CircuitState } from '../../cms/circuit-breaker.js';
 import { config } from '../../config/index.js';
 import { logger } from '../../observability/logger.js';
 
-type DependencyStatus = 'connected' | 'disconnected' | 'reachable' | 'unreachable' | 'configured';
+type DependencyStatus = 'connected' | 'disconnected' | 'reachable' | 'unreachable' | 'configured' | 'circuit_open';
 
 interface ReadyResponse {
     status: 'ready' | 'not_ready';
@@ -25,14 +26,22 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
         const redisConnected = await isRedisConnected();
         const redisStatus: DependencyStatus = redisConnected ? 'connected' : 'disconnected';
 
-        // Check CMS via circuit breaker
+        // Check CMS circuit breaker state first: if OPEN, the breaker is
+        // actively rejecting calls — pinging would just trickle through and
+        // hide that we cannot write results back. Reporting not_ready here
+        // lets the orchestrator stop routing new work until CMS recovers.
+        const breakerState = cmsClient.getCircuitBreaker().getState();
         let cmsStatus: DependencyStatus = 'unreachable';
-        try {
-            const cmsPing = await cmsClient.ping();
-            cmsStatus = cmsPing ? 'reachable' : 'unreachable';
-        } catch (error) {
-            logger.debug('CMS ping failed during readiness check', { error });
-            cmsStatus = 'unreachable';
+        if (breakerState === CircuitState.OPEN) {
+            cmsStatus = 'circuit_open';
+        } else {
+            try {
+                const cmsPing = await cmsClient.ping();
+                cmsStatus = cmsPing ? 'reachable' : 'unreachable';
+            } catch (error) {
+                logger.debug('CMS ping failed during readiness check', { error });
+                cmsStatus = 'unreachable';
+            }
         }
 
         // Check Storage - best effort
@@ -62,10 +71,12 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
             storageStatus = 'configured';
         }
 
-        // Determine overall status
-        const isReady = redisStatus === 'connected';
-        // Note: CMS and storage being unreachable shouldn't block readiness
-        // Redis is the critical dependency for queue operations
+        // Determine overall status. Redis is the queue backbone; an OPEN
+        // CMS circuit breaker means write-backs would fail silently, so we
+        // also gate readiness on that. Transient unreachability (still
+        // CLOSED/HALF_OPEN) is tolerated.
+        const isReady =
+            redisStatus === 'connected' && cmsStatus !== 'circuit_open';
 
         return reply.send({
             status: isReady ? 'ready' : 'not_ready',

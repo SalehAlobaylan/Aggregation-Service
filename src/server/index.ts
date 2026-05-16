@@ -8,6 +8,7 @@ import { healthRoutes } from './routes/health.js';
 import { readyRoutes } from './routes/ready.js';
 import { metricsRoutes } from './routes/metrics.js';
 import { adminRoutes } from './routes/admin.js';
+import { internalRoutes } from './routes/internal.js';
 
 let server: FastifyInstance | null = null;
 
@@ -56,13 +57,33 @@ export function createServer(): FastifyInstance {
  */
 export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     await registerCors(fastify);
+    await registerMultipart(fastify);
 
     await fastify.register(healthRoutes);
     await fastify.register(readyRoutes);
     await fastify.register(metricsRoutes);
     await fastify.register(adminRoutes);
+    await fastify.register(internalRoutes);
 
-    logger.info('Routes registered: /health, /ready, /metrics, /admin/*');
+    logger.info('Routes registered: /health, /ready, /metrics, /admin/*, /internal/*');
+}
+
+async function registerMultipart(fastify: FastifyInstance): Promise<void> {
+    try {
+        // Dynamic import keeps the dep optional at startup and lets Node
+        // resolve the ESM package correctly.
+        const moduleName = '@fastify/multipart';
+        const mod = await import(moduleName);
+        await fastify.register(mod.default, {
+            limits: {
+                fileSize: 50 * 1024 * 1024, // 50 MiB per file
+                files: 1,
+            },
+        });
+    } catch (error) {
+        logger.error('Failed to register @fastify/multipart', { error });
+        throw error;
+    }
 }
 
 /**

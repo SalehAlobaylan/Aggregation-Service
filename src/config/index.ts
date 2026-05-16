@@ -23,6 +23,12 @@ const configSchema = z.object({
     cmsServiceToken: z.string().min(1, 'CMS service token is required'),
     redisUrl: z.string().min(1, 'Redis URL is required'),
     jwtSecret: z.string().min(1, 'JWT secret is required for admin auth'),
+    // Shared secret protecting internal service-to-service routes such as
+    // POST /internal/jobs/user-content (called by CMS for user-submitted content).
+    // Must match AGGREGATION_SERVICE_TOKEN on the CMS side. Optional at boot
+    // so dev stacks without it can still start; the route plugin refuses
+    // requests at call-time when this is empty.
+    internalServiceToken: z.string().default(''),
 
     // Required - Storage (S3-compatible) — primary/hot tier
     storageEndpoint: urlSchema.describe('S3-compatible storage endpoint'),
@@ -128,6 +134,7 @@ function mapEnvToConfig(): Record<string, unknown> {
         cmsServiceToken: process.env.CMS_SERVICE_TOKEN,
         redisUrl: process.env.REDIS_URL,
         jwtSecret: process.env.JWT_SECRET,
+        internalServiceToken: process.env.INTERNAL_SERVICE_TOKEN,
 
         storageEndpoint: process.env.STORAGE_ENDPOINT,
         storageBucket: process.env.STORAGE_BUCKET,
@@ -236,6 +243,7 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
         cmsBaseUrl: cfg.cmsBaseUrl,
         cmsServiceToken: '[REDACTED]',
         jwtSecret: '[REDACTED]',
+        internalServiceToken: '[REDACTED]',
         redisUrl: cfg.redisUrl.replace(/\/\/.*@/, '//<redacted>@'),
         storageEndpoint: cfg.storageEndpoint,
         storageBucket: cfg.storageBucket,
