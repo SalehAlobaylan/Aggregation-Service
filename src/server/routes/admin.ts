@@ -429,6 +429,32 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     );
 
     /**
+     * Self-restart
+     * POST /admin/restart
+     *
+     * Replies 202 then sends SIGTERM to the process so the existing
+     * graceful-shutdown handler in src/index.ts runs (closes workers,
+     * queues, Redis). The process must be supervised (Cranl, k8s, systemd,
+     * Docker restart:always) for it to actually come back.
+     */
+    fastify.post(
+        '/admin/restart',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            logger.info('Restart requested via /admin/restart');
+            reply.code(202).send({
+                message:
+                    'Restart accepted. Service is shutting down — supervisor must bring it back.',
+                service: 'aggregation',
+            });
+
+            setTimeout(() => {
+                process.kill(process.pid, 'SIGTERM');
+            }, 250);
+        }
+    );
+
+    /**
      * Get all queue statistics
      * GET /admin/queues
      */
