@@ -14,7 +14,9 @@ import { config } from '../config/index.js';
 // to CMS itself.
 import {
     transcribeViaEnrichment,
+    transcribeAsyncViaEnrichment,
     generateEmbeddingViaEnrichment,
+    embedImageViaEnrichment,
     type TranscriptResult,
 } from '../ai/enrichment-client.js';
 import { buildEmbeddingText } from '../ai/embeddings.js';
@@ -27,7 +29,15 @@ export const aiWorker = createWorker({
     queueName: QUEUE_NAMES.AI,
     concurrency: 3, // AI processing with moderate concurrency
     processor: async (job: Job<AIJob>, jobLogger): Promise<void> => {
-        const { contentItemId, contentType, operations, textContent, mediaPath, mediaUrl } = job.data;
+        const {
+            contentItemId,
+            contentType,
+            operations,
+            textContent,
+            mediaPath,
+            mediaUrl,
+            heroImageUrl,
+        } = job.data;
 
         jobLogger.info('Processing AI job', {
             contentItemId,
@@ -73,11 +83,22 @@ export const aiWorker = createWorker({
 
                     // Transcribe via Enrichment-Service. content_id triggers
                     // server-side write-back to CMS (transcript + link).
-                    const result: TranscriptResult = await transcribeViaEnrichment(
-                        audioPath,
-                        contentItemId,
-                        { wordTimestamps: true, requestId: job.id },
-                    );
+                    // PODCAST audio is typically long-form (>5 min) — use the
+                    // async job queue to avoid HTTP gateway timeouts. Other
+                    // content types (short clips embedded in articles/tweets)
+                    // stay on the sync path.
+                    const useAsync = contentType === 'PODCAST';
+                    const result: TranscriptResult = useAsync
+                        ? await transcribeAsyncViaEnrichment(
+                              audioPath,
+                              contentItemId,
+                              { wordTimestamps: true, requestId: job.id },
+                          )
+                        : await transcribeViaEnrichment(
+                              audioPath,
+                              contentItemId,
+                              { wordTimestamps: true, requestId: job.id },
+                          );
                     transcriptText = result.text;
 
                     if (transcriptText && transcriptText.length > 0) {
@@ -125,16 +146,26 @@ export const aiWorker = createWorker({
                     if (embeddingText.length > 0) {
                         // Generate + persist 384-dim embedding via Enrichment.
                         // content_id triggers server-side write-back to CMS.
-                        const embedding = await generateEmbeddingViaEnrichment(
+                        // extract_tags=true for long-form content where the
+                        // extra LLM call is worth it for News-feed topic
+                        // filtering / search. Skip for short user-generated
+                        // text (TWEET/COMMENT) where tags add no value.
+                        const wantsTags =
+                            contentType === 'ARTICLE'
+                            || contentType === 'VIDEO'
+                            || contentType === 'PODCAST';
+
+                        const embedResult = await generateEmbeddingViaEnrichment(
                             embeddingText,
                             contentItemId,
-                            { requestId: job.id },
+                            { requestId: job.id, extractTags: wantsTags },
                         );
 
                         jobLogger.info('Embedding generated and written by Enrichment', {
                             contentItemId,
-                            embeddingDim: embedding.length,
+                            embeddingDim: embedResult.embedding.length,
                             textLength: embeddingText.length,
+                            tagCount: embedResult.tags?.length ?? 0,
                         });
                     } else {
                         jobLogger.warn('No text available for embedding', { contentItemId });
@@ -148,7 +179,30 @@ export const aiWorker = createWorker({
                 }
             }
 
-            // 3. Set status to READY (all required artifacts should exist now)
+            // 3. Image embedding (CLIP) — only if a hero image URL was supplied.
+            // Secondary enrichment: always best-effort, never blocks READY.
+            if (heroImageUrl) {
+                try {
+                    const imgResult = await embedImageViaEnrichment(
+                        heroImageUrl,
+                        contentItemId,
+                        { requestId: job.id },
+                    );
+                    jobLogger.info('Image embedding generated and written by Enrichment', {
+                        contentItemId,
+                        embeddingDim: imgResult.embedding.length,
+                        heroImageUrl,
+                    });
+                } catch (imageError) {
+                    jobLogger.warn('Image embedding failed (non-blocking)', {
+                        contentItemId,
+                        heroImageUrl,
+                        error: imageError instanceof Error ? imageError.message : 'Unknown error',
+                    });
+                }
+            }
+
+            // 4. Set status to READY (all required artifacts should exist now)
             await cmsClient.updateStatus(contentItemId, { status: 'READY' }, job.id);
 
             jobLogger.info('AI job completed, status set to READY', {

@@ -69,7 +69,7 @@ export interface MediaJob {
 }
 
 /**
- * AI Job - handles transcript and embedding generation
+ * AI Job - handles transcript, embedding, and image-embedding generation
  */
 export interface AIJob {
     contentItemId: string;
@@ -82,6 +82,9 @@ export interface AIJob {
     };
     mediaPath?: string; // For transcript generation
     mediaUrl?: string;  // For transcript generation via remote URL
+    // Hero image / video thumbnail URL — when set, the AI worker also runs
+    // CLIP image embedding via Enrichment (best-effort, non-blocking).
+    heroImageUrl?: string;
 }
 
 /**
