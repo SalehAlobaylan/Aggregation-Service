@@ -20,7 +20,7 @@ async function main(): Promise<void> {
         cmsBaseUrl: config.cmsBaseUrl,
         redisUrl: config.redisUrl.replace(/\/\/.*@/, '//<redacted>@'),
         storageEndpoint: config.storageEndpoint,
-        whisperApiUrl: config.whisperApiUrl,
+        enrichmentBaseUrl: config.enrichmentBaseUrl,
         metricsPort: config.metricsPort,
         platformConsoleOrigins: config.platformConsoleOrigins,
     });

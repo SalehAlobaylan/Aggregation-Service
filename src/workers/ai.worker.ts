@@ -9,13 +9,15 @@ import { QUEUE_NAMES, type AIJob } from '../queues/index.js';
 import { cmsClient } from '../cms/client.js';
 import { config } from '../config/index.js';
 
-// AI services
-import { transcribeWithTimestamps, type TranscriptResult } from '../ai/whisper.js';
+// AI services — all model-backed work happens in Enrichment-Service.
+// Aggregation passes content_id; Enrichment writes transcripts + embeddings
+// to CMS itself.
 import {
-    generateEmbedding,
-    buildEmbeddingText,
-    embeddingService,
-} from '../ai/embeddings.js';
+    transcribeViaEnrichment,
+    generateEmbeddingViaEnrichment,
+    type TranscriptResult,
+} from '../ai/enrichment-client.js';
+import { buildEmbeddingText } from '../ai/embeddings.js';
 
 // Media services
 import { extractAudio } from '../media/transcoder.js';
@@ -36,7 +38,7 @@ export const aiWorker = createWorker({
 
         const tempFiles: string[] = [];
         let transcriptText: string | undefined;
-        let transcriptId: string | undefined;
+        let transcriptWritten = false;
 
         try {
             // 1. Generate transcript if media path provided and transcript operation requested
@@ -69,36 +71,34 @@ export const aiWorker = createWorker({
                         tempFiles.push(audioPath);
                     }
 
-                    // Transcribe using Whisper (with timestamps for segment-level timing)
-                    const result: TranscriptResult = await transcribeWithTimestamps(audioPath);
+                    // Transcribe via Enrichment-Service. content_id triggers
+                    // server-side write-back to CMS (transcript + link).
+                    const result: TranscriptResult = await transcribeViaEnrichment(
+                        audioPath,
+                        contentItemId,
+                        { wordTimestamps: true, requestId: job.id },
+                    );
                     transcriptText = result.text;
 
                     if (transcriptText && transcriptText.length > 0) {
-                        // Store transcript via CMS API
-                        const transcriptResponse = await cmsClient.createTranscript({
-                            content_item_id: contentItemId,
-                            full_text: transcriptText,
-                            word_timestamps: result.segments?.map((segment) => ({
-                                word: segment.text,
-                                start: segment.start,
-                                end: segment.end,
-                            })),
-                            language: result.language || 'en',
-                        }, job.id);
-
-                        transcriptId = transcriptResponse.id;
-
-                        // Link transcript to content item
-                        await cmsClient.linkTranscript(contentItemId, {
-                            transcript_id: transcriptId,
-                        }, job.id);
-
-                        jobLogger.info('Transcript stored and linked', {
-                            contentItemId,
-                            transcriptId,
-                            textLength: transcriptText.length,
-                            language: result.language,
-                        });
+                        if (result.writeBackStatus === 'ok') {
+                            transcriptWritten = true;
+                            jobLogger.info('Transcript written by Enrichment', {
+                                contentItemId,
+                                textLength: transcriptText.length,
+                                language: result.language,
+                            });
+                        } else {
+                            // Enrichment produced the transcript but couldn't
+                            // persist it. Surface as a warning; don't fail the
+                            // job — embedding step may still succeed.
+                            jobLogger.warn('Enrichment transcript write-back did not complete', {
+                                contentItemId,
+                                writeBackStatus: result.writeBackStatus,
+                                writeBackError: result.writeBackError,
+                                textLength: transcriptText.length,
+                            });
+                        }
                     }
                 } catch (transcriptError) {
                     // Transcript is best-effort, don't fail the job
@@ -123,16 +123,15 @@ export const aiWorker = createWorker({
                     );
 
                     if (embeddingText.length > 0) {
-                        // Generate 384-dim embedding
-                        const embedding = await generateEmbedding(embeddingText);
+                        // Generate + persist 384-dim embedding via Enrichment.
+                        // content_id triggers server-side write-back to CMS.
+                        const embedding = await generateEmbeddingViaEnrichment(
+                            embeddingText,
+                            contentItemId,
+                            { requestId: job.id },
+                        );
 
-                        // Store embedding via CMS API
-                        await cmsClient.updateEmbedding(contentItemId, {
-                            embedding,
-                            topic_tags: [], // Could be extracted from content later
-                        }, job.id);
-
-                        jobLogger.info('Embedding stored', {
+                        jobLogger.info('Embedding generated and written by Enrichment', {
                             contentItemId,
                             embeddingDim: embedding.length,
                             textLength: embeddingText.length,
@@ -154,7 +153,7 @@ export const aiWorker = createWorker({
 
             jobLogger.info('AI job completed, status set to READY', {
                 contentItemId,
-                hasTranscript: !!transcriptId,
+                hasTranscript: transcriptWritten,
             });
 
         } catch (error) {

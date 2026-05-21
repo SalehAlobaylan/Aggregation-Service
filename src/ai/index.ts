@@ -1,19 +1,15 @@
 /**
- * AI module exports
+ * AI module exports.
+ *
+ * All model-backed AI work (Whisper transcription, sentence embeddings) is
+ * performed by Enrichment-Service. Aggregation only assembles input text and
+ * makes HTTP calls — there are no local model dependencies anymore.
  */
 export {
-    whisperClient,
-    transcribe,
-    transcribeWithTimestamps,
-    detectLanguage,
+    transcribeViaEnrichment,
+    generateEmbeddingViaEnrichment,
     type TranscriptResult,
     type TranscriptSegment,
-} from './whisper.js';
+} from './enrichment-client.js';
 
-export {
-    embeddingService,
-    buildEmbeddingText,
-    generateEmbedding,
-    generateEmbeddingsBatch,
-    warmupEmbeddingModel,
-} from './embeddings.js';
+export { buildEmbeddingText } from './embeddings.js';

@@ -19,7 +19,9 @@ services:
       - STORAGE_ACCESS_KEY=minioadmin
       - STORAGE_SECRET_KEY=minioadmin
       - STORAGE_PUBLIC_URL=http://localhost:9000
-      - WHISPER_API_URL=http://whisper:9000
+      # AI services live in Enrichment-Service; default points at host.
+      - ENRICHMENT_BASE_URL=http://host.docker.internal:5050
+      - ENRICHMENT_SERVICE_TOKEN=dev-service-token
       - MEDIA_TEMP_DIR=/tmp/wahb-media
       - WORKER_CONCURRENCY=5
       - LOG_LEVEL=info
@@ -30,8 +32,6 @@ services:
       redis:
         condition: service_healthy
       minio:
-        condition: service_started
-      whisper:
         condition: service_started
     ports:
       - "5002:5002"
@@ -82,22 +82,6 @@ services:
       exit 0;
       "
 
-  whisper:
-    image: onerahmet/openai-whisper-asr-webservice:latest
-    container_name: aggregation-whisper
-    environment:
-      - ASR_MODEL=base
-      - ASR_ENGINE=openai_whisper
-    ports:
-      - "9002:9000"
-    volumes:
-      - whisper-cache:/root/.cache
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-
   # ============================================================================
   # Monitoring Stack (optional - use 'docker compose --profile monitoring up')
   # ============================================================================
@@ -140,6 +124,5 @@ volumes:
   redis-data:
   minio-data:
   media-temp:
-  whisper-cache:
   prometheus-data:
   grafana-data:

@@ -72,7 +72,8 @@ async function buildServer(): Promise<FastifyInstance> {
     process.env.STORAGE_ACCESS_KEY = 'key';
     process.env.STORAGE_SECRET_KEY = 'secret';
     process.env.STORAGE_PUBLIC_URL = 'http://localhost:9000';
-    process.env.WHISPER_API_URL = 'http://localhost:9002';
+    process.env.ENRICHMENT_BASE_URL = 'http://localhost:5050';
+    process.env.ENRICHMENT_SERVICE_TOKEN = 'test-enrichment-token';
     process.env.JWT_SECRET = 'test-jwt-secret';
     process.env.ADMIN_JWT_ISSUER = 'cms-service';
     process.env.ADMIN_JWT_AUDIENCE = 'platform-console';

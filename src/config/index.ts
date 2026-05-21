@@ -57,8 +57,10 @@ const configSchema = z.object({
     cloudflareApiToken:     z.string().nullable().default(null),
     cloudflareR2BucketName: z.string().nullable().default(null),
 
-    // AI Services
-    whisperApiUrl: urlSchema.default('http://whisper:9000'),
+    // AI Services — Enrichment-Service handles transcription + embedding.
+    // (Legacy whisperApiUrl removed in favor of enrichment HTTP calls.)
+    enrichmentBaseUrl:      urlSchema.default('http://localhost:5050'),
+    enrichmentServiceToken: z.string().default(''),
 
     // Media Processing
     mediaTempDir: z.string().default('/tmp/wahb-media'),
@@ -155,7 +157,8 @@ function mapEnvToConfig(): Record<string, unknown> {
         cloudflareApiToken:     process.env.CLOUDFLARE_API_TOKEN || null,
         cloudflareR2BucketName: process.env.CLOUDFLARE_R2_BUCKET_NAME || null,
 
-        whisperApiUrl: process.env.WHISPER_API_URL,
+        enrichmentBaseUrl: process.env.ENRICHMENT_BASE_URL,
+        enrichmentServiceToken: process.env.ENRICHMENT_SERVICE_TOKEN,
         mediaTempDir: process.env.MEDIA_TEMP_DIR,
 
         workerConcurrency: process.env.WORKER_CONCURRENCY,
@@ -250,7 +253,8 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
         storageAccessKey: '[REDACTED]',
         storageSecretKey: '[REDACTED]',
         storagePublicUrl: cfg.storagePublicUrl,
-        whisperApiUrl: cfg.whisperApiUrl,
+        enrichmentBaseUrl: cfg.enrichmentBaseUrl,
+        enrichmentServiceToken: cfg.enrichmentServiceToken ? '[REDACTED]' : '',
         workerConcurrency: cfg.workerConcurrency,
         logLevel: cfg.logLevel,
         metricsPort: cfg.metricsPort,
