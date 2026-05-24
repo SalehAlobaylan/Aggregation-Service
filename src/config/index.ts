@@ -57,10 +57,14 @@ const configSchema = z.object({
     cloudflareApiToken:     z.string().nullable().default(null),
     cloudflareR2BucketName: z.string().nullable().default(null),
 
-    // AI Services — Enrichment-Service handles transcription + embedding.
-    // (Legacy whisperApiUrl removed in favor of enrichment HTTP calls.)
+    // AI Services — split across two backends:
+    //   - Media-Service: audio + image processing (transcribe, image embed)
+    //   - Enrichment-Service: text intelligence (text embed, tags, future LLM)
+    // Single shared SERVICE_AUTH_TOKEN works for both via start.sh fallbacks.
     enrichmentBaseUrl:      urlSchema.default('http://localhost:5050'),
     enrichmentServiceToken: z.string().default(''),
+    mediaBaseUrl:           urlSchema.default('http://localhost:5051'),
+    mediaServiceToken:      z.string().default(''),
 
     // Media Processing
     mediaTempDir: z.string().default('/tmp/wahb-media'),
@@ -159,6 +163,8 @@ function mapEnvToConfig(): Record<string, unknown> {
 
         enrichmentBaseUrl: process.env.ENRICHMENT_BASE_URL,
         enrichmentServiceToken: process.env.ENRICHMENT_SERVICE_TOKEN,
+        mediaBaseUrl: process.env.MEDIA_BASE_URL,
+        mediaServiceToken: process.env.MEDIA_SERVICE_TOKEN,
         mediaTempDir: process.env.MEDIA_TEMP_DIR,
 
         workerConcurrency: process.env.WORKER_CONCURRENCY,
@@ -255,6 +261,8 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
         storagePublicUrl: cfg.storagePublicUrl,
         enrichmentBaseUrl: cfg.enrichmentBaseUrl,
         enrichmentServiceToken: cfg.enrichmentServiceToken ? '[REDACTED]' : '',
+        mediaBaseUrl: cfg.mediaBaseUrl,
+        mediaServiceToken: cfg.mediaServiceToken ? '[REDACTED]' : '',
         workerConcurrency: cfg.workerConcurrency,
         logLevel: cfg.logLevel,
         metricsPort: cfg.metricsPort,

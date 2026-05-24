@@ -9,16 +9,17 @@ import { QUEUE_NAMES, type AIJob } from '../queues/index.js';
 import { cmsClient } from '../cms/client.js';
 import { config } from '../config/index.js';
 
-// AI services — all model-backed work happens in Enrichment-Service.
-// Aggregation passes content_id; Enrichment writes transcripts + embeddings
-// to CMS itself.
+// AI services split across two backends:
+//   - Media-Service: audio + image processing (transcribe, image embed)
+//   - Enrichment-Service: text intelligence (text embed, tags, future LLM)
+// Aggregation passes content_id; each service writes its artifact to CMS.
 import {
-    transcribeViaEnrichment,
-    transcribeAsyncViaEnrichment,
-    generateEmbeddingViaEnrichment,
-    embedImageViaEnrichment,
+    transcribeViaMedia,
+    transcribeAsyncViaMedia,
+    embedImageViaMedia,
     type TranscriptResult,
-} from '../ai/enrichment-client.js';
+} from '../ai/media-client.js';
+import { generateEmbeddingViaEnrichment } from '../ai/enrichment-client.js';
 import { buildEmbeddingText } from '../ai/embeddings.js';
 
 // Media services
@@ -81,7 +82,7 @@ export const aiWorker = createWorker({
                         tempFiles.push(audioPath);
                     }
 
-                    // Transcribe via Enrichment-Service. content_id triggers
+                    // Transcribe via Media-Service. content_id triggers
                     // server-side write-back to CMS (transcript + link).
                     // PODCAST audio is typically long-form (>5 min) — use the
                     // async job queue to avoid HTTP gateway timeouts. Other
@@ -89,12 +90,12 @@ export const aiWorker = createWorker({
                     // stay on the sync path.
                     const useAsync = contentType === 'PODCAST';
                     const result: TranscriptResult = useAsync
-                        ? await transcribeAsyncViaEnrichment(
+                        ? await transcribeAsyncViaMedia(
                               audioPath,
                               contentItemId,
                               { wordTimestamps: true, requestId: job.id },
                           )
-                        : await transcribeViaEnrichment(
+                        : await transcribeViaMedia(
                               audioPath,
                               contentItemId,
                               { wordTimestamps: true, requestId: job.id },
@@ -104,16 +105,16 @@ export const aiWorker = createWorker({
                     if (transcriptText && transcriptText.length > 0) {
                         if (result.writeBackStatus === 'ok') {
                             transcriptWritten = true;
-                            jobLogger.info('Transcript written by Enrichment', {
+                            jobLogger.info('Transcript written by Media-Service', {
                                 contentItemId,
                                 textLength: transcriptText.length,
                                 language: result.language,
                             });
                         } else {
-                            // Enrichment produced the transcript but couldn't
+                            // Media produced the transcript but couldn't
                             // persist it. Surface as a warning; don't fail the
                             // job — embedding step may still succeed.
-                            jobLogger.warn('Enrichment transcript write-back did not complete', {
+                            jobLogger.warn('Media transcript write-back did not complete', {
                                 contentItemId,
                                 writeBackStatus: result.writeBackStatus,
                                 writeBackError: result.writeBackError,
@@ -161,7 +162,7 @@ export const aiWorker = createWorker({
                             { requestId: job.id, extractTags: wantsTags },
                         );
 
-                        jobLogger.info('Embedding generated and written by Enrichment', {
+                        jobLogger.info('Embedding generated and written by Enrichment-Service', {
                             contentItemId,
                             embeddingDim: embedResult.embedding.length,
                             textLength: embeddingText.length,
@@ -183,12 +184,12 @@ export const aiWorker = createWorker({
             // Secondary enrichment: always best-effort, never blocks READY.
             if (heroImageUrl) {
                 try {
-                    const imgResult = await embedImageViaEnrichment(
+                    const imgResult = await embedImageViaMedia(
                         heroImageUrl,
                         contentItemId,
                         { requestId: job.id },
                     );
-                    jobLogger.info('Image embedding generated and written by Enrichment', {
+                    jobLogger.info('Image embedding generated and written by Media-Service', {
                         contentItemId,
                         embeddingDim: imgResult.embedding.length,
                         heroImageUrl,
