@@ -145,13 +145,18 @@ export const aiWorker = createWorker({
                     );
 
                     if (embeddingText.length > 0) {
-                        // Generate + persist 384-dim embedding via Enrichment.
-                        // content_id triggers server-side write-back to CMS.
-                        // extract_tags=true for long-form content where the
-                        // extra LLM call is worth it for News-feed topic
-                        // filtering / search. Skip for short user-generated
-                        // text (TWEET/COMMENT) where tags add no value.
-                        const wantsTags =
+                        // Generate + persist BGE-M3 embedding (1024-dim dense
+                        // + optional sparse) via Enrichment. content_id
+                        // triggers server-side write-back to CMS.
+                        //
+                        // For long-form content (ARTICLE/VIDEO/PODCAST) enable:
+                        //   - extractTags:   topic tags via LLM (one extra call)
+                        //   - extractSparse: BGE-M3 sparse lexical weights —
+                        //                    no extra cost (same forward pass)
+                        //                    but required for /v1/related
+                        //                    hybrid retrieval to work on this
+                        //                    item. TWEET/COMMENT skip both.
+                        const wantsHybridEnrichment =
                             contentType === 'ARTICLE'
                             || contentType === 'VIDEO'
                             || contentType === 'PODCAST';
@@ -159,7 +164,11 @@ export const aiWorker = createWorker({
                         const embedResult = await generateEmbeddingViaEnrichment(
                             embeddingText,
                             contentItemId,
-                            { requestId: job.id, extractTags: wantsTags },
+                            {
+                                requestId: job.id,
+                                extractTags: wantsHybridEnrichment,
+                                extractSparse: wantsHybridEnrichment,
+                            },
                         );
 
                         jobLogger.info('Embedding generated and written by Enrichment-Service', {
@@ -167,6 +176,7 @@ export const aiWorker = createWorker({
                             embeddingDim: embedResult.embedding.length,
                             textLength: embeddingText.length,
                             tagCount: embedResult.tags?.length ?? 0,
+                            hybridEnabled: wantsHybridEnrichment,
                         });
                     } else {
                         jobLogger.warn('No text available for embedding', { contentItemId });
