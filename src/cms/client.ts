@@ -32,6 +32,7 @@ import type {
     InternalContentItem,
     WriteOpMetricsRequest,
     OpBudgetStatus,
+    ListMissingEmbeddingResponse,
 } from './types.js';
 
 // Circuit breaker for CMS calls
@@ -268,6 +269,23 @@ export const cmsClient = {
         if (params.page) qs.set('page', String(params.page));
         const query = qs.toString() ? `?${qs.toString()}` : '';
         return makeRequest<InternalContentListResponse>('GET', `/content-items${query}`, undefined, requestId);
+    },
+
+    /**
+     * GET /internal/content-items/missing-embedding?limit=N
+     * READY items still lacking a dense embedding — drives the reconciliation
+     * sweep (H2 backstop).
+     */
+    async listMissingEmbedding(
+        limit: number,
+        requestId?: string
+    ): Promise<ListMissingEmbeddingResponse> {
+        return makeRequest<ListMissingEmbeddingResponse>(
+            'GET',
+            `/content-items/missing-embedding?limit=${limit}`,
+            undefined,
+            requestId
+        );
     },
 
     // ---------------------------------------------------------------

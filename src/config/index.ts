@@ -6,7 +6,10 @@ import 'dotenv/config';
 import { z } from 'zod';
 
 // Custom validators
-const urlSchema = z.string().url('Must be a valid URL');
+// .trim() first: z.string().url() accepts a value with a stray trailing space
+// (the URL parser tolerates it) but stores it un-trimmed, which then yields
+// unparseable fetch URLs like "http://host:5050 /v1/embed". Trim defensively.
+const urlSchema = z.string().trim().url('Must be a valid URL');
 const portSchema = z.coerce.number().int().min(1).max(65535);
 const positiveIntSchema = z.coerce.number().int().positive();
 const csvListSchema = z.string().transform((value) =>
@@ -65,6 +68,17 @@ const configSchema = z.object({
     enrichmentServiceToken: z.string().default(''),
     mediaBaseUrl:           urlSchema.default('http://localhost:5051'),
     mediaServiceToken:      z.string().default(''),
+
+    // Embedding reconciliation sweep (H2 backstop) — periodically re-enqueues
+    // embedding-only AI jobs for READY items still missing a dense embedding.
+    reconcileEnabled:    z.coerce.boolean().default(true),
+    reconcileIntervalMs: positiveIntSchema.default(300_000), // 5 min
+    reconcileBatch:      positiveIntSchema.default(50),
+
+    // Transcription routing — audio longer than this goes through Media's async
+    // job queue (avoids HTTP gateway timeouts on long-form). Probed via ffprobe;
+    // falls back to a content-type heuristic if the probe fails.
+    asyncTranscribeThresholdSec: positiveIntSchema.default(120),
 
     // Media Processing
     mediaTempDir: z.string().default('/tmp/wahb-media'),
@@ -165,6 +179,10 @@ function mapEnvToConfig(): Record<string, unknown> {
         enrichmentServiceToken: process.env.ENRICHMENT_SERVICE_TOKEN,
         mediaBaseUrl: process.env.MEDIA_BASE_URL,
         mediaServiceToken: process.env.MEDIA_SERVICE_TOKEN,
+        reconcileEnabled: process.env.RECONCILE_ENABLED,
+        reconcileIntervalMs: process.env.RECONCILE_INTERVAL_MS,
+        reconcileBatch: process.env.RECONCILE_BATCH,
+        asyncTranscribeThresholdSec: process.env.ASYNC_TRANSCRIBE_THRESHOLD_SEC,
         mediaTempDir: process.env.MEDIA_TEMP_DIR,
 
         workerConcurrency: process.env.WORKER_CONCURRENCY,

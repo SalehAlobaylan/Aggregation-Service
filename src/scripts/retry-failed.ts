@@ -14,9 +14,11 @@ import { Queue } from 'bullmq';
 import { config } from '../config/index.js';
 import { getRedisConnection } from '../queues/redis.js';
 import { logger } from '../observability/logger.js';
-import type { MediaJob } from '../queues/schemas.js';
+import type { AIJob, MediaJob } from '../queues/schemas.js';
+import { enqueueRetryJob } from '../queues/retry-routing.js';
 
 const MEDIA_QUEUE_NAME = 'media-queue';
+const AI_QUEUE_NAME = 'ai-queue';
 
 // ── Parse CLI args ─────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -74,6 +76,7 @@ async function main() {
 
     const redis = getRedisConnection();
     const mediaQueue = new Queue<MediaJob>(MEDIA_QUEUE_NAME, { connection: redis });
+    const aiQueue = new Queue<AIJob>(AI_QUEUE_NAME, { connection: redis });
 
     let requeued = 0;
     const errors: string[] = [];
@@ -82,27 +85,15 @@ async function main() {
         try {
             await resetToPending(item.id);
 
-            const downloadRef = item.metadata?.telegramDownloadRef as MediaJob['downloadRef'] | undefined;
-            const isPhoto = item.source === 'TELEGRAM' && item.metadata?.mediaKind === 'photo';
-            const operations: MediaJob['operations'] = isPhoto
-                ? ['download']
-                : ['download', 'transcode', 'thumbnail'];
-
-            await mediaQueue.add(
-                `retry-media-${item.source}-${item.id}`,
-                {
-                    contentItemId: item.id,
-                    contentType: item.type as MediaJob['contentType'],
-                    sourceType: item.source as MediaJob['sourceType'],
-                    sourceUrl: item.original_url,
-                    operations,
-                    downloadRef,
-                },
-                { priority: 3 }
+            // Routes Telegram text posts to embedding instead of the media queue.
+            const route = await enqueueRetryJob(
+                { media: mediaQueue, ai: aiQueue },
+                item,
+                { namePrefix: 'retry-media', priority: 3 },
             );
 
             requeued++;
-            logger.info(`retry-failed: ✓ requeued`, { id: item.id, source: item.source });
+            logger.info(`retry-failed: ✓ requeued`, { id: item.id, source: item.source, route });
         } catch (err) {
             const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
             errors.push(msg);

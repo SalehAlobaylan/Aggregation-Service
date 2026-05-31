@@ -34,6 +34,13 @@ function tracingHeaders(requestId?: string): Record<string, string> {
 export interface EmbedResult {
     /** Single text embedding vector (384-dim today, 1024-dim after Slice 0 / BGE-M3). */
     embedding: number[];
+    /**
+     * Whether Enrichment persisted the vector to CMS. `not_attempted` when no
+     * content_id was supplied (stateless mode). The AI worker gates READY on
+     * this so content is never published without its embedding.
+     */
+    writeBackStatus: 'not_attempted' | 'ok' | 'failed';
+    writeBackError?: string;
     /** When extractTags was requested and the LLM succeeded. */
     tags?: string[];
     entities?: {
@@ -116,6 +123,8 @@ export async function generateEmbeddingViaEnrichment(
 
     return {
         embedding: result.embeddings[0],
+        writeBackStatus: result.write_back_status ?? 'not_attempted',
+        writeBackError: result.write_back_error ?? undefined,
         tags: result.tags ?? undefined,
         entities: result.entities ?? undefined,
     };

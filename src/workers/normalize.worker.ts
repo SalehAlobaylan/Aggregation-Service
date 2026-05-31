@@ -290,7 +290,8 @@ export const normalizeWorker = createWorker({
                                         },
                                         mediaUrl: normalized.mediaUrl,
                                     },
-                                    { priority: 2 }
+                                    // Deterministic id coalesces duplicate AI jobs on re-ingest.
+                                    { priority: 2, jobId: `ai-${contentItemId}` }
                                 );
 
                                 aiEnqueued++;
@@ -338,7 +339,8 @@ export const normalizeWorker = createWorker({
                                         bodyText: normalized.bodyText || undefined,
                                     },
                                 },
-                                { priority: 2 }
+                                // Deterministic id coalesces duplicate AI jobs on re-ingest.
+                                { priority: 2, jobId: `ai-${contentItemId}` }
                             );
 
                             aiEnqueued++;

@@ -10,6 +10,7 @@ import { normalizeWorker } from './normalize.worker.js';
 import { mediaWorker } from './media.worker.js';
 import { aiWorker } from './ai.worker.js';
 import { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
+import { reconcileWorker, syncReconcileSweeper } from './reconcile.worker.js';
 import { qualityWorker } from './quality.worker.js';
 import { startOpMetricsFlush } from './op-metrics-flush.worker.js';
 import { startCloudflareAnalyticsPuller } from '../services/cloudflare-analytics.service.js';
@@ -21,6 +22,7 @@ const workers: Worker[] = [
     mediaWorker,
     aiWorker,
     storageWorker,
+    reconcileWorker,
     qualityWorker,
 ];
 
@@ -40,6 +42,10 @@ export function startWorkers(): void {
     // Schedule repeatable storage sweepers (best-effort — non-fatal if CMS is down)
     syncRepeatableSweepers().catch(err => {
         logger.error('Failed to sync repeatable storage sweepers', err);
+    });
+    // Schedule the embedding reconciliation sweep (H2 backstop).
+    syncReconcileSweeper().catch(err => {
+        logger.error('Failed to sync embedding reconciliation sweeper', err);
     });
     // Telemetry: drain the S3 op counter to CMS hourly.
     startOpMetricsFlush();
@@ -73,5 +79,6 @@ export { normalizeWorker } from './normalize.worker.js';
 export { mediaWorker } from './media.worker.js';
 export { aiWorker } from './ai.worker.js';
 export { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
+export { reconcileWorker, syncReconcileSweeper } from './reconcile.worker.js';
 export { qualityWorker } from './quality.worker.js';
 export { createWorker } from './base-worker.js';

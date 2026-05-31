@@ -4,6 +4,7 @@
 import { FastifyInstance } from 'fastify';
 import { scheduler } from '../../services/scheduler.service.js';
 import { getQueue, QUEUE_NAMES } from '../../queues/index.js';
+import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
@@ -757,31 +758,18 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
             let requeued = 0;
             const errors: string[] = [];
 
+            const aiQueue = getQueue(QUEUE_NAMES.AI);
+
             for (const item of listResult.data) {
                 try {
                     // Reset status so the item can progress again
                     await cmsClient.updateStatus(item.id, { status: 'PENDING' });
 
-                    const downloadRef = item.metadata?.telegramDownloadRef as
-                        | { channelUsername: string; messageId: number; mediaKind: 'audio' | 'voice' | 'video' | 'photo'; fileName?: string; mimeType?: string }
-                        | undefined;
-
-                    const operations: ('download' | 'transcode' | 'thumbnail')[] =
-                        item.source === 'TELEGRAM' && item.metadata?.mediaKind === 'photo'
-                            ? ['download']
-                            : ['download', 'transcode', 'thumbnail'];
-
-                    await mediaQueue.add(
-                        `retry-media-${item.source}-${item.id}`,
-                        {
-                            contentItemId: item.id,
-                            contentType: item.type,
-                            sourceType: item.source,
-                            sourceUrl: item.original_url,
-                            operations,
-                            downloadRef,
-                        },
-                        { priority: 3 }
+                    // Routes Telegram text posts to embedding instead of the media queue.
+                    await enqueueRetryJob(
+                        { media: mediaQueue, ai: aiQueue },
+                        item,
+                        { namePrefix: 'retry-media', priority: 3 },
                     );
 
                     requeued++;
@@ -847,31 +835,18 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 });
             }
 
+            const aiQueue = getQueue(QUEUE_NAMES.AI);
+
             let requeued = 0;
             const errors: string[] = [];
 
             for (const item of listResult.data) {
                 try {
-                    const downloadRef = item.metadata?.telegramDownloadRef as
-                        | { channelUsername: string; messageId: number; mediaKind: 'audio' | 'voice' | 'video' | 'photo'; fileName?: string; mimeType?: string }
-                        | undefined;
-
-                    const operations: ('download' | 'transcode' | 'thumbnail')[] =
-                        item.source === 'TELEGRAM' && item.metadata?.mediaKind === 'photo'
-                            ? ['download']
-                            : ['download', 'transcode', 'thumbnail'];
-
-                    await mediaQueue.add(
-                        `retry-pending-${item.source}-${item.id}`,
-                        {
-                            contentItemId: item.id,
-                            contentType: item.type,
-                            sourceType: item.source,
-                            sourceUrl: item.original_url,
-                            operations,
-                            downloadRef,
-                        },
-                        { priority: 5 }
+                    // Routes Telegram text posts to embedding instead of the media queue.
+                    await enqueueRetryJob(
+                        { media: mediaQueue, ai: aiQueue },
+                        item,
+                        { namePrefix: 'retry-pending', priority: 5 },
                     );
 
                     requeued++;

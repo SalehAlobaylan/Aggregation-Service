@@ -24,7 +24,7 @@ const TranscriptCreateSchema = z.object({
 });
 
 const EmbeddingUpdateSchema = z.object({
-    embedding: z.array(z.number()).length(384),
+    embedding: z.array(z.number()).length(1024),
     topic_tags: z.array(z.string()).optional(),
 });
 
@@ -106,9 +106,9 @@ describe('CMS API Contract: Transcripts', () => {
 });
 
 describe('CMS API Contract: Embeddings', () => {
-    it('should validate 384-dimension embeddings', () => {
+    it('should validate 1024-dimension embeddings', () => {
         const payload = {
-            embedding: Array(384).fill(0.5),
+            embedding: Array(1024).fill(0.5),
             topic_tags: ['technology', 'ai'],
         };
         expect(EmbeddingUpdateSchema.safeParse(payload).success).toBe(true);
@@ -116,7 +116,7 @@ describe('CMS API Contract: Embeddings', () => {
 
     it('should reject wrong dimension embeddings', () => {
         const payload = {
-            embedding: Array(256).fill(0.5),
+            embedding: Array(384).fill(0.5),
         };
         expect(EmbeddingUpdateSchema.safeParse(payload).success).toBe(false);
     });

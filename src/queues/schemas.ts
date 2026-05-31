@@ -96,6 +96,15 @@ export interface StorageSweepJob {
 }
 
 /**
+ * Reconcile Job - one sweep tick that re-enqueues embedding-only AI jobs for
+ * READY content items still missing a dense embedding (the H2 backstop for
+ * items where the original AI job exhausted retries, plus historical rows).
+ */
+export interface ReconcileJob {
+    trigger: 'auto' | 'manual';
+}
+
+/**
  * Quality Re-encode Job - one item, one target profile.
  * Workflow: download → ffprobe → ffmpeg(profile) → upload to versioned key →
  * patch CMS → schedule grace-period cleanup of the prior key.
@@ -141,6 +150,7 @@ export const QUEUE_NAMES = {
     MEDIA: 'media-queue',
     AI: 'ai-queue',
     STORAGE_SWEEP: 'storage-sweep-queue',
+    RECONCILE: 'reconcile-queue',
     QUALITY_REENCODE: 'quality-reencode-queue',
     DLQ: 'aggregation-dlq',
 } as const;

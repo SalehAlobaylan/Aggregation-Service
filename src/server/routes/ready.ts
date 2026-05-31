@@ -54,16 +54,20 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
                 const timeout = setTimeout(() => controller.abort(), 5000);
 
                 try {
-                    const response = await fetch(config.storageEndpoint, {
+                    await fetch(config.storageEndpoint, {
                         method: 'HEAD',
                         signal: controller.signal,
                     });
                     clearTimeout(timeout);
-                    storageStatus = response.ok || response.status === 403 ? 'reachable' : 'unreachable';
+                    // ANY HTTP response means the endpoint is reachable. An
+                    // unauthenticated bare HEAD to an S3/R2 endpoint legitimately
+                    // returns 400/401/403 (no bucket, no signature) — that is NOT
+                    // an outage, and authenticated PutObject still works. Only a
+                    // network-level failure (fetch throws below) is unreachable.
+                    storageStatus = 'reachable';
                 } catch {
                     clearTimeout(timeout);
-                    // If storage URL is configured but unreachable, still mark as configured in Phase 1
-                    storageStatus = 'configured';
+                    storageStatus = 'unreachable';
                 }
             }
         } catch (error) {

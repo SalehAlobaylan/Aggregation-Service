@@ -392,3 +392,18 @@ export interface ApiResponse<T> {
         message: string;
     };
 }
+
+/** One READY item still missing a dense embedding (reconciliation sweep). */
+export interface MissingEmbeddingItem {
+    id: string;
+    type: string;
+    title: string | null;
+    excerpt: string | null;
+    body_text: string | null;
+    source_name: string | null;
+    published_at: string | null;
+}
+
+export interface ListMissingEmbeddingResponse {
+    items: MissingEmbeddingItem[];
+}
