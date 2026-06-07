@@ -58,6 +58,28 @@ export interface WordTimestamp {
     end: number;
 }
 
+/** Timestamped transcript segment ([{start,end,text}]). */
+export interface TranscriptSegment {
+    start: number;
+    end: number;
+    text: string;
+}
+
+/** Chapter marker. `source`: 'youtube' (native) or 'derived' (future LLM). */
+export interface TranscriptChapter {
+    start: number;
+    end: number;
+    title: string;
+    source: 'youtube' | 'derived';
+}
+
+/** Transcript provenance written to CMS — drives content_item.caption_state. */
+export type TranscriptSource =
+    | 'youtube_human'
+    | 'youtube_auto'
+    | 'stt_deepgram'
+    | 'stt_whisper';
+
 // API Request/Response types
 
 /**
@@ -253,11 +275,29 @@ export interface CreateTranscriptRequest {
     summary?: string;
     word_timestamps?: WordTimestamp[];
     language: string;
+    // Caption-first additions. `segments` powers subtitles/seek + chunked
+    // embeddings; `chapters` are native YouTube chapters; `source`/`provider`
+    // set provenance (CMS maps source → caption_state).
+    segments?: TranscriptSegment[];
+    chapters?: TranscriptChapter[];
+    source?: TranscriptSource;
+    provider?: string;
 }
 
 export interface CreateTranscriptResponse {
     id: string;
     created_at: string;
+}
+
+/**
+ * POST /internal/content-items/:id/request-stt
+ * Guard-enforced STT request (toggle + budget live in CMS). `force` bypasses
+ * the toggle/state-machine for a manual upgrade (budget cap still applies).
+ */
+export interface RequestSttResponse {
+    triggered: boolean;
+    reason?: string;
+    error?: string;
 }
 
 /**

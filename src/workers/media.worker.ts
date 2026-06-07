@@ -33,7 +33,10 @@ import {
     getPublicUrl,
 } from '../storage/client.js';
 import { resolveIngestProfile, preflightCheck } from '../services/quality.service.js';
+import { captionsToFullText } from '../media/captions.js';
 import { lookup as lookupMime } from 'mime-types';
+
+type CaptionState = 'youtube_human' | 'youtube_auto' | 'none';
 
 export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
@@ -244,8 +247,54 @@ export const mediaWorker = createWorker({
                 duration: Math.round(duration),
             });
 
-            // 9. Enqueue AI job for transcript + embedding
-            await enqueueAIJob(job, contentItemId, contentType, isImageArtifact ? undefined : processedPath, mediaUrl);
+            // 9a. Caption-first: if YouTube gave us a usable caption track, persist
+            // it as the transcript now (the free fast-path). Human caption →
+            // trusted/terminal; auto caption → displayed default, upgradeable via
+            // STT later. Native chapters ride along on the same transcript row.
+            let captionState: CaptionState = 'none';
+            let captionText: string | undefined;
+            const captions = downloadResult.captions;
+            const chapters = downloadResult.chapters;
+            if (captions && captions.segments.length > 0) {
+                captionState = captions.isAuto ? 'youtube_auto' : 'youtube_human';
+                captionText = captionsToFullText(captions.segments);
+                try {
+                    await cmsClient.createTranscript({
+                        content_item_id: contentItemId,
+                        full_text: captionText,
+                        language: captions.language,
+                        segments: captions.segments,
+                        chapters: chapters && chapters.length > 0 ? chapters : undefined,
+                        source: captions.isAuto ? 'youtube_auto' : 'youtube_human',
+                        provider: 'youtube',
+                    }, job.id);
+                    jobLogger.info('Caption transcript written', {
+                        contentItemId,
+                        captionState,
+                        segments: captions.segments.length,
+                        chapters: chapters?.length ?? 0,
+                    });
+                } catch (capErr) {
+                    // Non-blocking: STT can still upgrade later; chapters/caption lost this run.
+                    jobLogger.warn('Caption transcript write failed (non-blocking)', {
+                        contentItemId,
+                        error: capErr instanceof Error ? capErr.message : 'Unknown error',
+                    });
+                    captionState = 'none';
+                    captionText = undefined;
+                }
+            }
+
+            // 9b. Enqueue AI job for transcript (STT, if needed) + embedding
+            await enqueueAIJob(
+                job,
+                contentItemId,
+                contentType,
+                isImageArtifact ? undefined : processedPath,
+                mediaUrl,
+                captionState,
+                captionText,
+            );
 
             jobLogger.info('Media job completed successfully', { contentItemId });
 
@@ -284,7 +333,9 @@ async function enqueueAIJob(
     contentItemId: string,
     contentType: string,
     mediaPath?: string,
-    mediaUrl?: string
+    mediaUrl?: string,
+    captionState: CaptionState = 'none',
+    captionText?: string
 ): Promise<void> {
     const aiQueue = getQueue(QUEUE_NAMES.AI);
     if (!aiQueue) {
@@ -307,6 +358,8 @@ async function enqueueAIJob(
             },
             mediaPath,
             mediaUrl,
+            captionState,
+            captionText,
         },
         {
             priority: 2,

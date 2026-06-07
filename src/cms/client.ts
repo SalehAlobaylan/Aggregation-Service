@@ -13,6 +13,7 @@ import type {
     UpdateArtifactsRequest,
     CreateTranscriptRequest,
     CreateTranscriptResponse,
+    RequestSttResponse,
     LinkTranscriptRequest,
     UpdateEmbeddingRequest,
     ApiResponse,
@@ -216,6 +217,27 @@ export const cmsClient = {
             'POST',
             '/transcripts',
             data,
+            requestId
+        );
+    },
+
+    /**
+     * Request STT for a content item (auto/manual upgrade path).
+     * POST /internal/content-items/:id/request-stt
+     *
+     * The guard (auto-STT toggle + caption-state machine + budget cap) lives in
+     * CMS, so Aggregation just asks and CMS decides whether to invoke Media.
+     * `force=true` is the manual upgrade (budget cap still applies).
+     */
+    async requestStt(
+        contentItemId: string,
+        force = false,
+        requestId?: string
+    ): Promise<RequestSttResponse> {
+        return makeProtectedRequest<RequestSttResponse>(
+            'POST',
+            `/content-items/${contentItemId}/request-stt`,
+            { force },
             requestId
         );
     },

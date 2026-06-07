@@ -85,6 +85,13 @@ export interface AIJob {
     // Hero image / video thumbnail URL — when set, the AI worker also runs
     // CLIP image embedding via Enrichment (best-effort, non-blocking).
     heroImageUrl?: string;
+    // Caption-first: when the media worker extracted a YouTube caption it writes
+    // it to CMS and passes the state here. 'youtube_human' → skip STT entirely;
+    // 'youtube_auto'/'none' → ask CMS to (maybe) upgrade via STT (guard-gated).
+    // captionText feeds embedding so caption items embed with their text even
+    // though STT (if any) runs asynchronously.
+    captionState?: 'youtube_human' | 'youtube_auto' | 'none';
+    captionText?: string;
 }
 
 /**

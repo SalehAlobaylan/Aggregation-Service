@@ -11,6 +11,8 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
+import { extractCaptionsAndChapters, type ExtractedCaptions } from './captions.js';
+import type { TranscriptChapter } from '../cms/types.js';
 
 export interface DownloadResult {
     filePath: string;
@@ -18,7 +20,21 @@ export interface DownloadResult {
     duration?: number;
     title?: string;
     thumbnailUrl?: string;
+    // Caption-first (YouTube only): the best caption track + native chapters,
+    // parsed from the same yt-dlp call's info-json + subtitle files.
+    captions?: ExtractedCaptions;
+    chapters?: TranscriptChapter[];
 }
+
+// Subtitle flags appended to YouTube yt-dlp calls. Fetches human + auto captions
+// for Arabic/English in the SAME download (no extra request). Parsing/selection
+// happens in captions.ts; auto-translated tracks are rejected there.
+const SUBTITLE_ARGS = [
+    '--write-subs',
+    '--write-auto-subs',
+    '--sub-langs', 'ar.*,en.*',
+    '--sub-format', 'vtt',
+];
 
 interface TelegramDownloadRef {
     channelUsername: string;
@@ -67,6 +83,7 @@ export async function downloadYouTube(
             '-o', outputTemplate,
             '--no-playlist',
             '--write-info-json',
+            ...SUBTITLE_ARGS,
             '--print-json',
             url,
         ];
@@ -102,10 +119,20 @@ export async function downloadYouTube(
 
                 await stat(actualPath); // Verify file exists
 
+                // Caption-first: read chapters + the best caption track from the
+                // info-json + .vtt files yt-dlp just wrote (no extra request).
+                // Best-effort — never blocks the download.
+                const { captions, chapters } = await extractCaptionsAndChapters(
+                    getTempPath(contentItemId, 'info.json'),
+                );
+
                 logger.info('YouTube download complete', {
                     contentItemId,
                     title: metadata.title,
                     duration: metadata.duration,
+                    hasCaptions: !!captions,
+                    captionIsAuto: captions?.isAuto,
+                    chapterCount: chapters.length,
                 });
 
                 resolve({
@@ -114,6 +141,8 @@ export async function downloadYouTube(
                     duration: metadata.duration,
                     title: metadata.title,
                     thumbnailUrl: metadata.thumbnail,
+                    captions,
+                    chapters,
                 });
             } catch (parseError) {
                 // Fallback if JSON parsing fails

@@ -38,6 +38,8 @@ export const aiWorker = createWorker({
             mediaPath,
             mediaUrl,
             heroImageUrl,
+            captionState = 'none',
+            captionText,
         } = job.data;
 
         jobLogger.info('Processing AI job', {
@@ -48,7 +50,9 @@ export const aiWorker = createWorker({
         });
 
         const tempFiles: string[] = [];
-        let transcriptText: string | undefined;
+        // Seed from the YouTube caption (if any) so embedding includes the
+        // caption text even when STT runs asynchronously / not at all.
+        let transcriptText: string | undefined = captionText;
         let transcriptWritten = false;
         // Embedding gate: an item must not reach READY without a persisted
         // embedding (it would be invisible to retrieval + degrade its news
@@ -76,7 +80,36 @@ export const aiWorker = createWorker({
                 }
             }
 
-            if (operations.includes('transcript') && resolvedMediaPath) {
+            // Caption-first transcript logic:
+            //  - youtube_human → caption already written by media worker; skip STT.
+            //  - youtube_auto / none → ask the CMS guard (toggle + budget + state
+            //    machine) whether to upgrade via STT; if allowed, run it via Media
+            //    (existing sync/async routing). Media writes back source=stt_*.
+            const wantsTranscript = operations.includes('transcript');
+            let sttAllowed = false;
+            if (wantsTranscript && captionState === 'youtube_human') {
+                transcriptWritten = true; // the human caption IS the transcript
+                jobLogger.info('Human YouTube caption present — skipping STT', { contentItemId });
+            } else if (wantsTranscript && resolvedMediaPath) {
+                try {
+                    const decision = await cmsClient.requestStt(contentItemId, false, job.id);
+                    sttAllowed = decision.triggered;
+                    if (!sttAllowed) {
+                        jobLogger.info('STT skipped by guard', {
+                            contentItemId,
+                            captionState,
+                            reason: decision.reason,
+                        });
+                    }
+                } catch (guardError) {
+                    jobLogger.warn('STT guard check failed (skipping STT)', {
+                        contentItemId,
+                        error: guardError instanceof Error ? guardError.message : 'Unknown error',
+                    });
+                }
+            }
+
+            if (sttAllowed && resolvedMediaPath) {
                 try {
                     jobLogger.info('Generating transcript', { mediaPath: resolvedMediaPath });
 
