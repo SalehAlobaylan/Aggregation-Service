@@ -103,7 +103,7 @@ export async function extractCaptionsAndChapters(
 
 function extractChapters(info: YtInfoJson): TranscriptChapter[] {
     if (!Array.isArray(info.chapters)) return [];
-    return info.chapters
+    const cleaned = info.chapters
         .filter((c) => typeof c.title === 'string' && c.title.trim().length > 0)
         // --sponsorblock-mark injects sponsor entries into `chapters` titled
         // "[SponsorBlock]: …" — drop them so they don't pollute real chapters.
@@ -114,6 +114,20 @@ function extractChapters(info: YtInfoJson): TranscriptChapter[] {
             title: String(c.title).trim(),
             source: 'youtube' as const,
         }));
+
+    // Merge adjacent fragments with the same title: --sponsorblock-mark can split
+    // a native chapter around an in-chapter sponsor, leaving two same-titled
+    // pieces once the sponsor entry is filtered out above.
+    const merged: TranscriptChapter[] = [];
+    for (const ch of cleaned) {
+        const prev = merged[merged.length - 1];
+        if (prev && prev.title === ch.title) {
+            prev.end = ch.end;
+            continue;
+        }
+        merged.push({ ...ch });
+    }
+    return merged;
 }
 
 function extractHeatmap(info: YtInfoJson): HeatmapPoint[] | undefined {

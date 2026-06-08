@@ -154,6 +154,9 @@ export interface UpdateArtifactsRequest {
     original_bitrate_kbps?: number;
     current_bitrate_kbps?: number;
     current_quality_profile_id?: number;
+    // Download-time signals merged into content_item.metadata jsonb (heatmap,
+    // sponsor_segments, categories). Merged server-side — existing keys preserved.
+    metadata?: Record<string, unknown>;
 }
 
 // =============================================================================

@@ -11,7 +11,12 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
-import { extractCaptionsAndChapters, type ExtractedCaptions } from './captions.js';
+import {
+    extractCaptionsAndChapters,
+    type ExtractedCaptions,
+    type HeatmapPoint,
+    type SponsorSegment,
+} from './captions.js';
 import type { TranscriptChapter } from '../cms/types.js';
 
 export interface DownloadResult {
@@ -24,16 +29,23 @@ export interface DownloadResult {
     // parsed from the same yt-dlp call's info-json + subtitle files.
     captions?: ExtractedCaptions;
     chapters?: TranscriptChapter[];
+    // Extra YouTube signals from the same info-json (engagement + segments).
+    heatmap?: HeatmapPoint[];
+    sponsorSegments?: SponsorSegment[];
+    categories?: string[];
 }
 
-// Subtitle flags appended to YouTube yt-dlp calls. Fetches human + auto captions
-// for Arabic/English in the SAME download (no extra request). Parsing/selection
-// happens in captions.ts; auto-translated tracks are rejected there.
+// Flags appended to YouTube yt-dlp calls. Fetches human + auto captions for
+// Arabic/English AND marks SponsorBlock segments in the SAME download (no extra
+// request beyond the SponsorBlock API lookup). Parsing happens in captions.ts;
+// auto-translated caption tracks + [SponsorBlock] chapter entries are handled there.
 const SUBTITLE_ARGS = [
     '--write-subs',
     '--write-auto-subs',
     '--sub-langs', 'ar.*,en.*',
     '--sub-format', 'vtt',
+    // Mark (don't cut) sponsor/intro/outro/… segments into the info-json.
+    '--sponsorblock-mark', 'all',
 ];
 
 interface TelegramDownloadRef {
@@ -119,12 +131,11 @@ export async function downloadYouTube(
 
                 await stat(actualPath); // Verify file exists
 
-                // Caption-first: read chapters + the best caption track from the
-                // info-json + .vtt files yt-dlp just wrote (no extra request).
-                // Best-effort — never blocks the download.
-                const { captions, chapters } = await extractCaptionsAndChapters(
-                    getTempPath(contentItemId, 'info.json'),
-                );
+                // Caption-first: read chapters, the best caption track, plus
+                // heatmap / SponsorBlock / categories from the info-json + .vtt
+                // files yt-dlp just wrote (no extra request). Best-effort.
+                const { captions, chapters, heatmap, sponsorSegments, categories } =
+                    await extractCaptionsAndChapters(getTempPath(contentItemId, 'info.json'));
 
                 logger.info('YouTube download complete', {
                     contentItemId,
@@ -133,6 +144,8 @@ export async function downloadYouTube(
                     hasCaptions: !!captions,
                     captionIsAuto: captions?.isAuto,
                     chapterCount: chapters.length,
+                    heatmapPoints: heatmap?.length ?? 0,
+                    sponsorSegments: sponsorSegments?.length ?? 0,
                 });
 
                 resolve({
@@ -143,6 +156,9 @@ export async function downloadYouTube(
                     thumbnailUrl: metadata.thumbnail,
                     captions,
                     chapters,
+                    heatmap,
+                    sponsorSegments,
+                    categories,
                 });
             } catch (parseError) {
                 // Fallback if JSON parsing fails

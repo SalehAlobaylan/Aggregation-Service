@@ -229,6 +229,14 @@ export const mediaWorker = createWorker({
             // originalSourceBytes was computed above during pre-flight.
             const originalBitrateKbps = mediaInfo.bitrateKbps ?? undefined;
 
+            // Merge download-time YouTube signals (heatmap / sponsor segments /
+            // categories) into the item's metadata. Omitted when absent so we
+            // never send empty keys (non-YouTube items have none).
+            const downloadMeta: Record<string, unknown> = {};
+            if (downloadResult.heatmap?.length) downloadMeta['heatmap'] = downloadResult.heatmap;
+            if (downloadResult.sponsorSegments?.length) downloadMeta['sponsor_segments'] = downloadResult.sponsorSegments;
+            if (downloadResult.categories?.length) downloadMeta['categories'] = downloadResult.categories;
+
             await cmsClient.updateArtifacts(contentItemId, {
                 media_url: mediaUrl,
                 thumbnail_url: thumbnailUrl,
@@ -238,6 +246,7 @@ export const mediaWorker = createWorker({
                 original_bitrate_kbps: originalBitrateKbps,
                 current_bitrate_kbps: originalBitrateKbps,
                 current_quality_profile_id: ingestProfileId ?? undefined,
+                metadata: Object.keys(downloadMeta).length > 0 ? downloadMeta : undefined,
             }, job.id);
 
             jobLogger.info('CMS artifacts updated', {

@@ -7,11 +7,26 @@
  */
 
 const MAX_TEXT_LENGTH = 8192; // Characters
+const MAX_PART_LENGTH = 3000; // Per-source cap (transcript, description)
+
+/**
+ * Strip the worst embedding noise from free-text bodies (esp. YouTube
+ * descriptions): URLs and collapsed whitespace. Conservative on purpose — safe
+ * for article bodies too, without guessing at boilerplate.
+ */
+function cleanForEmbedding(text: string): string {
+    return text
+        .replace(/https?:\/\/\S+/g, ' ') // drop URLs (links/affiliate/social)
+        .replace(/\s+/g, ' ') // collapse whitespace/newlines
+        .trim();
+}
 
 /**
  * Build text for embedding from content fields.
  *
- * Order: title → transcript|body → excerpt. Caps total length to
+ * Order: title → transcript → body(description) → excerpt. Both transcript AND
+ * the description contribute (a video's description carries topic/context the
+ * transcript may not), each capped at MAX_PART_LENGTH; total capped at
  * MAX_TEXT_LENGTH so we don't blow past the model's input window.
  */
 export function buildEmbeddingText(
@@ -22,11 +37,13 @@ export function buildEmbeddingText(
 ): string {
     const parts: string[] = [title];
 
-    // Prefer transcript for video/podcast, otherwise use body text.
+    // Include the transcript (video/podcast) AND the description — not either/or.
     if (transcript) {
-        parts.push(transcript.substring(0, 2000));
-    } else if (bodyText) {
-        parts.push(bodyText.substring(0, 2000));
+        parts.push(transcript.substring(0, MAX_PART_LENGTH));
+    }
+    if (bodyText) {
+        // Clean before capping so the cap counts useful chars, not URLs.
+        parts.push(cleanForEmbedding(bodyText).substring(0, MAX_PART_LENGTH));
     }
 
     if (excerpt && excerpt !== bodyText?.substring(0, excerpt.length)) {
