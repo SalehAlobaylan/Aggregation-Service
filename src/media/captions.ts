@@ -27,9 +27,26 @@ export interface ExtractedCaptions {
     isAuto: boolean;
 }
 
+/** "Most replayed" engagement point (yt-dlp info-json `heatmap`). value 0..1. */
+export interface HeatmapPoint {
+    start: number; // seconds
+    end: number;
+    value: number;
+}
+
+/** SponsorBlock segment (sponsor/intro/outro/…) from `sponsorblock_chapters`. */
+export interface SponsorSegment {
+    start: number; // seconds
+    end: number;
+    category: string;
+}
+
 export interface CaptionExtractionResult {
     captions?: ExtractedCaptions;
     chapters: TranscriptChapter[];
+    heatmap?: HeatmapPoint[];
+    sponsorSegments?: SponsorSegment[];
+    categories?: string[];
 }
 
 interface YtSubtitleEntry {
@@ -44,6 +61,9 @@ interface YtInfoJson {
     subtitles?: Record<string, YtSubtitleEntry[]>;
     automatic_captions?: Record<string, YtSubtitleEntry[]>;
     requested_subtitles?: Record<string, YtSubtitleEntry>;
+    heatmap?: { start_time?: number; end_time?: number; value?: number }[];
+    sponsorblock_chapters?: { start_time?: number; end_time?: number; category?: string }[];
+    categories?: string[];
 }
 
 /**
@@ -63,7 +83,13 @@ export async function extractCaptionsAndChapters(
         const chapters = extractChapters(info);
         const captionsResult = await selectAndParseCaption(info, infoJsonPath, aux);
 
-        return { captions: captionsResult, chapters };
+        return {
+            captions: captionsResult,
+            chapters,
+            heatmap: extractHeatmap(info),
+            sponsorSegments: extractSponsorSegments(info),
+            categories: Array.isArray(info.categories) ? info.categories : undefined,
+        };
     } catch (err) {
         logger.debug('Caption/chapter extraction skipped', {
             infoJsonPath,
@@ -79,11 +105,36 @@ function extractChapters(info: YtInfoJson): TranscriptChapter[] {
     if (!Array.isArray(info.chapters)) return [];
     return info.chapters
         .filter((c) => typeof c.title === 'string' && c.title.trim().length > 0)
+        // --sponsorblock-mark injects sponsor entries into `chapters` titled
+        // "[SponsorBlock]: …" — drop them so they don't pollute real chapters.
+        .filter((c) => !String(c.title).trim().startsWith('[SponsorBlock]'))
         .map((c) => ({
             start: Number(c.start_time ?? 0),
             end: Number(c.end_time ?? 0),
             title: String(c.title).trim(),
             source: 'youtube' as const,
+        }));
+}
+
+function extractHeatmap(info: YtInfoJson): HeatmapPoint[] | undefined {
+    if (!Array.isArray(info.heatmap) || info.heatmap.length === 0) return undefined;
+    return info.heatmap.map((h) => ({
+        start: Number(h.start_time ?? 0),
+        end: Number(h.end_time ?? 0),
+        value: Number(h.value ?? 0),
+    }));
+}
+
+function extractSponsorSegments(info: YtInfoJson): SponsorSegment[] | undefined {
+    if (!Array.isArray(info.sponsorblock_chapters) || info.sponsorblock_chapters.length === 0) {
+        return undefined;
+    }
+    return info.sponsorblock_chapters
+        .filter((s) => typeof s.category === 'string' && s.category)
+        .map((s) => ({
+            start: Number(s.start_time ?? 0),
+            end: Number(s.end_time ?? 0),
+            category: String(s.category),
         }));
 }
 
