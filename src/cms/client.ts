@@ -278,15 +278,16 @@ export const cmsClient = {
 
     /**
      * List content items with optional filters
-     * GET /internal/content-items?status=FAILED&source=TELEGRAM&limit=100&page=1
+     * GET /internal/content-items?status=FAILED&source=TELEGRAM&ids=a,b&limit=100&page=1
      */
     async listContentItems(
-        params: { status?: string; source?: string; limit?: number; page?: number },
+        params: { status?: string; source?: string; ids?: string[]; limit?: number; page?: number },
         requestId?: string
     ): Promise<InternalContentListResponse> {
         const qs = new URLSearchParams();
         if (params.status) qs.set('status', params.status);
         if (params.source) qs.set('source', params.source);
+        if (params.ids?.length) qs.set('ids', params.ids.join(','));
         if (params.limit) qs.set('limit', String(params.limit));
         if (params.page) qs.set('page', String(params.page));
         const query = qs.toString() ? `?${qs.toString()}` : '';

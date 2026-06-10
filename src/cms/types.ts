@@ -285,6 +285,9 @@ export interface CreateTranscriptRequest {
     chapters?: TranscriptChapter[];
     source?: TranscriptSource;
     provider?: string;
+    transcription_job_id?: string;
+    language_probability?: number;
+    duration_sec?: number;
 }
 
 export interface CreateTranscriptResponse {
@@ -299,6 +302,8 @@ export interface CreateTranscriptResponse {
  */
 export interface RequestSttResponse {
     triggered: boolean;
+    job_id?: string;
+    status?: string;
     reason?: string;
     error?: string;
 }

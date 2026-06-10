@@ -87,6 +87,7 @@ export const aiWorker = createWorker({
             //    (existing sync/async routing). Media writes back source=stt_*.
             const wantsTranscript = operations.includes('transcript');
             let sttAllowed = false;
+            let transcriptionJobId: string | undefined;
             if (wantsTranscript && captionState === 'youtube_human') {
                 transcriptWritten = true; // the human caption IS the transcript
                 jobLogger.info('Human YouTube caption present — skipping STT', { contentItemId });
@@ -94,6 +95,7 @@ export const aiWorker = createWorker({
                 try {
                     const decision = await cmsClient.requestStt(contentItemId, false, job.id);
                     sttAllowed = decision.triggered;
+                    transcriptionJobId = decision.job_id;
                     if (!sttAllowed) {
                         jobLogger.info('STT skipped by guard', {
                             contentItemId,
@@ -144,12 +146,12 @@ export const aiWorker = createWorker({
                         ? await transcribeAsyncViaMedia(
                               audioPath,
                               contentItemId,
-                              { wordTimestamps: true, requestId: job.id },
+                              { wordTimestamps: true, requestId: job.id, transcriptionJobId },
                           )
                         : await transcribeViaMedia(
                               audioPath,
                               contentItemId,
-                              { wordTimestamps: true, requestId: job.id },
+                              { wordTimestamps: true, requestId: job.id, transcriptionJobId },
                           );
                     transcriptText = result.text;
 

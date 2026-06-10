@@ -65,6 +65,7 @@ interface JobResponse {
 
 interface RetryFailedBody {
     source?: string;
+    ids?: string[];
     limit?: number;
 }
 
@@ -712,7 +713,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     /**
      * Requeue FAILED content items back into the media pipeline
      * POST /admin/retry-failed
-     * Body: { source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
+     * Body: { ids?: string[], source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
      *
      * - Fetches FAILED items from CMS (filtered by source if provided)
      * - Resets each item's status to PENDING
@@ -723,7 +724,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         '/admin/retry-failed',
         { preHandler: verifyAdminAuth },
         async (request, reply) => {
-            const { source, limit = 100 } = request.body ?? {};
+            const { source, ids, limit = 100 } = request.body ?? {};
             const safeLimit = Math.max(1, Math.min(limit, 500));
 
             const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
@@ -741,7 +742,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
             try {
                 listResult = await cmsClient.listContentItems({
                     status: 'FAILED',
-                    source: source?.toUpperCase(),
+                    source: ids?.length ? undefined : source?.toUpperCase(),
+                    ids,
                     limit: safeLimit,
                 });
             } catch (err) {
@@ -794,7 +796,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     /**
      * Enqueue media jobs for PENDING content items that were never processed.
      * POST /admin/retry-pending
-     * Body: { source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
+     * Body: { ids?: string[], source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
      *
      * Unlike retry-failed (which resets FAILED→PENDING), this targets items
      * already in PENDING status whose media jobs were never enqueued or got lost.
@@ -803,7 +805,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         '/admin/retry-pending',
         { preHandler: verifyAdminAuth },
         async (request, reply) => {
-            const { source, limit = 200 } = request.body ?? {};
+            const { source, ids, limit = 200 } = request.body ?? {};
             const safeLimit = Math.max(1, Math.min(limit, 500));
 
             const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
@@ -821,7 +823,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
             try {
                 listResult = await cmsClient.listContentItems({
                     status: 'PENDING',
-                    source: source?.toUpperCase(),
+                    source: ids?.length ? undefined : source?.toUpperCase(),
+                    ids,
                     limit: safeLimit,
                 });
             } catch (err) {

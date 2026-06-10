@@ -36,15 +36,19 @@ export interface DownloadResult {
 }
 
 // Flags appended to YouTube yt-dlp calls. Fetches human + auto captions for
-// Arabic/English AND marks SponsorBlock segments in the SAME download (no extra
-// request beyond the SponsorBlock API lookup). Parsing happens in captions.ts;
-// auto-translated caption tracks + [SponsorBlock] chapter entries are handled there.
+// Arabic/English. Parsing happens in captions.ts; auto-translated caption tracks
+// are rejected there.
 const SUBTITLE_ARGS = [
     '--write-subs',
     '--write-auto-subs',
     '--sub-langs', 'ar.*,en.*',
     '--sub-format', 'vtt',
-    // Mark (don't cut) sponsor/intro/outro/… segments into the info-json.
+];
+
+// Mark (don't cut) sponsor/intro/outro/… segments into the info-json. Kept
+// separate so we can retry media download without subtitle files if YouTube
+// rate-limits captions.
+const SPONSORBLOCK_ARGS = [
     '--sponsorblock-mark', 'all',
 ];
 
@@ -87,19 +91,20 @@ export async function downloadYouTube(
 
     logger.info('Starting YouTube download', { url, contentItemId });
 
-    return new Promise((resolve, reject) => {
-        // yt-dlp arguments for best quality video+audio merged to mp4
-        const args = [
-            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            '--merge-output-format', 'mp4',
-            '-o', outputTemplate,
-            '--no-playlist',
-            '--write-info-json',
-            ...SUBTITLE_ARGS,
-            '--print-json',
-            url,
-        ];
+    const buildArgs = (withSubtitles: boolean) => [
+        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '--merge-output-format', 'mp4',
+        '-o', outputTemplate,
+        '--no-playlist',
+        '--write-info-json',
+        ...(withSubtitles ? SUBTITLE_ARGS : []),
+        ...SPONSORBLOCK_ARGS,
+        '--print-json',
+        url,
+    ];
 
+    const runYtDlp = (args: string[]) => new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        // yt-dlp arguments for best quality video+audio merged to mp4
         const proc = spawn('yt-dlp', args, {
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -121,53 +126,7 @@ export async function downloadYouTube(
                 reject(new Error(`yt-dlp exited with code ${code}: ${stderr}`));
                 return;
             }
-
-            try {
-                // Parse JSON output from yt-dlp
-                const metadata = JSON.parse(stdout.trim().split('\n').pop() || '{}');
-
-                // Find the actual downloaded file
-                const actualPath = getTempPath(contentItemId, metadata.ext || 'mp4');
-
-                await stat(actualPath); // Verify file exists
-
-                // Caption-first: read chapters, the best caption track, plus
-                // heatmap / SponsorBlock / categories from the info-json + .vtt
-                // files yt-dlp just wrote (no extra request). Best-effort.
-                const { captions, chapters, heatmap, sponsorSegments, categories } =
-                    await extractCaptionsAndChapters(getTempPath(contentItemId, 'info.json'));
-
-                logger.info('YouTube download complete', {
-                    contentItemId,
-                    title: metadata.title,
-                    duration: metadata.duration,
-                    hasCaptions: !!captions,
-                    captionIsAuto: captions?.isAuto,
-                    chapterCount: chapters.length,
-                    heatmapPoints: heatmap?.length ?? 0,
-                    sponsorSegments: sponsorSegments?.length ?? 0,
-                });
-
-                resolve({
-                    filePath: actualPath,
-                    format: metadata.ext || 'mp4',
-                    duration: metadata.duration,
-                    title: metadata.title,
-                    thumbnailUrl: metadata.thumbnail,
-                    captions,
-                    chapters,
-                    heatmap,
-                    sponsorSegments,
-                    categories,
-                });
-            } catch (parseError) {
-                // Fallback if JSON parsing fails
-                logger.warn('Failed to parse yt-dlp output, using defaults', { parseError });
-                resolve({
-                    filePath: outputPath,
-                    format: 'mp4',
-                });
-            }
+            resolve({ stdout, stderr });
         });
 
         proc.on('error', (error) => {
@@ -175,6 +134,72 @@ export async function downloadYouTube(
             reject(error);
         });
     });
+
+    const parseResult = async (stdout: string): Promise<DownloadResult> => {
+        try {
+            // Parse JSON output from yt-dlp
+            const metadata = JSON.parse(stdout.trim().split('\n').pop() || '{}');
+
+            // Find the actual downloaded file
+            const actualPath = getTempPath(contentItemId, metadata.ext || 'mp4');
+
+            await stat(actualPath); // Verify file exists
+
+            // Caption-first: read chapters, the best caption track, plus
+            // heatmap / SponsorBlock / categories from the info-json + .vtt
+            // files yt-dlp just wrote (no extra request). Best-effort.
+            const { captions, chapters, heatmap, sponsorSegments, categories } =
+                await extractCaptionsAndChapters(getTempPath(contentItemId, 'info.json'));
+
+            logger.info('YouTube download complete', {
+                contentItemId,
+                title: metadata.title,
+                duration: metadata.duration,
+                hasCaptions: !!captions,
+                captionIsAuto: captions?.isAuto,
+                chapterCount: chapters.length,
+                heatmapPoints: heatmap?.length ?? 0,
+                sponsorSegments: sponsorSegments?.length ?? 0,
+            });
+
+            return {
+                filePath: actualPath,
+                format: metadata.ext || 'mp4',
+                duration: metadata.duration,
+                title: metadata.title,
+                thumbnailUrl: metadata.thumbnail,
+                captions,
+                chapters,
+                heatmap,
+                sponsorSegments,
+                categories,
+            };
+        } catch (parseError) {
+            // Fallback if JSON parsing fails
+            logger.warn('Failed to parse yt-dlp output, using defaults', { parseError });
+            return {
+                filePath: outputPath,
+                format: 'mp4',
+            };
+        }
+    };
+
+    try {
+        const { stdout } = await runYtDlp(buildArgs(true));
+        return parseResult(stdout);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!message.includes('Unable to download video subtitles')) {
+            throw err;
+        }
+        logger.warn('YouTube subtitle download failed; retrying media without subtitles', {
+            url,
+            contentItemId,
+            error: message,
+        });
+        const { stdout } = await runYtDlp(buildArgs(false));
+        return parseResult(stdout);
+    }
 }
 
 /**

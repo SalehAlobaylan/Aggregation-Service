@@ -61,9 +61,9 @@ function tracingHeaders(requestId?: string): Record<string, string> {
 export async function transcribeViaMedia(
     audioPath: string,
     contentItemId?: string,
-    opts: { language?: string; wordTimestamps?: boolean; requestId?: string } = {},
+    opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string } = {},
 ): Promise<TranscriptResult> {
-    const { language, wordTimestamps = true, requestId } = opts;
+    const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
 
     logger.info('Calling Media /v1/transcribe', {
         audioPath,
@@ -74,6 +74,7 @@ export async function transcribeViaMedia(
     const form = new FormData();
     form.append('audio_file', createReadStream(audioPath));
     if (contentItemId) form.append('content_id', contentItemId);
+    if (transcriptionJobId) form.append('transcription_job_id', transcriptionJobId);
     if (language) form.append('language', language);
     form.append('word_timestamps', wordTimestamps ? 'true' : 'false');
 
@@ -122,13 +123,14 @@ export async function transcribeViaMedia(
 export async function submitTranscribeJobViaMedia(
     audioPath: string,
     contentItemId?: string,
-    opts: { language?: string; wordTimestamps?: boolean; requestId?: string } = {},
+    opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string } = {},
 ): Promise<string> {
-    const { language, wordTimestamps = true, requestId } = opts;
+    const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
 
     const form = new FormData();
     form.append('audio_file', createReadStream(audioPath));
     if (contentItemId) form.append('content_id', contentItemId);
+    if (transcriptionJobId) form.append('transcription_job_id', transcriptionJobId);
     if (language) form.append('language', language);
     form.append('word_timestamps', wordTimestamps ? 'true' : 'false');
 
@@ -236,6 +238,7 @@ export async function transcribeAsyncViaMedia(
         language?: string;
         wordTimestamps?: boolean;
         requestId?: string;
+        transcriptionJobId?: string;
         pollIntervalMs?: number;
         maxWaitMs?: number;
     } = {},
