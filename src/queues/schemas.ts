@@ -15,8 +15,11 @@ export type SourceType =
     | 'UPLOAD'
     | 'MANUAL';
 
-// Content types
-export type ContentType = 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
+// Content types. NEWS is the CMS-side primary kind (with a `format` sub-type);
+// Aggregation still normalizes to the legacy ARTICLE/TWEET/COMMENT shapes and
+// CMS folds them into NEWS+format at the ingest boundary. NEWS appears here for
+// the reconcile read-back path, which reads `type` straight from CMS.
+export type ContentType = 'NEWS' | 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
 
 // Content status
 export type ContentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' | 'ARCHIVED';
@@ -57,6 +60,13 @@ export interface MediaJob {
     contentType: ContentType;
     sourceType: SourceType;
     sourceUrl: string;
+    // Content text captured during normalization. Forwarded to the AI job after
+    // media processing so video/podcast embeddings include title/description.
+    textContent?: {
+        title: string;
+        excerpt?: string;
+        bodyText?: string;
+    };
     downloadRef?: {
         channelUsername: string;
         channelId?: string;

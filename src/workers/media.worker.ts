@@ -43,7 +43,14 @@ export const mediaWorker = createWorker({
     concurrency: 2, // Media processing is resource-intensive
     timeoutMs: config.mediaJobTimeoutMs, // 30 min default — FFmpeg transcodes can be slow
     processor: async (job: Job<MediaJob>, jobLogger): Promise<void> => {
-        const { contentItemId, contentType, sourceType, sourceUrl, operations, downloadRef } = job.data;
+        const {
+            contentItemId,
+            contentType,
+            sourceType,
+            sourceUrl,
+            operations,
+            downloadRef,
+        } = job.data;
 
         jobLogger.info('Processing media job', {
             contentItemId,
@@ -362,9 +369,7 @@ async function enqueueAIJob(
             contentItemId,
             contentType,
             operations,
-            textContent: {
-                title: '', // Will be fetched from CMS if needed
-            },
+            textContent: job.data.textContent ?? { title: '' },
             mediaPath,
             mediaUrl,
             captionState,

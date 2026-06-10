@@ -313,6 +313,11 @@ export const normalizeWorker = createWorker({
                                         contentType: normalized.type,
                                         sourceType,
                                         sourceUrl,
+                                        textContent: {
+                                            title: normalized.title,
+                                            excerpt: normalized.excerpt || undefined,
+                                            bodyText: normalized.bodyText || undefined,
+                                        },
                                         downloadRef,
                                         operations: ['download', 'transcode', 'thumbnail'],
                                     },

@@ -3,7 +3,7 @@
  */
 
 // Content types - must match queue schemas
-export type ContentType = 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
+export type ContentType = 'NEWS' | 'ARTICLE' | 'VIDEO' | 'TWEET' | 'COMMENT' | 'PODCAST';
 export type SourceType = 'RSS' | 'WEBSITE' | 'TELEGRAM' | 'PODCAST' | 'PODCAST_DISCOVERY' | 'YOUTUBE' | 'TWITTER' | 'REDDIT' | 'UPLOAD' | 'MANUAL';
 export type ContentStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' | 'ARCHIVED';
 

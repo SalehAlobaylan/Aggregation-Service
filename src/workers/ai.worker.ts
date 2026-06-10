@@ -209,7 +209,8 @@ export const aiWorker = createWorker({
                         //                    hybrid retrieval to work on this
                         //                    item. TWEET/COMMENT skip both.
                         const wantsHybridEnrichment =
-                            contentType === 'ARTICLE'
+                            contentType === 'NEWS'
+                            || contentType === 'ARTICLE'
                             || contentType === 'VIDEO'
                             || contentType === 'PODCAST';
 

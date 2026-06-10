@@ -47,11 +47,27 @@ export const reconcileWorker = createWorker({
                     bodyText: item.body_text || undefined,
                 },
             };
+            const jobId = `reconcile-embed-${item.id}`;
+
+            // Deterministic jobIds dedup against ACTIVE work, but BullMQ also
+            // silently ignores an add while a finished job with the same id is
+            // still retained — a single failure (e.g. Enrichment cold start)
+            // would wedge the item for the whole removeOnFail window with every
+            // sweep no-oping. Clear finished remnants so the sweep can retry;
+            // leave queued/active jobs alone (genuine dedup).
+            const existing = await aiQueue.getJob(jobId);
+            if (existing) {
+                const state = await existing.getState();
+                if (state === 'failed' || state === 'completed') {
+                    await existing.remove();
+                } else {
+                    continue; // still queued/active — let it run
+                }
+            }
+
             await aiQueue.add(`reconcile-embed-${item.id}`, aiJob, {
                 priority: 5, // below fresh ingestion
-                // Deterministic jobId coalesces repeat sweeps for the same item
-                // while a prior attempt is still around — avoids dup embed work.
-                jobId: `reconcile-embed-${item.id}`,
+                jobId,
                 removeOnComplete: { age: 3600, count: 200 },
                 removeOnFail: { age: 86400 },
             });
