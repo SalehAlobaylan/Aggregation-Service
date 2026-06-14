@@ -8,7 +8,7 @@ import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
-import type { SourceType } from '../../queues/schemas.js';
+import type { SourceType, DiscoveryJob, DiscoveryProfileInput } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
@@ -315,6 +315,37 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     success: false,
                     message: error instanceof Error ? error.message : 'Unknown error',
                 });
+            }
+        }
+    );
+
+    /**
+     * Trigger a one-off source-discovery sweep for a profile (proxied from CMS).
+     * POST /admin/discovery/run
+     */
+    fastify.post<{ Body: { profile?: DiscoveryProfileInput }; Reply: TriggerResponse }>(
+        '/admin/discovery/run',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const profile = request.body?.profile;
+            if (!profile || !profile.id || !profile.name) {
+                return reply.status(400).send({ success: false, message: 'profile.id and profile.name are required' });
+            }
+            try {
+                const queue = getQueue(QUEUE_NAMES.DISCOVERY);
+                if (!queue) {
+                    return reply.status(503).send({ success: false, message: 'discovery queue unavailable' });
+                }
+                const job = await queue.add(
+                    `discovery-${profile.id}-${Date.now()}`,
+                    { profile, triggeredBy: 'manual' } satisfies DiscoveryJob,
+                    { priority: 2 }
+                );
+                logger.info('Admin triggered discovery sweep', { profile: profile.name, jobId: job.id });
+                return reply.send({ success: true, jobId: job.id ?? undefined, message: `Discovery queued for ${profile.name}` });
+            } catch (error) {
+                logger.error('Admin discovery trigger failed', error);
+                return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
             }
         }
     );

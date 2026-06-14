@@ -12,6 +12,7 @@ import { aiWorker } from './ai.worker.js';
 import { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
 import { reconcileWorker, syncReconcileSweeper } from './reconcile.worker.js';
 import { qualityWorker } from './quality.worker.js';
+import { discoveryWorker } from './discovery.worker.js';
 import { startOpMetricsFlush } from './op-metrics-flush.worker.js';
 import { startCloudflareAnalyticsPuller } from '../services/cloudflare-analytics.service.js';
 
@@ -24,6 +25,7 @@ const workers: Worker[] = [
     storageWorker,
     reconcileWorker,
     qualityWorker,
+    discoveryWorker,
 ];
 
 /**

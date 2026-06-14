@@ -149,6 +149,25 @@ export interface QualityCleanupJob {
 // which enqueues directly onto QUALITY_REENCODE.
 
 /**
+ * Discovery Job - hunts the open web for new news sources matching a profile,
+ * validates them, and posts candidates back to CMS for admin review.
+ */
+export interface DiscoveryProfileInput {
+    id: string; // CMS discovery_profiles.public_id
+    name: string;
+    description?: string;
+    keywords?: string[];
+    languages?: string[];
+    maxSuggestionsPerRun?: number;
+    tenantId?: string;
+}
+
+export interface DiscoveryJob {
+    profile: DiscoveryProfileInput;
+    triggeredBy: 'schedule' | 'manual';
+}
+
+/**
  * DLQ Job - failed job moved to dead letter queue
  */
 export interface DLQJob {
@@ -169,6 +188,7 @@ export const QUEUE_NAMES = {
     STORAGE_SWEEP: 'storage-sweep-queue',
     RECONCILE: 'reconcile-queue',
     QUALITY_REENCODE: 'quality-reencode-queue',
+    DISCOVERY: 'discovery-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 

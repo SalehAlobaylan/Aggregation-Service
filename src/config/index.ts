@@ -130,6 +130,9 @@ const configSchema = z.object({
     // Optional - Twitter API
     twitterBearerToken: z.string().nullable().default(null),
 
+    // Optional - Tavily web search (source discovery; crawl-only fallback when unset)
+    tavilyApiKey: z.string().nullable().default(null),
+
     // Optional - iTunes Search
     enableItunesSearch: z.preprocess(
         (val) => val === undefined ? true : val,
@@ -216,6 +219,8 @@ function mapEnvToConfig(): Record<string, unknown> {
         redditPassword: process.env.REDDIT_PASSWORD || null,
 
         twitterBearerToken: process.env.TWITTER_BEARER_TOKEN || null,
+
+        tavilyApiKey: process.env.TAVILY_API_KEY || null,
 
         enableItunesSearch: process.env.ENABLE_ITUNES_SEARCH,
         adminJwtIssuer: process.env.ADMIN_JWT_ISSUER,

@@ -155,6 +155,26 @@ export const cmsClient = {
     },
 
     /**
+     * Post discovered source candidates to CMS for admin review.
+     * POST /internal/source-suggestions
+     */
+    async postSourceSuggestions(
+        data: { tenantId?: string; profileId?: string; candidates: unknown[] },
+        requestId?: string
+    ): Promise<{ upserted: number; skipped: number }> {
+        return makeProtectedRequest<{ upserted: number; skipped: number }>(
+            'POST',
+            '/source-suggestions',
+            {
+                tenant_id: data.tenantId,
+                profile_id: data.profileId,
+                candidates: data.candidates,
+            },
+            requestId
+        );
+    },
+
+    /**
      * Update an existing content item
      * PUT /internal/content-items/:id
      */
