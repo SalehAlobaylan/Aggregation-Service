@@ -8,7 +8,7 @@ import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
-import type { SourceType, DiscoveryJob, DiscoveryProfileInput } from '../../queues/schemas.js';
+import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
@@ -16,6 +16,7 @@ import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
 import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
 import { syncDiscoverySweeper } from '../../workers/discovery-sweep.worker.js';
+import { syncSourceGraphSweeper } from '../../workers/source-graph.worker.js';
 // quality-sweeper worker removed in Phase 7; re-encoding is now driven by
 // the storage sweeper (when archive_action='re_encode').
 import { probeContentItem } from '../../services/quality.service.js';
@@ -329,14 +330,36 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         { preHandler: verifyAdminAuth },
         async (_request, reply) => {
             try {
-                await syncDiscoverySweeper();
-                return reply.send({ success: true, message: 'Discovery schedule re-synced' });
+                await Promise.all([syncDiscoverySweeper(), syncSourceGraphSweeper()]);
+                return reply.send({ success: true, message: 'Discovery + graph schedules re-synced' });
             } catch (error) {
                 logger.error('Discovery schedule resync failed', error);
                 return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
             }
         }
     );
+
+    /**
+     * Manually sweep all enabled interests now (proxied from CMS). Runs even when
+     * scheduled automation is off (trigger: 'manual'). POST /admin/discovery/sweep-now
+     */
+    fastify.post('/admin/discovery/sweep-now', { preHandler: verifyAdminAuth }, async (_request, reply) => {
+        const q = getQueue(QUEUE_NAMES.DISCOVERY_SWEEP);
+        if (!q) return reply.status(503).send({ success: false, message: 'discovery sweep queue unavailable' });
+        const job = await q.add('manual-sweep', { trigger: 'manual' } satisfies DiscoverySweepJob);
+        return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Discovery sweep queued' });
+    });
+
+    /**
+     * Manually rebuild the source-intelligence graph now (proxied from CMS).
+     * POST /admin/discovery/build-graph-now
+     */
+    fastify.post('/admin/discovery/build-graph-now', { preHandler: verifyAdminAuth }, async (_request, reply) => {
+        const q = getQueue(QUEUE_NAMES.SOURCE_GRAPH);
+        if (!q) return reply.status(503).send({ success: false, message: 'source graph queue unavailable' });
+        const job = await q.add('manual-graph', { trigger: 'manual' } satisfies SourceGraphJob);
+        return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Source graph build queued' });
+    });
 
     /**
      * Trigger a one-off source-discovery sweep for a profile (proxied from CMS).

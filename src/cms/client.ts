@@ -184,8 +184,26 @@ export const cmsClient = {
         recency_window_days: number;
         max_candidates_per_profile: number;
         search_provider: string;
+        intelligence_enabled: boolean;
+        graph_build_interval_hours: number;
     }> {
         return makeRequest('GET', '/discovery/config', undefined, requestId);
+    },
+
+    /**
+     * Source-graph signals + ledger write-back (Slice 4).
+     */
+    async getCorpusCitations(requestId?: string): Promise<{ data: { domain: string; count: number; recent_count: number }[] }> {
+        return makeRequest('GET', '/intel/corpus-citations', undefined, requestId);
+    },
+    async getApprovedSourcePages(requestId?: string): Promise<{ data: { host: string; site_url: string; feed_url: string }[] }> {
+        return makeRequest('GET', '/intel/approved-source-pages', undefined, requestId);
+    },
+    async postCandidates(
+        data: { candidates: unknown[]; edges: { from_host: string; to_host: string; weight: number }[] },
+        requestId?: string
+    ): Promise<{ candidates: number; edges: number; promoted: number }> {
+        return makeProtectedRequest('POST', '/intel/candidates', data, requestId);
     },
 
     /**

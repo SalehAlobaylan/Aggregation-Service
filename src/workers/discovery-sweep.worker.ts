@@ -22,7 +22,7 @@ export const discoverySweepWorker = createWorker({
     concurrency: 1,
     processor: async (job: Job<DiscoverySweepJob>, jobLogger): Promise<void> => {
         const cfg = await cmsClient.getDiscoveryConfig(job.id);
-        if (!cfg.automation_enabled) {
+        if (!cfg.automation_enabled && job.data.trigger !== 'manual') {
             jobLogger.info('Discovery sweep skipped: automation disabled in config');
             return;
         }

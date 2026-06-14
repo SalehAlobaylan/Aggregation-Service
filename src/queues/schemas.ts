@@ -177,6 +177,11 @@ export interface DiscoverySweepJob {
     trigger: 'auto' | 'manual';
 }
 
+// Source Graph Job — the repeatable that rebuilds the source-intelligence graph.
+export interface SourceGraphJob {
+    trigger: 'auto' | 'manual';
+}
+
 /**
  * DLQ Job - failed job moved to dead letter queue
  */
@@ -200,6 +205,7 @@ export const QUEUE_NAMES = {
     QUALITY_REENCODE: 'quality-reencode-queue',
     DISCOVERY: 'discovery-queue',
     DISCOVERY_SWEEP: 'discovery-sweep-queue',
+    SOURCE_GRAPH: 'source-graph-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 
