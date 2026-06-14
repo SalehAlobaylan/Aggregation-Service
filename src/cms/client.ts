@@ -175,6 +175,30 @@ export const cmsClient = {
     },
 
     /**
+     * Read the tenant's discovery config (sweep interval, automation, knobs).
+     * GET /internal/discovery/config
+     */
+    async getDiscoveryConfig(requestId?: string): Promise<{
+        automation_enabled: boolean;
+        sweep_interval_hours: number;
+        recency_window_days: number;
+        max_candidates_per_profile: number;
+        search_provider: string;
+    }> {
+        return makeRequest('GET', '/discovery/config', undefined, requestId);
+    },
+
+    /**
+     * List enabled discovery profiles for the scheduled sweep fan-out.
+     * GET /internal/discovery/profiles?enabled=true
+     */
+    async listEnabledDiscoveryProfiles(requestId?: string): Promise<{
+        data: Array<{ id: string; name: string; description?: string; keywords?: string[]; languages?: string[]; max_suggestions_per_run?: number }>;
+    }> {
+        return makeRequest('GET', '/discovery/profiles?enabled=true', undefined, requestId);
+    },
+
+    /**
      * Update an existing content item
      * PUT /internal/content-items/:id
      */

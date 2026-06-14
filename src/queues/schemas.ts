@@ -160,11 +160,21 @@ export interface DiscoveryProfileInput {
     languages?: string[];
     maxSuggestionsPerRun?: number;
     tenantId?: string;
+    // Config-driven overrides (from CMS discovery_config) so scheduled and manual
+    // runs share the same tuning.
+    recencyDays?: number;
+    searchProvider?: string; // 'auto' | 'tavily' | 'crawl'
 }
 
 export interface DiscoveryJob {
     profile: DiscoveryProfileInput;
     triggeredBy: 'schedule' | 'manual';
+}
+
+// Discovery Sweep Job — the repeatable that fans out a DiscoveryJob per enabled
+// profile on the configured interval.
+export interface DiscoverySweepJob {
+    trigger: 'auto' | 'manual';
 }
 
 /**
@@ -189,6 +199,7 @@ export const QUEUE_NAMES = {
     RECONCILE: 'reconcile-queue',
     QUALITY_REENCODE: 'quality-reencode-queue',
     DISCOVERY: 'discovery-queue',
+    DISCOVERY_SWEEP: 'discovery-sweep-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 

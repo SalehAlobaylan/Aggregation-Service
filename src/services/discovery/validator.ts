@@ -30,7 +30,7 @@ function guessLanguage(text: string): string | undefined {
     return /[؀-ۿ]/.test(text) ? 'ar' : 'en';
 }
 
-export async function validateFeed(feedUrl: string): Promise<ValidatedFeed | null> {
+export async function validateFeed(feedUrl: string, recencyDays: number = RECENCY_DAYS): Promise<ValidatedFeed | null> {
     // One GET per candidate feed — bounded by maxSuggestions — so skip the
     // per-host politeness limiter (it wrongly throttles same-host category feeds,
     // e.g. BBC Arabic's 7 topic feeds). SSRF + size caps still apply.
@@ -57,7 +57,7 @@ export async function validateFeed(feedUrl: string): Promise<ValidatedFeed | nul
     const lastMs = timestamps.length > 0 ? Math.max(...timestamps) : NaN;
 
     // Reject only when we have dates AND the newest is stale — undated feeds pass.
-    if (!Number.isNaN(lastMs) && lastMs < Date.now() - RECENCY_DAYS * 86_400_000) {
+    if (!Number.isNaN(lastMs) && lastMs < Date.now() - recencyDays * 86_400_000) {
         return null;
     }
 

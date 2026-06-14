@@ -15,6 +15,7 @@ import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.j
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
 import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
+import { syncDiscoverySweeper } from '../../workers/discovery-sweep.worker.js';
 // quality-sweeper worker removed in Phase 7; re-encoding is now driven by
 // the storage sweeper (when archive_action='re_encode').
 import { probeContentItem } from '../../services/quality.service.js';
@@ -315,6 +316,24 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     success: false,
                     message: error instanceof Error ? error.message : 'Unknown error',
                 });
+            }
+        }
+    );
+
+    /**
+     * Re-sync the scheduled discovery sweep from CMS config (proxied by CMS when
+     * an admin saves discovery config). POST /admin/discovery/resync-schedule
+     */
+    fastify.post(
+        '/admin/discovery/resync-schedule',
+        { preHandler: verifyAdminAuth },
+        async (_request, reply) => {
+            try {
+                await syncDiscoverySweeper();
+                return reply.send({ success: true, message: 'Discovery schedule re-synced' });
+            } catch (error) {
+                logger.error('Discovery schedule resync failed', error);
+                return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
             }
         }
     );

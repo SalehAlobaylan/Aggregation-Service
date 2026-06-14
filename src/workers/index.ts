@@ -13,6 +13,7 @@ import { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
 import { reconcileWorker, syncReconcileSweeper } from './reconcile.worker.js';
 import { qualityWorker } from './quality.worker.js';
 import { discoveryWorker } from './discovery.worker.js';
+import { discoverySweepWorker, syncDiscoverySweeper } from './discovery-sweep.worker.js';
 import { startOpMetricsFlush } from './op-metrics-flush.worker.js';
 import { startCloudflareAnalyticsPuller } from '../services/cloudflare-analytics.service.js';
 
@@ -26,6 +27,7 @@ const workers: Worker[] = [
     reconcileWorker,
     qualityWorker,
     discoveryWorker,
+    discoverySweepWorker,
 ];
 
 /**
@@ -48,6 +50,10 @@ export function startWorkers(): void {
     // Schedule the embedding reconciliation sweep (H2 backstop).
     syncReconcileSweeper().catch(err => {
         logger.error('Failed to sync embedding reconciliation sweeper', err);
+    });
+    // Schedule the Feeds-Finding discovery sweep (interval/toggle from CMS config).
+    syncDiscoverySweeper().catch(err => {
+        logger.error('Failed to sync discovery sweeper', err);
     });
     // Telemetry: drain the S3 op counter to CMS hourly.
     startOpMetricsFlush();

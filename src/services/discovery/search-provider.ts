@@ -143,9 +143,11 @@ class HybridSearchProvider implements SourceSearchProvider {
     }
 }
 
-export function getSearchProvider(): SourceSearchProvider {
-    const tavily = config.tavilyApiKey ? new TavilySearchProvider(config.tavilyApiKey) : undefined;
-    if (!tavily) {
+export function getSearchProvider(providerOverride?: string): SourceSearchProvider {
+    // 'crawl' forces catalog-only; 'tavily'/'auto'/unset use Tavily when keyed.
+    const wantTavily = providerOverride !== 'crawl';
+    const tavily = wantTavily && config.tavilyApiKey ? new TavilySearchProvider(config.tavilyApiKey) : undefined;
+    if (wantTavily && !tavily) {
         logger.warn('TAVILY_API_KEY not set — discovery using curated catalog only');
     }
     return new HybridSearchProvider(tavily);

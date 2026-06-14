@@ -11,7 +11,7 @@ import { scoreConfidence } from './scorer.js';
 import type { DiscoveryProfileInput, SuggestionCandidate } from './types.js';
 
 export async function runDiscovery(profile: DiscoveryProfileInput): Promise<SuggestionCandidate[]> {
-    const provider = getSearchProvider();
+    const provider = getSearchProvider(profile.searchProvider);
     const maxSuggestions = profile.maxSuggestionsPerRun && profile.maxSuggestionsPerRun > 0
         ? profile.maxSuggestionsPerRun
         : 10;
@@ -43,7 +43,7 @@ export async function runDiscovery(profile: DiscoveryProfileInput): Promise<Sugg
 
             let validated;
             try {
-                validated = await validateFeed(feed.feedUrl);
+                validated = await validateFeed(feed.feedUrl, profile.recencyDays);
             } catch (error) {
                 logger.debug('Feed validation skipped', { feedUrl: feed.feedUrl, error: error instanceof Error ? error.message : String(error) });
                 continue;
