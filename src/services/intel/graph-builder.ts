@@ -14,6 +14,7 @@ import { resolveFeeds } from '../discovery/feed-resolver.js';
 import { validateFeed } from '../discovery/validator.js';
 import { extractOutboundHosts } from './link-extractor.js';
 import { personalizedPageRank, type GraphEdge } from './pagerank.js';
+import { buildTelegramGraph } from './telegram-graph.js';
 
 const MAX_SOURCES_TO_CRAWL = 8;
 const MAX_CANDIDATES_TO_RESOLVE = 20;
@@ -47,7 +48,32 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
         }
     }
 
-    const authority = personalizedPageRank(edges, trustedHosts);
+    // Telegram contributor — extends the citation graph to channels (gated).
+    // Forwarded-from + t.me mentions are the Telegram analog of the link-graph.
+    let cfg: { telegram_discovery_enabled?: boolean } = {};
+    try {
+        cfg = await cmsClient.getDiscoveryConfig();
+    } catch {
+        /* default off */
+    }
+    let tgCandidates: Awaited<ReturnType<typeof buildTelegramGraph>>['candidates'] = [];
+    const pagerankSeeds = [...trustedHosts];
+    if (cfg.telegram_discovery_enabled) {
+        try {
+            const tgChannels = await cmsClient
+                .getApprovedTelegramChannels()
+                .catch(() => ({ data: [] as { username: string }[] }));
+            const seedUsernames = (tgChannels.data ?? []).map((c) => c.username).filter(Boolean);
+            const tg = await buildTelegramGraph(seedUsernames, recencyDays);
+            tgCandidates = tg.candidates;
+            for (const e of tg.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
+            for (const u of seedUsernames) pagerankSeeds.push(`tg:${u.replace(/^@/, '').toLowerCase()}`);
+        } catch (err) {
+            logger.warn('Telegram discovery failed', { error: (err as Error).message });
+        }
+    }
+
+    const authority = personalizedPageRank(edges, pagerankSeeds);
 
     // Merge corpus + link-graph signals into a candidate map (exclude trusted).
     const candMap = new Map<string, CandidateSignal>();
@@ -101,6 +127,7 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
         const trend = sig.citation > 0 && sig.recent * 2 >= sig.citation ? 'rising' : 'flat';
         candidates.push({
             domain,
+            kind: 'rss',
             canonical_key: resolvedFeedUrl ? canonicalSourceKey(resolvedFeedUrl) : 'https://' + domain,
             resolved_feed_url: resolvedFeedUrl,
             feed_valid: feedValid,
@@ -111,6 +138,24 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
             discovered_via: [...sig.via],
             sample_titles: sampleTitles,
             feed_health: feedHealth,
+        });
+    }
+
+    // Telegram candidates → ledger rows (channel = domain, tg: namespaced key).
+    for (const tc of tgCandidates) {
+        candidates.push({
+            domain: tc.username,
+            kind: 'telegram',
+            canonical_key: `tg:${tc.username}`,
+            resolved_feed_url: `https://t.me/${tc.username}`,
+            feed_valid: true,
+            citation_count: 0,
+            cocitation_count: tc.cocitation,
+            authority_score: authority.get(`tg:${tc.username}`) ?? 0,
+            trend: 'flat',
+            discovered_via: [tc.via],
+            sample_titles: tc.sampleTitles,
+            feed_health: tc.feedHealth,
         });
     }
 

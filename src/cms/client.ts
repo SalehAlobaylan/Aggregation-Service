@@ -185,6 +185,7 @@ export const cmsClient = {
         max_candidates_per_profile: number;
         search_provider: string;
         intelligence_enabled: boolean;
+        telegram_discovery_enabled: boolean;
         graph_build_interval_hours: number;
     }> {
         return makeRequest('GET', '/discovery/config', undefined, requestId);
@@ -198,6 +199,9 @@ export const cmsClient = {
     },
     async getApprovedSourcePages(requestId?: string): Promise<{ data: { host: string; site_url: string; feed_url: string }[] }> {
         return makeRequest('GET', '/intel/approved-source-pages', undefined, requestId);
+    },
+    async getApprovedTelegramChannels(requestId?: string): Promise<{ data: { username: string }[] }> {
+        return makeRequest('GET', '/intel/approved-telegram-channels', undefined, requestId);
     },
     async postCandidates(
         data: { candidates: unknown[]; edges: { from_host: string; to_host: string; weight: number }[] },

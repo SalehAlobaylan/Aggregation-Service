@@ -129,3 +129,45 @@ export async function generateEmbeddingViaEnrichment(
         entities: result.entities ?? undefined,
     };
 }
+
+export interface TelegramChannelInfo {
+    username: string;
+    exists: boolean;
+    title: string | null;
+    subscribers: number;
+    posts: { text: string; datetime: string | null; views: string | null }[];
+    forwarded: string[];
+    mentioned: string[];
+}
+
+const TELEGRAM_TIMEOUT_MS = 40_000;
+
+/**
+ * Scrape a Telegram channel's public preview (t.me/s/<username>) via Enrichment.
+ * Stealth web extraction is Enrichment's boundary; Aggregation only orchestrates
+ * the forward-graph. Returns exists:false for private/missing channels.
+ */
+export async function fetchTelegramChannel(
+    username: string,
+    requestId?: string,
+): Promise<TelegramChannelInfo> {
+    const response = await fetch(`${baseUrl()}/v1/extract/telegram`, {
+        method: 'POST',
+        body: JSON.stringify({ username }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/telegram failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+
+    return (await response.json()) as TelegramChannelInfo;
+}
