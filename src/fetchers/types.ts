@@ -44,6 +44,8 @@ export interface FetchResult {
         totalFetched: number;
         skipped: number;
         errors: number;
+        /** Human-readable failure reason when a fetch yields nothing (surfaced in UI). */
+        reason?: string;
     };
 }
 
@@ -137,8 +139,11 @@ export interface TwitterSourceConfig extends SourceConfig {
     settings: {
         searchQuery?: string;
         userId?: string;
+        username?: string;          // handle, if not derivable from url
         mode?: 'api' | 'scrape';
         minEngagement?: number;
+        skipRetweets?: boolean;
+        skipReplies?: boolean;
     };
 }
 

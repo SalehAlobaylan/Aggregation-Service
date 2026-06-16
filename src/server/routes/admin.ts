@@ -254,7 +254,10 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
 
                 return reply.send({
                     success: true,
-                    message: 'Preview generated successfully',
+                    // Surface the fetcher's failure reason (e.g. X 429) when nothing came back.
+                    message: result.items.length === 0 && result.metadata.reason
+                        ? result.metadata.reason
+                        : 'Preview generated successfully',
                     fetched: result.items.length,
                     normalized: previewItems.length,
                     skipped: normalization.skipped,

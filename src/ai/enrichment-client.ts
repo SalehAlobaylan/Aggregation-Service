@@ -171,3 +171,58 @@ export async function fetchTelegramChannel(
 
     return (await response.json()) as TelegramChannelInfo;
 }
+
+export interface TwitterPostInfo {
+    id: string;
+    text: string;
+    created_at: string | null;
+    url: string | null;
+    likes: number;
+    retweets: number;
+    replies: number;
+    is_retweet: boolean;
+    is_reply: boolean;
+}
+
+export interface TwitterProfileInfo {
+    username: string;
+    exists: boolean;
+    rate_limited?: boolean;
+    name: string | null;
+    followers: number;
+    verified: boolean;
+    posts: TwitterPostInfo[];
+    retweeted: string[];
+    quoted: string[];
+    mentioned: string[];
+}
+
+/**
+ * Scrape an X profile's public syndication timeline via Enrichment. Stealth
+ * extraction is Enrichment's boundary; Aggregation orchestrates the
+ * interaction-graph + ingestion. Returns exists:false on missing/throttled.
+ */
+export async function fetchTwitterProfile(
+    username: string,
+    requestId?: string,
+): Promise<TwitterProfileInfo> {
+    const response = await fetch(`${baseUrl()}/v1/extract/twitter`, {
+        method: 'POST',
+        body: JSON.stringify({ username }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/twitter failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+
+    return (await response.json()) as TwitterProfileInfo;
+}

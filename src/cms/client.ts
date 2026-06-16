@@ -186,6 +186,7 @@ export const cmsClient = {
         search_provider: string;
         intelligence_enabled: boolean;
         telegram_discovery_enabled: boolean;
+        twitter_discovery_enabled: boolean;
         graph_build_interval_hours: number;
     }> {
         return makeRequest('GET', '/discovery/config', undefined, requestId);
@@ -202,6 +203,9 @@ export const cmsClient = {
     },
     async getApprovedTelegramChannels(requestId?: string): Promise<{ data: { username: string }[] }> {
         return makeRequest('GET', '/intel/approved-telegram-channels', undefined, requestId);
+    },
+    async getApprovedTwitterHandles(requestId?: string): Promise<{ data: { username: string }[] }> {
+        return makeRequest('GET', '/intel/approved-twitter-handles', undefined, requestId);
     },
     async postCandidates(
         data: { candidates: unknown[]; edges: { from_host: string; to_host: string; weight: number }[] },

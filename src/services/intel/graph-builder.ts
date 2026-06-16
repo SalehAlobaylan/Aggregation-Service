@@ -15,6 +15,7 @@ import { validateFeed } from '../discovery/validator.js';
 import { extractOutboundHosts } from './link-extractor.js';
 import { personalizedPageRank, type GraphEdge } from './pagerank.js';
 import { buildTelegramGraph } from './telegram-graph.js';
+import { buildTwitterGraph } from './twitter-graph.js';
 
 const MAX_SOURCES_TO_CRAWL = 8;
 const MAX_CANDIDATES_TO_RESOLVE = 20;
@@ -50,13 +51,14 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
 
     // Telegram contributor — extends the citation graph to channels (gated).
     // Forwarded-from + t.me mentions are the Telegram analog of the link-graph.
-    let cfg: { telegram_discovery_enabled?: boolean } = {};
+    let cfg: { telegram_discovery_enabled?: boolean; twitter_discovery_enabled?: boolean } = {};
     try {
         cfg = await cmsClient.getDiscoveryConfig();
     } catch {
         /* default off */
     }
     let tgCandidates: Awaited<ReturnType<typeof buildTelegramGraph>>['candidates'] = [];
+    let xCandidates: Awaited<ReturnType<typeof buildTwitterGraph>>['candidates'] = [];
     const pagerankSeeds = [...trustedHosts];
     if (cfg.telegram_discovery_enabled) {
         try {
@@ -70,6 +72,22 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
             for (const u of seedUsernames) pagerankSeeds.push(`tg:${u.replace(/^@/, '').toLowerCase()}`);
         } catch (err) {
             logger.warn('Telegram discovery failed', { error: (err as Error).message });
+        }
+    }
+
+    // Twitter/X contributor — retweet/quote/mention is the X analog of the link-graph.
+    if (cfg.twitter_discovery_enabled) {
+        try {
+            const xHandles = await cmsClient
+                .getApprovedTwitterHandles()
+                .catch(() => ({ data: [] as { username: string }[] }));
+            const seedHandles = (xHandles.data ?? []).map((c) => c.username).filter(Boolean);
+            const x = await buildTwitterGraph(seedHandles, recencyDays);
+            xCandidates = x.candidates;
+            for (const e of x.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
+            for (const u of seedHandles) pagerankSeeds.push(`x:${u.replace(/^@/, '').toLowerCase()}`);
+        } catch (err) {
+            logger.warn('Twitter discovery failed', { error: (err as Error).message });
         }
     }
 
@@ -156,6 +174,24 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
             discovered_via: [tc.via],
             sample_titles: tc.sampleTitles,
             feed_health: tc.feedHealth,
+        });
+    }
+
+    // Twitter/X candidates → ledger rows (handle = domain, x: namespaced key).
+    for (const xc of xCandidates) {
+        candidates.push({
+            domain: xc.username,
+            kind: 'twitter',
+            canonical_key: `x:${xc.username}`,
+            resolved_feed_url: `https://x.com/${xc.username}`,
+            feed_valid: true,
+            citation_count: 0,
+            cocitation_count: xc.cocitation,
+            authority_score: authority.get(`x:${xc.username}`) ?? 0,
+            trend: 'flat',
+            discovered_via: [xc.via],
+            sample_titles: xc.sampleTitles,
+            feed_health: xc.feedHealth,
         });
     }
 
