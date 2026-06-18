@@ -7,8 +7,7 @@
  * /internal/* API, so callers don't need to do their own CMS writes.
  *
  * History: these functions used to live in enrichment-client.ts when there
- * was a single AI service. They were moved here as part of the Media-Service
- * split (see /Users/.../plans/good-now-the-aggregation-toasty-key.md → Phase 4).
+ * was a single AI service. They moved here as part of the Media-Service split.
  */
 import FormData from 'form-data';
 import { createReadStream } from 'fs';
