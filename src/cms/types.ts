@@ -455,3 +455,48 @@ export interface MissingEmbeddingItem {
 export interface ListMissingEmbeddingResponse {
     items: MissingEmbeddingItem[];
 }
+
+// =============================================================================
+// News Circulation — internal CMS API shapes
+// =============================================================================
+
+export interface NewsCirculationPolicy {
+    tenant_id: string;
+    preset: string;
+    timezone: string;
+    source_cadence_mode: 'suggest' | 'auto_apply' | 'manual';
+    source_claim_interval_minutes: number;
+    source_min_interval_minutes: number;
+    source_max_interval_minutes: number;
+    source_max_change_percent: number;
+}
+
+export interface CirculationSourceClaim {
+    id: string;
+    name: string;
+    type: SourceType;
+    url: string;
+    fetch_interval_minutes: number;
+    settings?: Record<string, unknown>;
+}
+
+export interface ClaimCirculationSourcesResponse {
+    data: CirculationSourceClaim[];
+    policy: NewsCirculationPolicy;
+}
+
+export interface ReportSourceRunRequest {
+    tenant_id?: string;
+    source_id: string;
+    job_id: string;
+    triggered_by: 'schedule' | 'manual';
+    fetched?: number;
+    accepted?: number;
+    duplicates?: number;
+    filtered?: number;
+    failed?: number;
+    started_at?: string;
+    finished_at?: string;
+    duration_ms?: number;
+    metadata?: Record<string, unknown>;
+}

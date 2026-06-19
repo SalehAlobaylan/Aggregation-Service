@@ -8,7 +8,7 @@ import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
-import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob } from '../../queues/schemas.js';
+import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
@@ -17,6 +17,7 @@ import { cmsClient } from '../../cms/client.js';
 import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
 import { syncDiscoverySweeper } from '../../workers/discovery-sweep.worker.js';
 import { syncSourceGraphSweeper } from '../../workers/source-graph.worker.js';
+import { syncNewsCirculationSweeper } from '../../workers/news-circulation.worker.js';
 // quality-sweeper worker removed in Phase 7; re-encoding is now driven by
 // the storage sweeper (when archive_action='re_encode').
 import { probeContentItem } from '../../services/quality.service.js';
@@ -341,6 +342,30 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
             }
         }
     );
+
+    /**
+     * Re-sync the scheduled News Circulation source-claim worker from CMS policy.
+     * POST /admin/circulation/resync-schedule
+     */
+    fastify.post('/admin/circulation/resync-schedule', { preHandler: verifyAdminAuth }, async (_request, reply) => {
+        try {
+            await syncNewsCirculationSweeper();
+            return reply.send({ success: true, message: 'News circulation schedule re-synced' });
+        } catch (error) {
+            logger.error('News circulation schedule resync failed', error);
+            return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
+        }
+    });
+
+    /**
+     * Manually claim due news sources now. POST /admin/circulation/sweep-now
+     */
+    fastify.post('/admin/circulation/sweep-now', { preHandler: verifyAdminAuth }, async (_request, reply) => {
+        const q = getQueue(QUEUE_NAMES.NEWS_CIRCULATION);
+        if (!q) return reply.status(503).send({ success: false, message: 'news circulation queue unavailable' });
+        const job = await q.add('manual-news-circulation', { trigger: 'manual', tenantId: 'default' } satisfies NewsCirculationJob, { priority: 1 });
+        return reply.send({ success: true, jobId: job.id ?? undefined, message: 'News circulation source claim queued' });
+    });
 
     /**
      * Manually sweep all enabled interests now (proxied from CMS). Runs even when

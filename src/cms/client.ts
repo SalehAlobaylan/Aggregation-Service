@@ -34,6 +34,9 @@ import type {
     WriteOpMetricsRequest,
     OpBudgetStatus,
     ListMissingEmbeddingResponse,
+    NewsCirculationPolicy,
+    ClaimCirculationSourcesResponse,
+    ReportSourceRunRequest,
 } from './types.js';
 
 // Circuit breaker for CMS calls
@@ -222,6 +225,27 @@ export const cmsClient = {
         data: Array<{ id: string; name: string; description?: string; keywords?: string[]; languages?: string[]; max_suggestions_per_run?: number }>;
     }> {
         return makeRequest('GET', '/discovery/profiles?enabled=true', undefined, requestId);
+    },
+
+    async getCirculationPolicy(tenantId = 'default', requestId?: string): Promise<NewsCirculationPolicy> {
+        return makeRequest('GET', `/circulation/policy?tenant_id=${encodeURIComponent(tenantId)}`, undefined, requestId);
+    },
+
+    async claimCirculationSources(
+        tenantId = 'default',
+        limit = 20,
+        requestId?: string
+    ): Promise<ClaimCirculationSourcesResponse> {
+        return makeProtectedRequest(
+            'POST',
+            `/circulation/claim-sources?tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}`,
+            {},
+            requestId
+        );
+    },
+
+    async reportSourceRun(data: ReportSourceRunRequest, requestId?: string): Promise<void> {
+        await makeProtectedRequest('POST', '/circulation/source-runs', data, requestId);
     },
 
     /**

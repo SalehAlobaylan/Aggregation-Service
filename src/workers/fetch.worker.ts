@@ -7,11 +7,13 @@ import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type FetchJob } from '../queues/index.js';
 import { fetchFromSource, type SourceConfig } from '../fetchers/index.js';
 import { getQueue } from '../queues/index.js';
+import { cmsClient } from '../cms/client.js';
 
 export const fetchWorker = createWorker({
     queueName: QUEUE_NAMES.FETCH,
     processor: async (job: Job<FetchJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, config, triggeredBy, triggeredAt } = job.data;
+        const startedAt = new Date();
         const sourceSettings = (config.settings as Record<string, unknown>) || {};
 
         const configuredMaxResults = getPositiveInteger(
@@ -40,7 +42,20 @@ export const fetchWorker = createWorker({
         };
 
         // Fetch content from source
-        const result = await fetchFromSource(sourceConfig, config.cursor as string | undefined);
+        let result: Awaited<ReturnType<typeof fetchFromSource>>;
+        try {
+            result = await fetchFromSource(sourceConfig, config.cursor as string | undefined);
+        } catch (error) {
+            await reportFetchRun(sourceId, job.id, triggeredBy, startedAt, 0, 1, {
+                sourceType,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        }
+        await reportFetchRun(sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
+            sourceType,
+            reason: result.metadata.reason,
+        });
 
         const remainingAllowed =
             typeof configuredMaxResults === 'number' && configuredMaxResults > 0
@@ -95,6 +110,7 @@ export const fetchWorker = createWorker({
                             fetchedAt: item.fetchedAt,
                         })),
                         fetchJobId: job.id,
+                        triggeredBy,
                         sourceSettings: sourceConfig.settings,
                     },
                     {
@@ -125,7 +141,7 @@ export const fetchWorker = createWorker({
                             cursor: result.cursor,
                             fetchedSoFar: totalFetchedSoFar,
                         },
-                        triggeredBy: 'schedule',
+                        triggeredBy,
                         triggeredAt: new Date().toISOString(),
                     },
                     {
@@ -160,4 +176,37 @@ function getPositiveInteger(...values: unknown[]): number | undefined {
         }
     }
     return undefined;
+}
+
+async function reportFetchRun(
+    sourceId: string,
+    jobId: string | undefined,
+    triggeredBy: 'schedule' | 'manual',
+    startedAt: Date,
+    fetched: number,
+    failed: number,
+    metadata: Record<string, unknown>
+): Promise<void> {
+    if (!jobId || !isUuid(sourceId)) return;
+    const finishedAt = new Date();
+    try {
+        await cmsClient.reportSourceRun({
+            tenant_id: 'default',
+            source_id: sourceId,
+            job_id: jobId,
+            triggered_by: triggeredBy,
+            fetched,
+            failed,
+            started_at: startedAt.toISOString(),
+            finished_at: finishedAt.toISOString(),
+            duration_ms: finishedAt.getTime() - startedAt.getTime(),
+            metadata,
+        }, jobId);
+    } catch {
+        // Telemetry must never fail ingestion.
+    }
+}
+
+function isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }

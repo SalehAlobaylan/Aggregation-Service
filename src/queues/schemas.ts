@@ -43,6 +43,7 @@ export interface NormalizeJob {
     sourceType: SourceType;
     rawItems: RawItem[];
     fetchJobId: string;
+    triggeredBy?: 'schedule' | 'manual';
     sourceSettings?: Record<string, unknown>;
 }
 
@@ -182,6 +183,12 @@ export interface SourceGraphJob {
     trigger: 'auto' | 'manual';
 }
 
+// News Circulation Job — claims due CMS news sources and enqueues fetch jobs.
+export interface NewsCirculationJob {
+    trigger: 'auto' | 'manual';
+    tenantId?: string;
+}
+
 /**
  * DLQ Job - failed job moved to dead letter queue
  */
@@ -206,6 +213,7 @@ export const QUEUE_NAMES = {
     DISCOVERY: 'discovery-queue',
     DISCOVERY_SWEEP: 'discovery-sweep-queue',
     SOURCE_GRAPH: 'source-graph-queue',
+    NEWS_CIRCULATION: 'news-circulation-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 

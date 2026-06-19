@@ -8,6 +8,7 @@ import { QUEUE_NAMES, type NormalizeJob } from '../queues/index.js';
 import { normalizeItem } from '../normalizers/index.js';
 import { dedupService } from '../services/dedup.service.js';
 import { upsertContentItem } from '../cms/upsert.js';
+import { cmsClient } from '../cms/client.js';
 import { getQueue } from '../queues/index.js';
 import type { RawFetchedItem } from '../fetchers/types.js';
 import type { NormalizedItem } from '../normalizers/types.js';
@@ -166,7 +167,7 @@ function evaluateModerationDecision(
 export const normalizeWorker = createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
-        const { sourceId, sourceType, rawItems, fetchJobId, sourceSettings } = job.data;
+        const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings } = job.data;
         const sourceFilters = parseSourceFilters(sourceSettings);
         const moderationConfig = parseModerationConfig(sourceSettings);
 
@@ -379,5 +380,46 @@ export const normalizeWorker = createWorker({
             mediaEnqueued,
             aiEnqueued,
         });
+        await reportNormalizeRun(sourceId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
+            sourceType,
+            moderationApproved,
+            moderationReview,
+            moderationRejected,
+            mediaEnqueued,
+            aiEnqueued,
+        });
     },
 });
+
+async function reportNormalizeRun(
+    sourceId: string,
+    fetchJobId: string,
+    triggeredBy: 'schedule' | 'manual',
+    accepted: number,
+    duplicates: number,
+    filtered: number,
+    failed: number,
+    metadata: Record<string, unknown>
+): Promise<void> {
+    if (!fetchJobId || !isUuid(sourceId)) return;
+    try {
+        await cmsClient.reportSourceRun({
+            tenant_id: 'default',
+            source_id: sourceId,
+            job_id: fetchJobId,
+            triggered_by: triggeredBy,
+            accepted,
+            duplicates,
+            filtered,
+            failed,
+            finished_at: new Date().toISOString(),
+            metadata,
+        }, fetchJobId);
+    } catch {
+        // Telemetry should never fail normalization.
+    }
+}
+
+function isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
