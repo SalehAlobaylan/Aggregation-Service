@@ -17,12 +17,15 @@ export const newsCirculationWorker = createWorker({
     queueName: QUEUE_NAMES.NEWS_CIRCULATION,
     processor: async (job: Job<NewsCirculationJob>, jobLogger): Promise<void> => {
         const tenantId = job.data.tenantId || 'default';
-        const claimed = await cmsClient.claimCirculationSources(tenantId, 20, job.id);
         const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
         if (!fetchQueue) {
             jobLogger.warn('News circulation skipped: fetch queue unavailable');
             return;
         }
+        const force = job.data.trigger === 'manual';
+        // Batch size is a policy knob owned by CMS (source_claim_batch_size); pass 0
+        // so CMS applies the configured batch instead of a hardcoded ceiling here.
+        const claimed = await cmsClient.claimCirculationSources(tenantId, 0, force, job.id);
 
         let enqueued = 0;
         for (const source of claimed.data ?? []) {

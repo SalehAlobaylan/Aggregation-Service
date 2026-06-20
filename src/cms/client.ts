@@ -234,11 +234,12 @@ export const cmsClient = {
     async claimCirculationSources(
         tenantId = 'default',
         limit = 20,
+        force = false,
         requestId?: string
     ): Promise<ClaimCirculationSourcesResponse> {
         return makeProtectedRequest(
             'POST',
-            `/circulation/claim-sources?tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}`,
+            `/circulation/claim-sources?tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}&force=${force ? 'true' : 'false'}`,
             {},
             requestId
         );

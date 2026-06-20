@@ -168,6 +168,7 @@ export const normalizeWorker = createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings } = job.data;
+        const tenantId = tenantFromSourceSettings(sourceSettings);
         const sourceFilters = parseSourceFilters(sourceSettings);
         const moderationConfig = parseModerationConfig(sourceSettings);
 
@@ -380,7 +381,7 @@ export const normalizeWorker = createWorker({
             mediaEnqueued,
             aiEnqueued,
         });
-        await reportNormalizeRun(sourceId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
+        await reportNormalizeRun(tenantId, sourceId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
             sourceType,
             moderationApproved,
             moderationReview,
@@ -391,7 +392,19 @@ export const normalizeWorker = createWorker({
     },
 });
 
+function tenantFromSourceSettings(settings?: Record<string, unknown>): string {
+    const circulation = settings?.circulation;
+    if (circulation && typeof circulation === 'object' && !Array.isArray(circulation)) {
+        const tenantId = (circulation as { tenantId?: unknown }).tenantId;
+        if (typeof tenantId === 'string' && tenantId.trim()) {
+            return tenantId.trim();
+        }
+    }
+    return 'default';
+}
+
 async function reportNormalizeRun(
+    tenantId: string,
     sourceId: string,
     fetchJobId: string,
     triggeredBy: 'schedule' | 'manual',
@@ -404,7 +417,7 @@ async function reportNormalizeRun(
     if (!fetchJobId || !isUuid(sourceId)) return;
     try {
         await cmsClient.reportSourceRun({
-            tenant_id: 'default',
+            tenant_id: tenantId,
             source_id: sourceId,
             job_id: fetchJobId,
             triggered_by: triggeredBy,

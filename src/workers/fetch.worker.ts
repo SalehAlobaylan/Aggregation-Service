@@ -15,6 +15,7 @@ export const fetchWorker = createWorker({
         const { sourceId, sourceType, config, triggeredBy, triggeredAt } = job.data;
         const startedAt = new Date();
         const sourceSettings = (config.settings as Record<string, unknown>) || {};
+        const tenantId = tenantFromSourceSettings(sourceSettings);
 
         const configuredMaxResults = getPositiveInteger(
             sourceSettings.max_results,
@@ -46,13 +47,13 @@ export const fetchWorker = createWorker({
         try {
             result = await fetchFromSource(sourceConfig, config.cursor as string | undefined);
         } catch (error) {
-            await reportFetchRun(sourceId, job.id, triggeredBy, startedAt, 0, 1, {
+            await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, 0, 1, {
                 sourceType,
                 error: error instanceof Error ? error.message : String(error),
             });
             throw error;
         }
-        await reportFetchRun(sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
+        await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
             sourceType,
             reason: result.metadata.reason,
         });
@@ -178,7 +179,19 @@ function getPositiveInteger(...values: unknown[]): number | undefined {
     return undefined;
 }
 
+function tenantFromSourceSettings(settings: Record<string, unknown>): string {
+    const circulation = settings.circulation;
+    if (circulation && typeof circulation === 'object' && !Array.isArray(circulation)) {
+        const tenantId = (circulation as { tenantId?: unknown }).tenantId;
+        if (typeof tenantId === 'string' && tenantId.trim()) {
+            return tenantId.trim();
+        }
+    }
+    return 'default';
+}
+
 async function reportFetchRun(
+    tenantId: string,
     sourceId: string,
     jobId: string | undefined,
     triggeredBy: 'schedule' | 'manual',
@@ -191,7 +204,7 @@ async function reportFetchRun(
     const finishedAt = new Date();
     try {
         await cmsClient.reportSourceRun({
-            tenant_id: 'default',
+            tenant_id: tenantId,
             source_id: sourceId,
             job_id: jobId,
             triggered_by: triggeredBy,
