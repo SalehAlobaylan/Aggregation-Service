@@ -14,6 +14,7 @@ export interface ScrapedArticle {
     byline?: string;        // Author if detected
     siteName?: string;
     length: number;         // Content length in chars
+    image?: string;         // og:image / twitter:image (absolute URL) if present
 }
 
 /**
@@ -87,6 +88,24 @@ export function parseArticleHtml(html: string, url: string): ScrapedArticle | nu
         const content = cleanText(article.textContent);
         const excerpt = content.substring(0, 200).trim() + (content.length > 200 ? '...' : '');
 
+        // Lead image: og:image (then twitter:image) — the article's own hero,
+        // resolved to an absolute URL so the CMS can serve it directly.
+        const pickMeta = (selector: string): string | undefined => {
+            const el = dom.window.document.querySelector(selector);
+            const val = el?.getAttribute('content')?.trim();
+            if (!val) return undefined;
+            try {
+                return new URL(val, url).href;
+            } catch {
+                return undefined;
+            }
+        };
+        const image =
+            pickMeta('meta[property="og:image"]') ||
+            pickMeta('meta[name="og:image"]') ||
+            pickMeta('meta[name="twitter:image"]') ||
+            pickMeta('meta[property="twitter:image"]');
+
         return {
             title: article.title || '',
             content,
@@ -94,6 +113,7 @@ export function parseArticleHtml(html: string, url: string): ScrapedArticle | nu
             byline: article.byline || undefined,
             siteName: article.siteName || undefined,
             length: content.length,
+            image,
         };
     } catch (error) {
         logger.error('HTML parsing error', error, { url });

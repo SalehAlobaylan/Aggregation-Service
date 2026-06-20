@@ -14,7 +14,52 @@ const parser = new Parser({
         'User-Agent': 'WahbBot/1.0 (Content Aggregation Service)',
         'Accept': 'application/rss+xml, application/xml, text/xml, */*',
     },
+    // rss-parser surfaces <enclosure> by default but NOT the Media RSS
+    // namespace, which is where most news feeds (CNN, etc.) put their images.
+    customFields: {
+        item: [
+            ['media:content', 'mediaContent', { keepArray: true }],
+            ['media:thumbnail', 'mediaThumbnail', { keepArray: true }],
+        ],
+    },
 });
+
+// Attribute bag rss-parser builds for a Media RSS node, e.g.
+// { $: { url, medium, type, width, height } }.
+interface MediaNode {
+    $?: { url?: string; medium?: string; type?: string };
+}
+
+/**
+ * Pick a post image from an RSS entry. Priority: Media RSS <media:content>
+ * (image) → <media:thumbnail> → an image <enclosure>. Returns undefined when the
+ * entry carries no usable image (caller then falls back to the scraped og:image).
+ */
+function extractRssImage(entry: Record<string, unknown>): string | undefined {
+    const isImage = (n?: MediaNode): boolean => {
+        const a = n?.$;
+        if (!a?.url) return false;
+        if (a.medium === 'image') return true;
+        if (a.type?.startsWith('image/')) return true;
+        // No type hint → accept by extension.
+        return /\.(jpe?g|png|webp|gif|avif)(\?|$)/i.test(a.url);
+    };
+    const firstUrl = (nodes: unknown): string | undefined => {
+        const arr = Array.isArray(nodes) ? (nodes as MediaNode[]) : nodes ? [nodes as MediaNode] : [];
+        return arr.find(isImage)?.$?.url;
+    };
+
+    const fromContent = firstUrl(entry.mediaContent);
+    if (fromContent) return fromContent;
+    const fromThumb = firstUrl(entry.mediaThumbnail);
+    if (fromThumb) return fromThumb;
+
+    const enc = entry.enclosure as { url?: string; type?: string } | undefined;
+    if (enc?.url && (enc.type?.startsWith('image/') || /\.(jpe?g|png|webp|gif|avif)(\?|$)/i.test(enc.url))) {
+        return enc.url;
+    }
+    return undefined;
+}
 
 export const rssFetcher: Fetcher = {
     sourceType: 'RSS',
@@ -58,6 +103,13 @@ export const rssFetcher: Fetcher = {
                         excerpt = scraped.excerpt;
                     }
 
+                    // Image priority: the feed's own Media RSS / enclosure image,
+                    // else the article's og:image from the scrape.
+                    const thumbnailUrl =
+                        extractRssImage(entry as unknown as Record<string, unknown>) ||
+                        scraped?.image ||
+                        undefined;
+
                     const item: RawFetchedItem = {
                         externalId: entry.guid || entry.link,
                         sourceType: 'RSS',
@@ -65,7 +117,8 @@ export const rssFetcher: Fetcher = {
                         title: entry.title || 'Untitled',
                         content,
                         excerpt: excerpt.substring(0, 500),
-                        author: entry.creator || entry.author || undefined,
+                        author: entry.creator || (entry as { author?: string }).author || undefined,
+                        thumbnailUrl,
                         publishedAt: entry.isoDate || entry.pubDate || undefined,
                         metadata: {
                             feedTitle: feed.title,
