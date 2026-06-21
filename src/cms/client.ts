@@ -190,6 +190,7 @@ export const cmsClient = {
         intelligence_enabled: boolean;
         telegram_discovery_enabled: boolean;
         twitter_discovery_enabled: boolean;
+        twitter_recommend_enabled: boolean;
         graph_build_interval_hours: number;
     }> {
         return makeRequest('GET', '/discovery/config', undefined, requestId);

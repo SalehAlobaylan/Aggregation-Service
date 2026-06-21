@@ -191,6 +191,7 @@ export interface TwitterProfileInfo {
     name: string | null;
     followers: number;
     verified: boolean;
+    image_url: string | null;
     posts: TwitterPostInfo[];
     retweeted: string[];
     quoted: string[];
@@ -225,4 +226,59 @@ export async function fetchTwitterProfile(
     }
 
     return (await response.json()) as TwitterProfileInfo;
+}
+
+export interface TwitterRecAccount {
+    username: string;
+    name: string | null;
+    followers: number;
+    friends: number;
+    statuses: number;
+    listed: number;
+    verified: boolean;
+    is_protected: boolean;
+    description: string;
+    url: string | null;
+    image_url: string | null;
+    created_at: string | null;
+    user_id: string | null;
+}
+
+export interface TwitterRecommendationsResult {
+    seed: string;
+    exists: boolean;
+    rate_limited?: boolean;
+    recommendations: TwitterRecAccount[];
+}
+
+/**
+ * Fetch X's "who to follow" / قد يعجبك recommendations for a seed account via
+ * Enrichment (guest-accessible REST — no login, no account-ban risk). Seed-
+ * relative: feeding a trusted source returns accounts X considers similar, the
+ * Source Intelligence relatedness signal. Each recommendation carries inline
+ * validation fields (followers/desc/statuses) — no profile re-fetch needed.
+ */
+export async function fetchTwitterRecommendations(
+    seed: string,
+    opts: { limit?: number; requestId?: string } = {},
+): Promise<TwitterRecommendationsResult> {
+    const response = await fetch(`${baseUrl()}/v1/extract/twitter/recommendations`, {
+        method: 'POST',
+        body: JSON.stringify({ seed, limit: opts.limit ?? 40 }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(opts.requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/twitter/recommendations failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+
+    return (await response.json()) as TwitterRecommendationsResult;
 }

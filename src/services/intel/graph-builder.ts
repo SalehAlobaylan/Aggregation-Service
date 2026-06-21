@@ -15,7 +15,12 @@ import { validateFeed } from '../discovery/validator.js';
 import { extractOutboundHosts } from './link-extractor.js';
 import { personalizedPageRank, type GraphEdge } from './pagerank.js';
 import { buildTelegramGraph } from './telegram-graph.js';
-import { buildTwitterGraph } from './twitter-graph.js';
+import {
+    buildTwitterGraph,
+    buildTwitterRecommendations,
+    mergeTwitterCandidates,
+    type TwitterCandidate,
+} from './twitter-graph.js';
 
 const MAX_SOURCES_TO_CRAWL = 8;
 const MAX_CANDIDATES_TO_RESOLVE = 20;
@@ -51,7 +56,11 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
 
     // Telegram contributor — extends the citation graph to channels (gated).
     // Forwarded-from + t.me mentions are the Telegram analog of the link-graph.
-    let cfg: { telegram_discovery_enabled?: boolean; twitter_discovery_enabled?: boolean } = {};
+    let cfg: {
+        telegram_discovery_enabled?: boolean;
+        twitter_discovery_enabled?: boolean;
+        twitter_recommend_enabled?: boolean;
+    } = {};
     try {
         cfg = await cmsClient.getDiscoveryConfig();
     } catch {
@@ -75,17 +84,31 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
         }
     }
 
-    // Twitter/X contributor — retweet/quote/mention is the X analog of the link-graph.
-    if (cfg.twitter_discovery_enabled) {
+    // Twitter/X contributors — interaction graph (retweet/quote/mention) +
+    // recommendations ("who to follow" / قد يعجبك). Both seed off your approved
+    // handles. Candidates MERGE by handle before posting (CMS upserts on handle;
+    // a duplicate handle in one batch would error the ON CONFLICT insert).
+    if (cfg.twitter_discovery_enabled || cfg.twitter_recommend_enabled) {
         try {
             const xHandles = await cmsClient
                 .getApprovedTwitterHandles()
                 .catch(() => ({ data: [] as { username: string }[] }));
             const seedHandles = (xHandles.data ?? []).map((c) => c.username).filter(Boolean);
-            const x = await buildTwitterGraph(seedHandles, recencyDays);
-            xCandidates = x.candidates;
-            for (const e of x.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
             for (const u of seedHandles) pagerankSeeds.push(`x:${u.replace(/^@/, '').toLowerCase()}`);
+
+            let interaction: TwitterCandidate[] = [];
+            let recommend: TwitterCandidate[] = [];
+            if (cfg.twitter_discovery_enabled) {
+                const x = await buildTwitterGraph(seedHandles, recencyDays);
+                interaction = x.candidates;
+                for (const e of x.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
+            }
+            if (cfg.twitter_recommend_enabled) {
+                const r = await buildTwitterRecommendations(seedHandles);
+                recommend = r.candidates;
+                for (const e of r.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
+            }
+            xCandidates = mergeTwitterCandidates(interaction, recommend);
         } catch (err) {
             logger.warn('Twitter discovery failed', { error: (err as Error).message });
         }
