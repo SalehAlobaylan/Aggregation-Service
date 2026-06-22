@@ -192,6 +192,7 @@ export interface TwitterProfileInfo {
     followers: number;
     verified: boolean;
     image_url: string | null;
+    description: string;
     posts: TwitterPostInfo[];
     retweeted: string[];
     quoted: string[];

@@ -19,7 +19,7 @@ export interface TelegramCandidate {
     via: 'telegram-forward' | 'telegram-mention';
     cocitation: number;
     sampleTitles: { title: string }[];
-    feedHealth: { items_count: number; last_item_at: string | null; subscribers: number };
+    feedHealth: { items_count: number; last_item_at: string | null; subscribers: number; bio?: string };
 }
 
 export interface TelegramGraphResult {
@@ -116,6 +116,7 @@ export async function buildTelegramGraph(
                     items_count: texts.length,
                     last_item_at: latest ? new Date(latest).toISOString() : null,
                     subscribers: info.subscribers || 0,
+                    bio: info.title || undefined,
                 },
             });
         } catch (err) {

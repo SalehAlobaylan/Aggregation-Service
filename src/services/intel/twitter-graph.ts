@@ -23,7 +23,7 @@ export interface TwitterCandidate {
     via: 'x-retweet' | 'x-quote' | 'x-mention' | 'x-recommend';
     cocitation: number;
     sampleTitles: { title: string }[];
-    feedHealth: { items_count: number; last_item_at: string | null; subscribers: number; listed?: number; image?: string };
+    feedHealth: { items_count: number; last_item_at: string | null; subscribers: number; listed?: number; image?: string; bio?: string; url?: string };
 }
 
 // Strongest → weakest provenance, so a stronger edge type wins the displayed
@@ -131,6 +131,7 @@ export async function buildTwitterGraph(
                     last_item_at: latest ? new Date(latest).toISOString() : null,
                     subscribers: info.followers || 0,
                     image: info.image_url ?? undefined,
+                    bio: info.description || undefined,
                 },
             });
         } catch (err) {
@@ -165,7 +166,7 @@ const MIN_REC_LISTED = 20;
  */
 export async function buildTwitterRecommendations(seeds: string[]): Promise<TwitterGraphResult> {
     const edges: { from: string; to: string; weight: number }[] = [];
-    const cands = new Map<string, { citedBy: Set<string>; name: string | null; followers: number; statuses: number; listed: number; description: string; isProtected: boolean; image: string | null }>();
+    const cands = new Map<string, { citedBy: Set<string>; name: string | null; followers: number; statuses: number; listed: number; description: string; isProtected: boolean; image: string | null; url: string | null }>();
 
     const seedList = [...new Set([...seeds, ...ARABIC_NEWS_X_HUBS].map(uname))].slice(0, MAX_REC_SEEDS);
     const seedSet = new Set(seedList);
@@ -187,6 +188,7 @@ export async function buildTwitterRecommendations(seeds: string[]): Promise<Twit
                     description: acc.description,
                     isProtected: acc.is_protected,
                     image: acc.image_url,
+                    url: acc.url,
                 };
                 c.citedBy.add(seed);
                 cands.set(h, c);
@@ -214,7 +216,7 @@ export async function buildTwitterRecommendations(seeds: string[]): Promise<Twit
                 .map((t) => ({ title: t.slice(0, 300) })),
             // listed_count is X's own list-membership authority — a strong, free
             // newsworthiness proxy (major outlets sit in thousands of user lists).
-            feedHealth: { items_count: meta.statuses, last_item_at: null, subscribers: meta.followers, listed: meta.listed, image: meta.image ?? undefined },
+            feedHealth: { items_count: meta.statuses, last_item_at: null, subscribers: meta.followers, listed: meta.listed, image: meta.image ?? undefined, bio: meta.description || undefined, url: meta.url ?? undefined },
         });
     }
 
