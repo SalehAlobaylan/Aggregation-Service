@@ -3,7 +3,15 @@
  * content into the same normalize → media → AI pipeline as ingested content.
  */
 import type { FastifyInstance } from 'fastify';
-import { getQueue, QUEUE_NAMES, type MediaJob, type ContentType } from '../../queues/index.js';
+import {
+    getQueue,
+    QUEUE_NAMES,
+    type ContentType,
+    type DiscoverySweepJob,
+    type MediaJob,
+    type NewsCirculationJob,
+    type SourceGraphJob,
+} from '../../queues/index.js';
 import { uploadBuffer, getStorageKey } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
@@ -13,6 +21,15 @@ interface UserContentResponse {
     contentItemId?: string;
     jobId?: string;
     message?: string;
+}
+
+interface InternalQueueStats {
+    queue: string;
+    waiting: number;
+    active: number;
+    completed: number;
+    failed: number;
+    delayed: number;
 }
 
 function extensionFromMime(mime: string | undefined, filename: string | undefined): string {
@@ -35,6 +52,65 @@ function extensionFromMime(mime: string | undefined, filename: string | undefine
 
 export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
     fastify.addHook('onRequest', verifyInternalServiceAuth);
+
+    fastify.get<{ Reply: { data: InternalQueueStats[] } }>('/internal/queues', async (_request, reply) => {
+        const data: InternalQueueStats[] = [];
+        for (const queueName of Object.values(QUEUE_NAMES)) {
+            const queue = getQueue(queueName);
+            if (!queue) continue;
+            const counts = await queue.getJobCounts();
+            data.push({
+                queue: queueName,
+                waiting: counts.waiting || 0,
+                active: counts.active || 0,
+                completed: counts.completed || 0,
+                failed: counts.failed || 0,
+                delayed: counts.delayed || 0,
+            });
+        }
+        return reply.send({ data });
+    });
+
+    fastify.post<{ Body: { tenant_id?: string }; Reply: { success: boolean; jobId?: string; message?: string } }>(
+        '/internal/circulation/sweep-now',
+        async (request, reply) => {
+            const queue = getQueue(QUEUE_NAMES.NEWS_CIRCULATION);
+            if (!queue) {
+                return reply.status(503).send({ success: false, message: 'news circulation queue unavailable' });
+            }
+            const tenantId = request.body?.tenant_id || 'default';
+            const job = await queue.add(
+                'internal-news-circulation',
+                { trigger: 'manual', tenantId } satisfies NewsCirculationJob,
+                { priority: 1 }
+            );
+            return reply.send({ success: true, jobId: job.id ?? undefined, message: 'News circulation source claim queued' });
+        }
+    );
+
+    fastify.post<{ Reply: { success: boolean; jobId?: string; message?: string } }>(
+        '/internal/discovery/sweep-now',
+        async (_request, reply) => {
+            const queue = getQueue(QUEUE_NAMES.DISCOVERY_SWEEP);
+            if (!queue) {
+                return reply.status(503).send({ success: false, message: 'discovery sweep queue unavailable' });
+            }
+            const job = await queue.add('internal-discovery-sweep', { trigger: 'manual' } satisfies DiscoverySweepJob, { priority: 1 });
+            return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Discovery sweep queued' });
+        }
+    );
+
+    fastify.post<{ Reply: { success: boolean; jobId?: string; message?: string } }>(
+        '/internal/discovery/build-graph-now',
+        async (_request, reply) => {
+            const queue = getQueue(QUEUE_NAMES.SOURCE_GRAPH);
+            if (!queue) {
+                return reply.status(503).send({ success: false, message: 'source graph queue unavailable' });
+            }
+            const job = await queue.add('internal-source-graph', { trigger: 'manual' } satisfies SourceGraphJob, { priority: 1 });
+            return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Source graph build queued' });
+        }
+    );
 
     /**
      * POST /internal/jobs/user-content
