@@ -2,13 +2,18 @@
  * Shared routing for re-enqueued content items (retry scripts + admin retry
  * endpoints). The normal ingest path (normalize.worker) already routes by
  * content shape; the retry paths historically did NOT, and blindly pushed every
- * item onto the media queue — so Telegram TEXT posts (which have no media and
- * no downloadRef) hit the media worker and failed with
- * "Missing Telegram downloadRef for media job", looping into the DLQ.
+ * item onto the media queue. Two failure modes resulted:
+ *   - Telegram TEXT posts (no media, no downloadRef) hit the media worker and
+ *     failed with "Missing Telegram downloadRef for media job".
+ *   - NEWS items (RSS/TWITTER/WEBSITE text) were downloaded as media: the media
+ *     worker fetched the article/tweet *page* URL, which either 403'd or saved an
+ *     HTML body as .mp4, then failed ffprobe with "moov atom not found".
  *
- * This helper centralizes the decision so all retry sites agree:
- *   - Telegram text post  → AI queue, embedding-only (no media to download)
- *   - everything else     → media queue (download/transcode/thumbnail; photo = download-only)
+ * This helper mirrors the normal-path guard (normalize.worker.ts) so all retry
+ * sites agree. Only genuine A/V needs the media-download pipeline:
+ *   - VIDEO / PODCAST                 → media queue (download/transcode/thumbnail)
+ *   - Telegram photo                  → media queue (download-only)
+ *   - everything else (NEWS/text)     → AI queue, embedding-only (no media to download)
  */
 import type { Queue } from 'bullmq';
 import type { AIJob, MediaJob } from './schemas.js';
@@ -33,9 +38,17 @@ export async function enqueueRetryJob(
 ): Promise<RetryRoute> {
     const meta = (item.metadata ?? {}) as Record<string, unknown>;
     const mediaKind = meta.mediaKind as string | undefined;
+    const isPhoto = item.source === 'TELEGRAM' && mediaKind === 'photo';
 
-    // Telegram text post — no media; route to embedding, never the media queue.
-    if (item.source === 'TELEGRAM' && mediaKind === 'text') {
+    // Only genuine A/V needs the media-download pipeline. Mirror the normal-path
+    // guard in normalize.worker.ts: VIDEO / PODCAST / Telegram-photo download;
+    // everything else (NEWS/text from RSS/TWITTER/WEBSITE, Telegram text) is
+    // text-only and goes to embedding — downloading its page URL would 403 or
+    // save HTML that later fails ffprobe.
+    const requiresMediaJob =
+        item.type === 'VIDEO' || item.type === 'PODCAST' || isPhoto;
+
+    if (!requiresMediaJob) {
         if (!queues.ai) return 'skipped';
         await queues.ai.add(
             `${opts.namePrefix}-embed-${item.source}-${item.id}`,
@@ -56,7 +69,6 @@ export async function enqueueRetryJob(
     }
 
     const downloadRef = meta.telegramDownloadRef as MediaJob['downloadRef'] | undefined;
-    const isPhoto = item.source === 'TELEGRAM' && mediaKind === 'photo';
     await queues.media.add(
         `${opts.namePrefix}-${item.source}-${item.id}`,
         {

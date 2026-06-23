@@ -5,11 +5,15 @@
  *   audio / voice / video / photo → For You feed (PODCAST / VIDEO / ARTICLE)
  *   text                          → News feed (ARTICLE)
  */
-import { Api, TelegramClient } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
+import { Api } from 'telegram';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 import { rateLimiter } from '../services/rate-limiter.js';
+import {
+    classifyTelegramError,
+    createTelegramClient,
+    disconnectTelegramClient,
+} from '../services/telegram-client.js';
 import type {
     Fetcher,
     FetchResult,
@@ -59,12 +63,7 @@ export const telegramFetcher: Fetcher = {
             };
         }
 
-        const client = new TelegramClient(
-            new StringSession(config.telegramSessionString),
-            config.telegramApiId,
-            config.telegramApiHash,
-            { connectionRetries: 3 }
-        );
+        const client = createTelegramClient();
 
         const items: RawFetchedItem[] = [];
         let skipped = 0;
@@ -87,7 +86,7 @@ export const telegramFetcher: Fetcher = {
             for await (const message of client.iterMessages(entity, {
                 limit: settings.maxResults,
                 offsetId,
-            })) {
+            }) as AsyncIterable<Api.Message>) {
                 try {
                     if (!message?.id) {
                         skipped++;
@@ -220,13 +219,30 @@ export const telegramFetcher: Fetcher = {
                 },
             };
         } catch (error) {
+            const details = classifyTelegramError(error);
+            if (details.transient) {
+                logger.warn('Telegram fetch skipped after transient failure', {
+                    sourceId: configInput.id,
+                    channelUsername: settings.channelUsername,
+                    code: details.code,
+                    error: details.message,
+                });
+                return {
+                    items: [],
+                    hasMore: false,
+                    metadata: { totalFetched: 0, skipped, errors: errors + 1 },
+                };
+            }
             logger.error('Failed to fetch Telegram channel', error, {
                 sourceId: configInput.id,
                 channelUsername: settings.channelUsername,
             });
             throw error;
         } finally {
-            await client.disconnect();
+            await disconnectTelegramClient(client, {
+                sourceId: configInput.id,
+                channelUsername: settings.channelUsername,
+            });
         }
     },
 };
@@ -375,6 +391,7 @@ export const telegramFetcherTestUtils = {
     parseTelegramSettings,
     extractTelegramContent,
     extractTitleAndBody,
+    classifyTelegramError,
 };
 
 /**

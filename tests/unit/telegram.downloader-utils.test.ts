@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { downloaderTestUtils } from '../../src/media/downloader.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { downloaderTestUtils, downloadHttp } from '../../src/media/downloader.js';
 
 describe('downloaderTestUtils', () => {
     it('normalizes Telegram channel references consistently', () => {
@@ -46,5 +46,26 @@ describe('downloaderTestUtils', () => {
                 fileName: 'photo.png',
             })
         ).toBe('png');
+    });
+});
+
+describe('downloadHttp content-type guard', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it('rejects an HTML response before writing a garbage media file', async () => {
+        const fetchMock = vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+            body: {},
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(
+            downloadHttp('https://sa.investing.com/news/article-93CH-3283147', 'c1', 'mp4')
+        ).rejects.toThrow(/non-media content-type/);
     });
 });

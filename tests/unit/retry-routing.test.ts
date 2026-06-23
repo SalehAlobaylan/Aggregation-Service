@@ -40,6 +40,62 @@ describe('enqueueRetryJob', () => {
         expect(data.textContent.bodyText).toBe('B');
     });
 
+    it('routes NEWS (RSS article) to the AI queue, never media download', async () => {
+        const q = mkQueues();
+        const item: RetryItem = {
+            id: 'c1',
+            original_url: 'https://sa.investing.com/news/article-93CH-3283147',
+            type: 'NEWS',
+            source: 'RSS',
+            title: 'Headline',
+            body_text: 'Body',
+            metadata: {},
+        };
+        const route = await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-pending',
+            priority: 3,
+        });
+        expect(route).toBe('ai');
+        expect(q.media.add).not.toHaveBeenCalled();
+        expect(q.ai.add).toHaveBeenCalledOnce();
+        expect(q.ai.add.mock.calls[0][1].operations).toEqual(['embedding']);
+    });
+
+    it('routes NEWS (TWITTER) to the AI queue, never media download', async () => {
+        const q = mkQueues();
+        const item: RetryItem = {
+            id: 'c1',
+            original_url: 'https://x.com/mojksa/status/2069406146750750830',
+            type: 'NEWS',
+            source: 'TWITTER',
+            metadata: {},
+        };
+        const route = await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-pending',
+            priority: 3,
+        });
+        expect(route).toBe('ai');
+        expect(q.media.add).not.toHaveBeenCalled();
+        expect(q.ai.add).toHaveBeenCalledOnce();
+    });
+
+    it('skips text items when no AI queue is available', async () => {
+        const q = { media: { add: vi.fn().mockResolvedValue(undefined) } };
+        const item: RetryItem = {
+            id: 'c1',
+            original_url: 'https://sa.investing.com/news/x',
+            type: 'NEWS',
+            source: 'RSS',
+            metadata: {},
+        };
+        const route = await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-pending',
+            priority: 3,
+        });
+        expect(route).toBe('skipped');
+        expect(q.media.add).not.toHaveBeenCalled();
+    });
+
     it('routes Telegram photo posts to the media queue (download-only)', async () => {
         const q = mkQueues();
         const item: RetryItem = {

@@ -7,10 +7,13 @@ import { createWriteStream } from 'fs';
 import { mkdir, unlink, stat, writeFile } from 'fs/promises';
 import { join, basename } from 'path';
 import { pipeline } from 'stream/promises';
-import { TelegramClient } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
+import {
+    createTelegramClient,
+    disconnectTelegramClient,
+    wrapTelegramMediaDownloadError,
+} from '../services/telegram-client.js';
 import {
     extractCaptionsAndChapters,
     type ExtractedCaptions,
@@ -295,6 +298,21 @@ export async function downloadHttp(
         throw new Error(`HTTP download failed: ${response.status} ${response.statusText}`);
     }
 
+    // Defense-in-depth: reject clearly-textual responses before saving. A 200 HTML
+    // page (e.g. an article/tweet URL mistakenly enqueued as media) would otherwise
+    // be written as .mp4 and fail ffprobe later with a cryptic "moov atom not found".
+    // Stay permissive — allow audio/video, octet-stream, and missing/unknown types
+    // (some CDNs mislabel mp3s); only reject obviously non-media content types.
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (
+        contentType.startsWith('text/') ||
+        contentType.includes('html') ||
+        contentType.includes('json') ||
+        contentType.includes('xml')
+    ) {
+        throw new Error(`HTTP download returned non-media content-type: ${contentType}`);
+    }
+
     const fileStream = createWriteStream(outputPath);
 
     // @ts-expect-error - Node.js fetch body is a ReadableStream
@@ -344,12 +362,7 @@ export async function downloadTelegram(
         mediaKind: downloadRef.mediaKind,
     });
 
-    const client = new TelegramClient(
-        new StringSession(config.telegramSessionString),
-        config.telegramApiId,
-        config.telegramApiHash,
-        { connectionRetries: 3 }
-    );
+    const client = createTelegramClient();
 
     try {
         await client.connect();
@@ -396,8 +409,14 @@ export async function downloadTelegram(
             filePath: outputPath,
             format: extension,
         };
+    } catch (error) {
+        throw wrapTelegramMediaDownloadError(error);
     } finally {
-        await client.disconnect();
+        await disconnectTelegramClient(client, {
+            contentItemId,
+            channel: normalizedChannel,
+            messageId: downloadRef.messageId,
+        });
     }
 }
 
