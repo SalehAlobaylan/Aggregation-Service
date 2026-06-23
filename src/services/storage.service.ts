@@ -159,7 +159,18 @@ export async function runSweepForTenant(
                         trigger: trigger === 'manual' ? 'manual' : 'rule',
                     };
                     try {
+                        const jobId = `reencode:${tenantId}:${candidate.id}:${targetId}`;
+                        const existing = await queue.getJob(jobId);
+                        if (existing) {
+                            logger.info('storage.sweep: re-encode already queued; skipping duplicate', {
+                                contentId: candidate.id,
+                                jobId,
+                                state: await existing.getState().catch(() => 'unknown'),
+                            });
+                            continue;
+                        }
                         await queue.add('reencode', payload, {
+                            jobId,
                             // Storage-driven re-encodes are lower priority than
                             // direct admin actions so they queue behind manual work.
                             priority: trigger === 'manual' ? 0 : 5,

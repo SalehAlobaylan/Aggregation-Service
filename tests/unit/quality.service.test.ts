@@ -44,6 +44,7 @@ import {
     toEncodeProfile,
     versionedKey,
     keyFromUrl,
+    sourceKeyCandidates,
 } from '../../src/services/quality.service.js';
 import { DEFAULT_ENCODE_PROFILE } from '../../src/media/transcoder.js';
 
@@ -134,6 +135,26 @@ describe('keyFromUrl', () => {
         expect(keyFromUrl(null)).toBeNull();
         expect(keyFromUrl(undefined)).toBeNull();
         expect(keyFromUrl('')).toBeNull();
+    });
+});
+
+describe('sourceKeyCandidates', () => {
+    const id = 'cccccccc-dddd-eeee-ffff-111111111111';
+
+    it('tries the live media URL first, then current-to-legacy processed keys', () => {
+        const live = `http://primary.example.com/wahb-media/content/${id}/processed.v4.mp4`;
+        expect(sourceKeyCandidates(id, live, 4)).toEqual([
+            `content/${id}/processed.v4.mp4`,
+            `content/${id}/processed.v3.mp4`,
+            `content/${id}/processed.v2.mp4`,
+            `content/${id}/processed.mp4`,
+        ]);
+    });
+
+    it('falls back to legacy processed.mp4 when the URL cannot be reversed', () => {
+        expect(sourceKeyCandidates(id, 'https://cdn.example.com/media.mp4', 1)).toEqual([
+            `content/${id}/processed.mp4`,
+        ]);
     });
 });
 

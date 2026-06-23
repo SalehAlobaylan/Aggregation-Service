@@ -116,6 +116,21 @@ export function getPublicUrl(key: string, tier: StorageTier = 'primary'): string
     return `${publicUrl.replace(/\/$/, '')}/${key}`;
 }
 
+function isMissingObjectError(error: unknown): boolean {
+    const err = error as {
+        name?: string;
+        code?: string;
+        $metadata?: { httpStatusCode?: number };
+    };
+    return (
+        err?.$metadata?.httpStatusCode === 404 ||
+        err?.name === 'NotFound' ||
+        err?.name === 'NoSuchKey' ||
+        err?.code === 'NotFound' ||
+        err?.code === 'NoSuchKey'
+    );
+}
+
 /**
  * Check if an object exists in storage
  */
@@ -130,7 +145,7 @@ export async function objectExists(key: string, tier: StorageTier = 'primary'): 
         );
         return true;
     } catch (error) {
-        if ((error as { name?: string }).name === 'NotFound') {
+        if (isMissingObjectError(error)) {
             return false;
         }
         throw error;

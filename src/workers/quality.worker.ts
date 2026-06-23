@@ -63,6 +63,15 @@ export const qualityWorker = createWorker({
         });
 
         if (!result.success) {
+            if (result.nonRetryable) {
+                jobLogger.warn('Quality re-encode skipped without retry', {
+                    contentItemId: data.contentItemId,
+                    error: result.error,
+                    skippedMissingSource: result.skippedMissingSource,
+                    sourceCandidates: result.sourceCandidates,
+                });
+                return;
+            }
             // Bubble up so BullMQ retries (subject to attempts).
             throw new Error(result.error ?? 'unknown re-encode failure');
         }

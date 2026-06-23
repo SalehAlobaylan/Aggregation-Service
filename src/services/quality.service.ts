@@ -15,8 +15,10 @@ import type { QualityProfile } from '../cms/types.js';
 import {
     deleteObjectsByKeys,
     getObjectStream,
+    listContentObjects,
     getStorageKey,
     getPublicUrl,
+    objectExists,
     type StorageTier,
 } from '../storage/client.js';
 import { uploadFile } from '../storage/client.js';
@@ -58,13 +60,13 @@ async function downloadToTemp(
     contentItemId: string,
     sourceKey: string,
     tier: StorageTier
-): Promise<{ path: string; size: number }> {
+): Promise<{ path: string; size: number; contentType?: string }> {
     await ensureTempDir();
     const tempPath = join(config.mediaTempDir, `qre-${contentItemId}.in.mp4`);
     const src = await getObjectStream(sourceKey, tier);
     await pipeline(src.body, createWriteStream(tempPath));
     const st = await stat(tempPath);
-    return { path: tempPath, size: st.size };
+    return { path: tempPath, size: st.size, contentType: src.contentType };
 }
 
 export interface ReencodeResult {
@@ -82,6 +84,12 @@ export interface ReencodeResult {
     error?: string;
     /** True when the item was already at the target profile and ffmpeg was skipped. */
     skippedIdempotent?: boolean;
+    /** True when retrying would repeat the same deterministic failure. */
+    nonRetryable?: boolean;
+    /** True when CMS points at media that no longer exists in object storage. */
+    skippedMissingSource?: boolean;
+    /** Source keys considered before the worker gave up or found a fallback. */
+    sourceCandidates?: string[];
 }
 
 /**
@@ -111,6 +119,130 @@ export function keyFromUrl(url: string | null | undefined): string | null {
     );
 }
 
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const value of values) {
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+    }
+    return out;
+}
+
+/**
+ * Build deterministic source-key candidates before falling back to an S3 prefix
+ * listing. The live media_url wins because it tracks prior re-encode versions;
+ * historical rows may still only have the legacy processed.mp4 key.
+ */
+export function sourceKeyCandidates(
+    contentItemId: string,
+    mediaUrl: string | null | undefined,
+    mediaVersion: number | null | undefined
+): string[] {
+    const version = Math.max(1, mediaVersion ?? 1);
+    const versioned: string[] = [];
+    for (let v = version; v >= 1; v--) {
+        versioned.push(versionedKey(contentItemId, v));
+    }
+    return uniqueStrings([
+        keyFromUrl(mediaUrl),
+        ...versioned,
+        getStorageKey(contentItemId, 'processed', 'mp4'),
+    ]);
+}
+
+function versionFromProcessedKey(key: string): number {
+    const file = key.split('/').pop() ?? '';
+    const match = /^processed\.v(\d+)\./.exec(file);
+    if (match) return Number(match[1]);
+    if (file.startsWith('processed.')) return 1;
+    return 0;
+}
+
+function fallbackObjectScore(key: string): number {
+    const file = key.split('/').pop() ?? '';
+    if (/^processed(\.v\d+)?\./.test(file)) {
+        return 3000 + versionFromProcessedKey(key);
+    }
+    if (/^original\./.test(file)) return 2000;
+    if (/^audio\./.test(file)) return 1000;
+    return 0;
+}
+
+async function resolveSourceKey(
+    contentItemId: string,
+    mediaUrl: string | null | undefined,
+    mediaVersion: number | null | undefined,
+    tier: StorageTier
+): Promise<{ key: string | null; candidates: string[]; usedListedFallback: boolean }> {
+    const candidates = sourceKeyCandidates(contentItemId, mediaUrl, mediaVersion);
+    for (const key of candidates) {
+        if (await objectExists(key, tier)) {
+            return { key, candidates, usedListedFallback: false };
+        }
+    }
+
+    const listed = await listContentObjects(contentItemId, tier);
+    const fallbackKeys = listed
+        .map(obj => obj.Key)
+        .filter((key): key is string => Boolean(key))
+        .filter(key => fallbackObjectScore(key) > 0)
+        .sort((a, b) => fallbackObjectScore(b) - fallbackObjectScore(a));
+
+    const allCandidates = uniqueStrings([...candidates, ...fallbackKeys]);
+    return {
+        key: fallbackKeys[0] ?? null,
+        candidates: allCandidates,
+        usedListedFallback: Boolean(fallbackKeys[0]),
+    };
+}
+
+function nonRetryableResult(
+    result: ReencodeResult,
+    error: string,
+    start: number,
+    extra?: Partial<ReencodeResult>
+): ReencodeResult {
+    result.error = error;
+    result.durationMs = Date.now() - start;
+    result.nonRetryable = true;
+    Object.assign(result, extra);
+    return result;
+}
+
+function isStorageMissingError(err: unknown): boolean {
+    const anyErr = err as { name?: string; code?: string; $metadata?: { httpStatusCode?: number }; message?: string };
+    const text = `${anyErr?.name ?? ''} ${anyErr?.code ?? ''} ${anyErr?.message ?? ''}`.toLowerCase();
+    return (
+        anyErr?.$metadata?.httpStatusCode === 404 ||
+        text.includes('nosuchkey') ||
+        text.includes('notfound') ||
+        text.includes('specified key does not exist')
+    );
+}
+
+async function markMissingSourceFailed(
+    contentItemId: string,
+    candidates: string[] | undefined
+): Promise<void> {
+    try {
+        await cmsClient.updateStatus(contentItemId, {
+            status: 'FAILED',
+            failure_reason: 'quality_reencode_source_object_missing',
+        });
+        logger.warn('Quality re-encode marked content FAILED because source object is missing', {
+            contentItemId,
+            candidates,
+        });
+    } catch (err) {
+        logger.error('Quality re-encode could not mark missing-source content FAILED', err, {
+            contentItemId,
+            candidates,
+        });
+    }
+}
+
 /**
  * Re-encode one content item to a target profile. End-to-end:
  *   1. Resolve the item's current media key + tier from CMS.
@@ -121,8 +253,9 @@ export function keyFromUrl(url: string | null | undefined): string | null {
  *   6. Patch CMS (URL swap + new size + bitrate + profile id + bump version).
  *   7. Schedule the prior key for grace-period deletion via the cleanup queue.
  *
- * Errors short-circuit and write a history row with `error` set; nothing in
- * S3 or DB is mutated on the failure path.
+ * Retryable errors short-circuit without mutating S3 or DB. Confirmed missing
+ * source objects are terminal: the item is marked FAILED in CMS so it stops
+ * being served/enqueued as if its media were still healthy.
  */
 export async function reencodeOneItem(args: {
     contentItemId: string;
@@ -198,20 +331,76 @@ export async function reencodeOneItem(args: {
         const tier: StorageTier = item.storage_tier === 'cold' ? 'cold' : 'primary';
         result.tier = tier;
 
-        // Derive source key from the live media_url so we pick up versioned
-        // keys (`processed.v3.mp4`) — never assume the unversioned key.
-        // Falls back to the deterministic v1 key only when the URL is missing.
-        const sourceKey =
-            keyFromUrl(item.media_url) ?? getStorageKey(contentItemId, 'processed', 'mp4');
+        const source = await resolveSourceKey(
+            contentItemId,
+            item.media_url,
+            item.media_version,
+            tier
+        );
+        result.sourceCandidates = source.candidates;
+        if (!source.key) {
+            logger.warn('Quality re-encode skipped — source object missing', {
+                contentItemId,
+                tier,
+                mediaUrl: item.media_url,
+                candidates: source.candidates,
+            });
+            await markMissingSourceFailed(contentItemId, source.candidates);
+            return nonRetryableResult(
+                result,
+                'source_object_missing',
+                start,
+                { skippedMissingSource: true }
+            );
+        }
+        if (source.usedListedFallback) {
+            logger.warn('Quality re-encode using listed storage fallback', {
+                contentItemId,
+                tier,
+                selectedKey: source.key,
+                candidates: source.candidates,
+            });
+        }
+        const sourceKey = source.key;
 
         // 2. Download.
         const downloaded = await downloadToTemp(contentItemId, sourceKey, tier);
         tempIn = downloaded.path;
         result.originalSizeBytes = downloaded.size;
 
+        const preflightBeforeProbe = preflightCheck(
+            { mimeType: downloaded.contentType, sizeBytes: downloaded.size },
+            profile
+        );
+        if (preflightBeforeProbe) {
+            logger.warn('Quality re-encode skipped — input failed preflight', {
+                contentItemId,
+                sourceKey,
+                reason: preflightBeforeProbe,
+            });
+            return nonRetryableResult(result, preflightBeforeProbe, start, { oldKey: sourceKey });
+        }
+
         // 3. Probe.
         const info = await getMediaInfo(tempIn);
         if (info.bitrateKbps) result.originalBitrateKbps = info.bitrateKbps;
+
+        const preflightAfterProbe = preflightCheck(
+            {
+                mimeType: downloaded.contentType,
+                sizeBytes: downloaded.size,
+                durationSec: info.duration,
+            },
+            profile
+        );
+        if (preflightAfterProbe) {
+            logger.warn('Quality re-encode skipped — probed input failed preflight', {
+                contentItemId,
+                sourceKey,
+                reason: preflightAfterProbe,
+            });
+            return nonRetryableResult(result, preflightAfterProbe, start, { oldKey: sourceKey });
+        }
 
         // 4. Encode.
         await ensureTempDir();
@@ -262,6 +451,15 @@ export async function reencodeOneItem(args: {
         return result;
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (isStorageMissingError(err)) {
+            await markMissingSourceFailed(contentItemId, result.sourceCandidates);
+            return nonRetryableResult(
+                result,
+                'source_object_missing',
+                start,
+                { skippedMissingSource: true }
+            );
+        }
         result.error = msg;
         result.durationMs = Date.now() - start;
         logger.error('Quality re-encode failed', err, { contentItemId, targetProfileId });
