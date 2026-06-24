@@ -12,6 +12,7 @@ import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
+import { resolveYoutubeChannel } from '../../fetchers/youtube.fetcher.js';
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
 import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
@@ -251,6 +252,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     author: item.author,
                     originalUrl: item.originalUrl,
                     publishedAt: item.publishedAt ? item.publishedAt.toISOString() : null,
+                    // Rich media metadata for the "Add media source" preview.
+                    thumbnailUrl: item.thumbnailUrl ?? null,
+                    durationSec: item.durationSec ?? null,
                 }));
 
                 return reply.send({
@@ -807,6 +811,31 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
             } catch (error) {
                 logger.error('iTunes search endpoint error', error);
                 return reply.status(500).send({ error: 'iTunes search failed' });
+            }
+        }
+    );
+
+    /**
+     * Resolve a YouTube channel URL/@handle to channel metadata (name + avatar)
+     * GET /admin/youtube/resolve?url=...
+     */
+    fastify.get<{ Querystring: { url: string } }>(
+        '/admin/youtube/resolve',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { url } = request.query;
+            if (!url) {
+                return reply.status(400).send({ error: 'url query parameter is required' });
+            }
+            try {
+                const channel = await resolveYoutubeChannel(url);
+                if (!channel) {
+                    return reply.status(404).send({ error: 'Could not resolve a YouTube channel from that URL' });
+                }
+                return reply.send(channel);
+            } catch (error) {
+                logger.error('YouTube resolve endpoint error', error);
+                return reply.status(500).send({ error: 'YouTube resolve failed' });
             }
         }
     );

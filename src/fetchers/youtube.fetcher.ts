@@ -164,6 +164,49 @@ function getBestThumbnail(thumbnails: Record<string, { url: string }>): string |
     return undefined;
 }
 
+export interface ResolvedYoutubeChannel {
+    channelId: string;
+    title: string;
+    thumbnail?: string;
+    subscriberCount?: number;
+}
+
+/**
+ * Resolve a YouTube channel URL / @handle to channel metadata, for the admin
+ * "Add media source" flow (show the resolved channel + avatar before saving).
+ * Returns null when the URL can't be resolved to a channel.
+ */
+export async function resolveYoutubeChannel(urlStr: string): Promise<ResolvedYoutubeChannel | null> {
+    const apiKey = getApiKey();
+    const resolved = await resolveUrlToChannelId(urlStr, apiKey);
+    const channelId = resolved?.channelId;
+    if (!channelId) return null;
+
+    const url = new URL(`${YOUTUBE_API_BASE}/channels`);
+    url.searchParams.set('part', 'snippet,statistics');
+    url.searchParams.set('id', channelId);
+    url.searchParams.set('key', apiKey);
+
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+        logger.warn('Failed to fetch YouTube channel metadata', { channelId, status: response.status });
+        return null;
+    }
+
+    const data = await response.json();
+    const item = data.items?.[0];
+    if (!item) return null;
+
+    const subsRaw = item.statistics?.subscriberCount;
+    const subs = subsRaw != null ? Number(subsRaw) : undefined;
+    return {
+        channelId,
+        title: item.snippet?.title ?? '',
+        thumbnail: getBestThumbnail(item.snippet?.thumbnails ?? {}),
+        subscriberCount: Number.isFinite(subs) ? subs : undefined,
+    };
+}
+
 function getNumber(raw: Record<string, unknown>, keys: string[]): number | undefined {
     for (const key of keys) {
         const value = raw[key];
