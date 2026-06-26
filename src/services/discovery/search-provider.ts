@@ -8,10 +8,11 @@
  */
 import { config } from '../../config/index.js';
 import { logger } from '../../observability/logger.js';
-import type { DiscoveryProfileInput, SiteCandidate } from './types.js';
+import { itunesSearch } from '../itunes-search.js';
+import type { DiscoveryProfileInput, DiscoveryVia, SiteCandidate } from './types.js';
 
 export interface SourceSearchProvider {
-    readonly via: 'tavily' | 'crawl';
+    readonly via: DiscoveryVia;
     search(profile: DiscoveryProfileInput): Promise<SiteCandidate[]>;
 }
 
@@ -143,9 +144,44 @@ class HybridSearchProvider implements SourceSearchProvider {
     }
 }
 
-export function getSearchProvider(providerOverride?: string): SourceSearchProvider {
+// Podcast discovery for media profiles — Apple's iTunes Search is the open-web
+// directory net (the Tavily analog). Returns podcast RSS feed URLs directly; the
+// existing resolver/validator treat them as RSS. Native-language terms + a
+// language-matched storefront so Arabic profiles get Arabic shows.
+class ItunesSearchProvider implements SourceSearchProvider {
+    readonly via = 'itunes' as const;
+    async search(profile: DiscoveryProfileInput): Promise<SiteCandidate[]> {
+        if (!itunesSearch.isEnabled()) {
+            logger.warn('iTunes search disabled — no podcast discovery candidates');
+            return [];
+        }
+        const country = (profile.languages ?? []).includes('ar') ? 'SA' : 'US';
+        const terms = profile.keywords && profile.keywords.length > 0 ? profile.keywords : [profile.name];
+        const out: SiteCandidate[] = [];
+        const seen = new Set<string>();
+        for (const term of terms.slice(0, 4)) {
+            try {
+                const res = await itunesSearch.searchPodcasts(term, 15, country);
+                for (const p of res.results) {
+                    if (!p.feedUrl || seen.has(p.feedUrl)) continue;
+                    seen.add(p.feedUrl);
+                    out.push({ siteUrl: p.feedUrl, title: p.collectionName, via: 'itunes' });
+                }
+            } catch (error) {
+                logger.warn('iTunes podcast search error', { term, error: error instanceof Error ? error.message : String(error) });
+            }
+        }
+        return out;
+    }
+}
+
+export function getSearchProvider(profile: DiscoveryProfileInput): SourceSearchProvider {
+    // Media profiles discover podcasts via iTunes; news profiles use Tavily+catalog.
+    if ((profile.category ?? 'news') === 'media') {
+        return new ItunesSearchProvider();
+    }
     // 'crawl' forces catalog-only; 'tavily'/'auto'/unset use Tavily when keyed.
-    const wantTavily = providerOverride !== 'crawl';
+    const wantTavily = profile.searchProvider !== 'crawl';
     const tavily = wantTavily && config.tavilyApiKey ? new TavilySearchProvider(config.tavilyApiKey) : undefined;
     if (wantTavily && !tavily) {
         logger.warn('TAVILY_API_KEY not set — discovery using curated catalog only');

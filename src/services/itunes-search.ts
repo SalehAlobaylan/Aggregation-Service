@@ -16,6 +16,9 @@ export interface ItunesPodcast {
     collectionName: string;
     artistName: string;
     feedUrl: string;
+    // Human-viewable Apple Podcasts page (browse + play episodes) — the link an
+    // admin opens to check the show's content. The feedUrl is raw RSS XML.
+    collectionViewUrl?: string;
     artworkUrl600?: string;
     genres: string[];
     releaseDate: string;
@@ -97,6 +100,7 @@ export async function searchPodcasts(
             results.push({
                 collectionId: item.collectionId,
                 collectionName: item.collectionName,
+                collectionViewUrl: item.collectionViewUrl,
                 artistName: item.artistName,
                 feedUrl: item.feedUrl,
                 artworkUrl600: item.artworkUrl600,
@@ -156,6 +160,7 @@ export async function lookupPodcast(collectionId: number): Promise<ItunesPodcast
         return {
             collectionId: item.collectionId,
             collectionName: item.collectionName,
+            collectionViewUrl: item.collectionViewUrl,
             artistName: item.artistName,
             feedUrl: item.feedUrl,
             artworkUrl600: item.artworkUrl600,

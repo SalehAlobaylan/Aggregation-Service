@@ -283,3 +283,162 @@ export async function fetchTwitterRecommendations(
 
     return (await response.json()) as TwitterRecommendationsResult;
 }
+
+export interface YouTubeVideoInfo {
+    video_id: string;
+    title: string;
+}
+
+export interface YouTubeChannelInfo {
+    channel: string;
+    exists: boolean;
+    channel_id: string | null;
+    title: string | null;
+    subscribers: number;
+    description: string;
+    image_url: string | null;
+    videos: YouTubeVideoInfo[];
+    category: string | null;
+    audio_first: boolean;
+    top_duration_sec: number;
+}
+
+export interface YouTubeRelatedChannel {
+    channel_id: string;
+    name: string | null;
+    via: string;
+}
+
+export interface YouTubeRelatedResult {
+    channel: string;
+    exists: boolean;
+    related: YouTubeRelatedChannel[];
+}
+
+/**
+ * Read a YouTube channel via Enrichment's guest InnerTube reader (no API key, no
+ * quota). Stealth/extraction is Enrichment's boundary; Aggregation orchestrates
+ * the media graph. Returns exists:false on missing/throttled (graceful).
+ */
+export async function fetchYouTubeChannel(
+    channel: string,
+    requestId?: string,
+): Promise<YouTubeChannelInfo> {
+    const response = await fetch(`${baseUrl()}/v1/extract/youtube`, {
+        method: 'POST',
+        body: JSON.stringify({ channel }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/youtube failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    return (await response.json()) as YouTubeChannelInfo;
+}
+
+/**
+ * Channels in a seed channel's watch-next graph (the YouTube relatedness signal).
+ */
+export async function fetchYouTubeRelated(
+    channel: string,
+    requestId?: string,
+): Promise<YouTubeRelatedResult> {
+    const response = await fetch(`${baseUrl()}/v1/extract/youtube/related`, {
+        method: 'POST',
+        body: JSON.stringify({ channel }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/youtube/related failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    return (await response.json()) as YouTubeRelatedResult;
+}
+
+export interface YouTubeSearchChannel {
+    channel_id: string;
+    title: string | null;
+    subscribers: number;
+}
+
+/**
+ * Topic/keyword YouTube channel search via Enrichment's guest InnerTube — the
+ * YouTube analog of the iTunes podcast keyword net (no API key, no quota).
+ */
+export async function searchYouTubeChannels(
+    query: string,
+    opts: { limit?: number; requestId?: string } = {},
+): Promise<YouTubeSearchChannel[]> {
+    const response = await fetch(`${baseUrl()}/v1/extract/youtube/search`, {
+        method: 'POST',
+        body: JSON.stringify({ query, limit: opts.limit ?? 15 }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(opts.requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/youtube/search failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    const data = (await response.json()) as { channels: YouTubeSearchChannel[] };
+    return data.channels ?? [];
+}
+
+export interface AppleRelatedShow {
+    adam_id: string;
+    title: string | null;
+    genres: string[];
+}
+
+export interface ApplePodcastRelatedResult {
+    collection_id: string;
+    exists: boolean;
+    related: AppleRelatedShow[];
+}
+
+/**
+ * A podcast's Apple "Listeners Also Subscribed" / "You Might Also Like" shelf via
+ * Enrichment (scraped from the public show page — no token). The co-listen
+ * relation; each adam_id resolves to an RSS feed via the iTunes lookup API.
+ */
+export async function fetchApplePodcastRelated(
+    collectionId: string,
+    opts: { country?: string; requestId?: string } = {},
+): Promise<ApplePodcastRelatedResult> {
+    const response = await fetch(`${baseUrl()}/v1/extract/apple-podcast/related`, {
+        method: 'POST',
+        body: JSON.stringify({ collection_id: collectionId, country: opts.country ?? 'us' }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(opts.requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/apple-podcast/related failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    return (await response.json()) as ApplePodcastRelatedResult;
+}

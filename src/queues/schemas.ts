@@ -161,6 +161,9 @@ export interface DiscoveryProfileInput {
     languages?: string[];
     maxSuggestionsPerRun?: number;
     tenantId?: string;
+    // Category ('news' | 'media') routes the sweep to the right keyword provider:
+    // media profiles discover podcasts via iTunes instead of the news web search.
+    category?: string;
     // Config-driven overrides (from CMS discovery_config) so scheduled and manual
     // runs share the same tuning.
     recencyDays?: number;

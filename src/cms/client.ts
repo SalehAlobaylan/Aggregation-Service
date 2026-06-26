@@ -191,6 +191,10 @@ export const cmsClient = {
         telegram_discovery_enabled: boolean;
         twitter_discovery_enabled: boolean;
         twitter_recommend_enabled: boolean;
+        youtube_discovery_enabled: boolean;
+        podcast_discovery_enabled: boolean;
+        youtube_related_enabled: boolean;
+        apple_related_enabled: boolean;
         graph_build_interval_hours: number;
     }> {
         return makeRequest('GET', '/discovery/config', undefined, requestId);
@@ -211,6 +215,12 @@ export const cmsClient = {
     async getApprovedTwitterHandles(requestId?: string): Promise<{ data: { username: string }[] }> {
         return makeRequest('GET', '/intel/approved-twitter-handles', undefined, requestId);
     },
+    async getApprovedYouTubeChannels(requestId?: string): Promise<{ data: { channel: string }[] }> {
+        return makeRequest('GET', '/intel/approved-youtube-channels', undefined, requestId);
+    },
+    async getApprovedPodcastFeeds(requestId?: string): Promise<{ data: { feed_url: string }[] }> {
+        return makeRequest('GET', '/intel/approved-podcast-feeds', undefined, requestId);
+    },
     async postCandidates(
         data: { candidates: unknown[]; edges: { from_host: string; to_host: string; weight: number }[] },
         requestId?: string
@@ -223,7 +233,7 @@ export const cmsClient = {
      * GET /internal/discovery/profiles?enabled=true
      */
     async listEnabledDiscoveryProfiles(requestId?: string): Promise<{
-        data: Array<{ id: string; name: string; description?: string; keywords?: string[]; languages?: string[]; max_suggestions_per_run?: number }>;
+        data: Array<{ id: string; name: string; description?: string; keywords?: string[]; languages?: string[]; category?: string; max_suggestions_per_run?: number }>;
     }> {
         return makeRequest('GET', '/discovery/profiles?enabled=true', undefined, requestId);
     },

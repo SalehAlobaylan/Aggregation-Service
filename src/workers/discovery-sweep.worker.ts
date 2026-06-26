@@ -57,6 +57,7 @@ export const discoverySweepWorker = createWorker({
                     description: p.description,
                     keywords: p.keywords,
                     languages: p.languages,
+                    category: p.category,
                     maxSuggestionsPerRun: Math.min(p.max_suggestions_per_run ?? cap, cap),
                     recencyDays: cfg.recency_window_days,
                     searchProvider: cfg.search_provider,

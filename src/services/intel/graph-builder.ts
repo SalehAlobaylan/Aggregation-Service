@@ -21,6 +21,8 @@ import {
     mergeTwitterCandidates,
     type TwitterCandidate,
 } from './twitter-graph.js';
+import { buildPodcastGraph } from './podcast-graph.js';
+import { buildYouTubeGraph } from './youtube-graph.js';
 
 const MAX_SOURCES_TO_CRAWL = 8;
 const MAX_CANDIDATES_TO_RESOLVE = 20;
@@ -60,6 +62,10 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
         telegram_discovery_enabled?: boolean;
         twitter_discovery_enabled?: boolean;
         twitter_recommend_enabled?: boolean;
+        youtube_discovery_enabled?: boolean;
+        podcast_discovery_enabled?: boolean;
+        apple_related_enabled?: boolean;
+        youtube_related_enabled?: boolean;
     } = {};
     try {
         cfg = await cmsClient.getDiscoveryConfig();
@@ -68,6 +74,8 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
     }
     let tgCandidates: Awaited<ReturnType<typeof buildTelegramGraph>>['candidates'] = [];
     let xCandidates: Awaited<ReturnType<typeof buildTwitterGraph>>['candidates'] = [];
+    let podCandidates: Awaited<ReturnType<typeof buildPodcastGraph>>['candidates'] = [];
+    let ytCandidates: Awaited<ReturnType<typeof buildYouTubeGraph>>['candidates'] = [];
     const pagerankSeeds = [...trustedHosts];
     if (cfg.telegram_discovery_enabled) {
         try {
@@ -111,6 +119,49 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
             xCandidates = mergeTwitterCandidates(interaction, recommend);
         } catch (err) {
             logger.warn('Twitter discovery failed', { error: (err as Error).message });
+        }
+    }
+
+    // YouTube contributor (media / For You) — guest InnerTube watch-next graph.
+    // Seeds = approved channels; candidates carry yt: nodes + edges, isolated from
+    // the news graph by category at promotion time (CMS). Free (no Data API quota).
+    if (cfg.youtube_discovery_enabled) {
+        try {
+            const chans = await cmsClient
+                .getApprovedYouTubeChannels()
+                .catch(() => ({ data: [] as { channel: string }[] }));
+            const seedRefs = (chans.data ?? []).map((c) => c.channel).filter(Boolean);
+            const yt = await buildYouTubeGraph(seedRefs, recencyDays, {
+                related: cfg.youtube_related_enabled,
+            });
+            ytCandidates = yt.candidates;
+            for (const e of yt.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
+            for (const id of yt.seedIds) pagerankSeeds.push(`yt:${id}`);
+        } catch (err) {
+            logger.warn('YouTube discovery failed', { error: (err as Error).message });
+        }
+    }
+
+    // Podcast contributor (media / For You) — seed-relative iTunes adjacency.
+    // Seeds = approved podcast feeds; candidates carry their own pod: nodes and
+    // edges, isolated from the news graph by category at promotion time (CMS).
+    if (cfg.podcast_discovery_enabled) {
+        try {
+            const feeds = await cmsClient
+                .getApprovedPodcastFeeds()
+                .catch(() => ({ data: [] as { feed_url: string }[] }));
+            const seedFeeds = (feeds.data ?? []).map((f) => f.feed_url).filter(Boolean);
+            const pod = await buildPodcastGraph(seedFeeds, recencyDays, {
+                appleRelated: cfg.apple_related_enabled,
+            });
+            podCandidates = pod.candidates;
+            for (const e of pod.edges) edges.push({ from: e.from, to: e.to, weight: e.weight });
+            for (const f of seedFeeds) {
+                const k = canonicalSourceKey(f);
+                if (k) pagerankSeeds.push(`pod:${k}`);
+            }
+        } catch (err) {
+            logger.warn('Podcast discovery failed', { error: (err as Error).message });
         }
     }
 
@@ -215,6 +266,43 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
             discovered_via: [xc.via],
             sample_titles: xc.sampleTitles,
             feed_health: xc.feedHealth,
+        });
+    }
+
+    // YouTube candidates → ledger rows (kind 'youtube', domain = channelId).
+    for (const yc of ytCandidates) {
+        candidates.push({
+            domain: yc.channelId,
+            kind: 'youtube',
+            canonical_key: `yt:${yc.channelId}`,
+            resolved_feed_url: `https://www.youtube.com/channel/${yc.channelId}`,
+            feed_valid: true,
+            citation_count: 0,
+            cocitation_count: yc.cocitation,
+            authority_score: authority.get(`yt:${yc.channelId}`) ?? 0,
+            trend: 'flat',
+            discovered_via: [yc.via],
+            sample_titles: yc.sampleTitles,
+            feed_health: yc.feedHealth,
+        });
+    }
+
+    // Podcast candidates → ledger rows (kind 'podcast', resolves to the RSS feed).
+    // Authority keyed on the pod:<feedKey> node so seed→candidate trust flows.
+    for (const pc of podCandidates) {
+        candidates.push({
+            domain: pc.domain,
+            kind: 'podcast',
+            canonical_key: pc.canonicalKey,
+            resolved_feed_url: pc.feedUrl,
+            feed_valid: true,
+            citation_count: 0,
+            cocitation_count: pc.cocitation,
+            authority_score: authority.get(`pod:${pc.canonicalKey}`) ?? 0,
+            trend: 'flat',
+            discovered_via: [pc.via],
+            sample_titles: pc.sampleTitles,
+            feed_health: pc.feedHealth,
         });
     }
 
