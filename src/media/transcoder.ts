@@ -5,7 +5,7 @@
 import ffmpeg from 'fluent-ffmpeg';
 import { deflateSync } from 'zlib';
 import { join } from 'path';
-import { stat, writeFile } from 'fs/promises';
+import { mkdir, stat, writeFile } from 'fs/promises';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 
@@ -417,10 +417,76 @@ export function extractAudio(
     });
 }
 
+export function cutMediaSegment(
+    inputPath: string,
+    outputPath: string,
+    startSec: number,
+    durationSec: number,
+    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE
+): Promise<TranscodeResult> {
+    return new Promise((resolve, reject) => {
+        logger.info('Cutting media segment', { inputPath, outputPath, startSec, durationSec });
+        ffmpeg(inputPath)
+            .inputOptions([`-ss ${Math.max(0, startSec)}`])
+            .duration(Math.max(0.1, durationSec))
+            .outputOptions(buildEncodeOptions(profile))
+            .output(outputPath)
+            .on('end', async () => {
+                try {
+                    const info = await getMediaInfo(outputPath);
+                    resolve({ outputPath, duration: info.duration });
+                } catch {
+                    resolve({ outputPath, duration: durationSec });
+                }
+            })
+            .on('error', (err) => {
+                logger.error('Media segment cut failed', err);
+                reject(err);
+            })
+            .run();
+    });
+}
+
+export function createHlsVod(
+    inputPath: string,
+    outputDir: string,
+    playlistName = 'index.m3u8'
+): Promise<{ playlistPath: string; duration: number }> {
+    return new Promise(async (resolve, reject) => {
+        await mkdir(outputDir, { recursive: true });
+        const playlistPath = join(outputDir, playlistName);
+        logger.info('Creating HLS VOD rendition', { inputPath, outputDir, playlistName });
+        ffmpeg(inputPath)
+            .outputOptions([
+                '-c copy',
+                '-hls_time 6',
+                '-hls_playlist_type vod',
+                '-hls_segment_filename',
+                join(outputDir, 'segment_%03d.ts'),
+            ])
+            .output(playlistPath)
+            .on('end', async () => {
+                try {
+                    const info = await getMediaInfo(inputPath);
+                    resolve({ playlistPath, duration: info.duration });
+                } catch {
+                    resolve({ playlistPath, duration: 0 });
+                }
+            })
+            .on('error', (err) => {
+                logger.error('HLS VOD creation failed', err);
+                reject(err);
+            })
+            .run();
+    });
+}
+
 export const transcoder = {
     getMediaInfo,
     transcodeToMp4,
     audioToMp4,
     extractThumbnail,
     extractAudio,
+    cutMediaSegment,
+    createHlsVod,
 };

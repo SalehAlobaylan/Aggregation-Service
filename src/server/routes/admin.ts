@@ -8,7 +8,7 @@ import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
-import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob } from '../../queues/schemas.js';
+import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob, AtomizationSweepJob } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
@@ -391,6 +391,17 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         if (!q) return reply.status(503).send({ success: false, message: 'source graph queue unavailable' });
         const job = await q.add('manual-graph', { trigger: 'manual' } satisfies SourceGraphJob);
         return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Source graph build queued' });
+    });
+
+    /**
+     * Manually enqueue transcript-ready media parents for atomization.
+     * POST /admin/atomization/sweep-now
+     */
+    fastify.post('/admin/atomization/sweep-now', { preHandler: verifyAdminAuth }, async (_request, reply) => {
+        const q = getQueue(QUEUE_NAMES.ATOMIZATION_SWEEP);
+        if (!q) return reply.status(503).send({ success: false, message: 'atomization sweep queue unavailable' });
+        const job = await q.add('manual-atomization-sweep', { trigger: 'manual', tenantId: 'default' } satisfies AtomizationSweepJob, { priority: 1 });
+        return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Atomization candidate sweep queued' });
     });
 
     /**

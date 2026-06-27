@@ -13,6 +13,7 @@ import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 
 const EMBED_TIMEOUT_MS = 30_000;
+const CHAPTERS_TIMEOUT_MS = 90_000;
 
 /** Strip any trailing slash so we never produce `//v1/...` URLs. */
 function baseUrl(): string {
@@ -48,6 +49,65 @@ export interface EmbedResult {
         organizations?: string[];
         locations?: string[];
     };
+}
+
+export interface ChapterWindowPayload {
+    index: number;
+    start_sec: number;
+    text: string;
+}
+
+export interface GeneratedChapterPlan {
+    start_index: number;
+    end_index?: number | null;
+    title: string;
+    summary?: string | null;
+    context_label?: string | null;
+    confidence?: number;
+    boundary_reason?: string | null;
+    standalone_score?: number;
+    contains_sponsor_or_intro?: boolean;
+    needs_review_reason?: string | null;
+}
+
+export async function generateChaptersViaEnrichment(
+    windows: ChapterWindowPayload[],
+    opts: {
+        requestId?: string;
+        language?: string | null;
+        maxChapters?: number;
+        minSec?: number;
+        maxSec?: number;
+    } = {},
+): Promise<GeneratedChapterPlan[]> {
+    const response = await fetch(`${baseUrl()}/v1/chapters/generate`, {
+        method: 'POST',
+        body: JSON.stringify({
+            windows,
+            mode: opts.maxChapters ? 'count' : 'auto',
+            target_count: opts.maxChapters,
+            min_sec: opts.minSec,
+            max_sec: opts.maxSec,
+            with_summary: true,
+            language: opts.language,
+        }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(opts.requestId),
+        },
+        signal: AbortSignal.timeout(CHAPTERS_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/chapters/generate failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+
+    const result = (await response.json()) as { chapters?: GeneratedChapterPlan[] };
+    return result.chapters ?? [];
 }
 
 /**

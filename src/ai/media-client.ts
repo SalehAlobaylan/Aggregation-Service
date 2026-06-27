@@ -9,8 +9,8 @@
  * History: these functions used to live in enrichment-client.ts when there
  * was a single AI service. They moved here as part of the Media-Service split.
  */
-import FormData from 'form-data';
-import { createReadStream } from 'fs';
+import { basename, extname } from 'path';
+import { openAsBlob } from 'fs';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 
@@ -49,6 +49,34 @@ function tracingHeaders(requestId?: string): Record<string, string> {
     return requestId ? { 'X-Request-ID': requestId } : {};
 }
 
+function audioMimeType(path: string): string {
+    switch (extname(path).toLowerCase()) {
+        case '.mp3':
+            return 'audio/mpeg';
+        case '.m4a':
+            return 'audio/mp4';
+        case '.aac':
+            return 'audio/aac';
+        case '.wav':
+            return 'audio/wav';
+        case '.opus':
+            return 'audio/opus';
+        case '.webm':
+            return 'audio/webm';
+        case '.mp4':
+        case '.m4v':
+        case '.mov':
+            return 'video/mp4';
+        default:
+            return 'application/octet-stream';
+    }
+}
+
+async function appendAudioFile(form: FormData, audioPath: string): Promise<void> {
+    const blob = await openAsBlob(audioPath, { type: audioMimeType(audioPath) });
+    form.append('audio_file', blob, basename(audioPath));
+}
+
 /**
  * Transcribe an audio file via Media-Service (synchronous).
  *
@@ -71,7 +99,7 @@ export async function transcribeViaMedia(
     });
 
     const form = new FormData();
-    form.append('audio_file', createReadStream(audioPath));
+    await appendAudioFile(form, audioPath);
     if (contentItemId) form.append('content_id', contentItemId);
     if (transcriptionJobId) form.append('transcription_job_id', transcriptionJobId);
     if (language) form.append('language', language);
@@ -79,9 +107,8 @@ export async function transcribeViaMedia(
 
     const response = await fetch(`${baseUrl()}/v1/transcribe`, {
         method: 'POST',
-        body: form as unknown as BodyInit,
+        body: form,
         headers: {
-            ...form.getHeaders(),
             ...authHeaders(),
             ...tracingHeaders(requestId),
         },
@@ -127,7 +154,7 @@ export async function submitTranscribeJobViaMedia(
     const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
 
     const form = new FormData();
-    form.append('audio_file', createReadStream(audioPath));
+    await appendAudioFile(form, audioPath);
     if (contentItemId) form.append('content_id', contentItemId);
     if (transcriptionJobId) form.append('transcription_job_id', transcriptionJobId);
     if (language) form.append('language', language);
@@ -135,9 +162,8 @@ export async function submitTranscribeJobViaMedia(
 
     const response = await fetch(`${baseUrl()}/v1/transcribe/jobs`, {
         method: 'POST',
-        body: form as unknown as BodyInit,
+        body: form,
         headers: {
-            ...form.getHeaders(),
             ...authHeaders(),
             ...tracingHeaders(requestId),
         },
@@ -299,9 +325,8 @@ export async function embedImageViaMedia(
 
     const response = await fetch(`${baseUrl()}/v1/embed/image`, {
         method: 'POST',
-        body: form as unknown as BodyInit,
+        body: form,
         headers: {
-            ...form.getHeaders(),
             ...authHeaders(),
             ...tracingHeaders(opts.requestId),
         },

@@ -1,6 +1,6 @@
 # Aggregation-Service
 
-The ingestion pipeline for the Wahb platform. A **worker-first** Node.js service that fetches content from external sources, normalizes it, transcodes media to MP4 (FFmpeg), delegates ML to Media + Enrichment, and writes finished content into CMS via `/internal/*`. It also runs automated source **discovery** and a source-intelligence graph.
+The ingestion and media-atomization pipeline for the Wahb platform. A **worker-first** Node.js service that fetches content from external sources, normalizes it, creates playback renditions and chapter cuts with FFmpeg, delegates ML to Media + Enrichment, and writes finished content into CMS via `/internal/*`. It also runs automated source **discovery** and a source-intelligence graph.
 
 It does **not** serve user-facing feeds, assemble feeds, or run ML models itself — those belong to CMS, Enrichment, and Media. The Fastify HTTP surface exists only for health/metrics, admin triggers (Platform-Console), and one internal inbound route.
 
@@ -14,15 +14,30 @@ It does **not** serve user-facing feeds, assemble feeds, or run ML models itself
   Sources (RSS / WEBSITE / YouTube / Podcast / Reddit / Telegram / Twitter / Upload)
                     │
                     ▼
-            fetch-queue ──▶ normalize-queue ──┬──▶ media-queue   (FFmpeg → MP4, Media transcribe)
+            fetch-queue ──▶ normalize-queue ──┬──▶ media-queue   (FFmpeg renditions, Media transcribe)
                                               └──▶ ai-queue      (Enrichment embed + tags, Media image-embed)
                                                        │
                                        CMS /internal/* write-back ──▶ status = READY
+                                                       │
+                                      atomization-sweep ──▶ atomization-queue
+                                                       │
+                                      Enrichment chapter plan + FFmpeg cuts
+                                                       │
+                                      CMS child feed units + child embeddings
 ```
 
-Background subsystems run alongside the main pipeline: **Feeds-Finding discovery** (auto-find sources), the **Source Intelligence Graph** (PageRank over a source link graph), storage lifecycle sweeps, media quality re-encode, and an embedding-reconciliation backstop. Schedules/toggles for these come from CMS config tables, not env.
+Background subsystems run alongside the main pipeline: **Media Atomization** (long podcasts/videos into chapters), **Feeds-Finding discovery** (auto-find sources), the **Source Intelligence Graph** (PageRank over a source link graph), storage lifecycle sweeps, media quality re-encode, and an embedding-reconciliation backstop. Schedules/toggles for these come from CMS config tables, not env.
 
-**BullMQ queues** (Redis db=0): `fetch`, `normalize`, `media`, `ai`, `storage-sweep`, `reconcile`, `quality-reencode`, `discovery`, `discovery-sweep`, `source-graph`, plus `aggregation-dlq`. Defaults: 3 attempts, exponential backoff; completed kept 1h, failed 24h.
+**BullMQ queues** (Redis db=0): `fetch`, `normalize`, `media`, `ai`, `atomization`, `atomization-sweep`, `storage-sweep`, `reconcile`, `quality-reencode`, `discovery`, `discovery-sweep`, `source-graph`, plus `aggregation-dlq`. Defaults: 3 attempts, exponential backoff; completed kept 1h, failed 24h.
+
+## Media Atomization
+
+Aggregation executes atomization; CMS owns policy and feed visibility.
+
+- Only parent media longer than 2400 seconds (>40m) should enter atomization. Do not atomize 15m/30m parents by default.
+- The worker waits for timestamped transcripts, calls Enrichment `/v1/chapters/generate`, normalizes boundaries, merges chapters below 270s with the best legal adjacent neighbor, cuts media with FFmpeg, creates HLS/MP4/audio renditions, writes child feed units to CMS, and queues child embeddings.
+- Visible child feed units must be 270-2400 seconds. If a sub-270s chapter cannot legally merge, it stays hidden/review-only.
+- Re-atomization must be idempotent: stable parent job IDs, old children archived/replaced through CMS, and no duplicate visible sibling chapters.
 
 ## Quick Start
 
@@ -120,6 +135,7 @@ No public/consumer routes. Admin routes require an admin JWT (`verifyAdminAuth`)
 | POST | `/admin/trigger`, `/admin/trigger/{rss,youtube,reddit}` | JWT | Trigger ingestion for a source |
 | POST | `/admin/discover` · `/admin/preview` | JWT | Feed discovery from a URL · fetch+normalize preview (no CMS write) |
 | POST | `/admin/discovery/{run,sweep-now,build-graph-now,resync-schedule}` | JWT | Discovery + source-graph control |
+| POST | `/admin/atomization/sweep-now` | JWT | Manually enqueue the atomization sweeper |
 | GET/POST | `/admin/queues*`, `/admin/jobs/:id`, `/admin/retry-failed`, `/admin/retry-pending` | JWT | Queue & job ops |
 | GET/POST | `/admin/ratelimits*`, `/admin/scheduled`, `/admin/storage/*`, `/admin/quality/*`, `/admin/itunes/search`, `/admin/restart` | JWT | Rate-limit, schedule, storage, quality, ops |
 | POST | `/internal/jobs/user-content` | token | Inject user-submitted content into the pipeline |
@@ -156,10 +172,10 @@ src/
 ├── index.ts        # boot: Redis → queues → workers → HTTP server
 ├── config/         # env parsing + validation (Zod)
 ├── queues/         # BullMQ queue + schema definitions, retry routing
-├── workers/        # job processors (fetch, normalize, media, ai, discovery, …)
+├── workers/        # job processors (fetch, normalize, media, ai, atomization, discovery, …)
 ├── fetchers/       # per-source fetchers (rss, website, youtube, podcast, reddit, telegram, twitter, manual)
 ├── normalizers/    # raw → canonical content shape
-├── media/          # FFmpeg transcode + media handling
+├── media/          # FFmpeg rendition + media handling
 ├── ai/             # Enrichment + Media service clients, embedding text builder
 ├── services/       # discovery/ (Feeds-Finding) + intel/ (source graph, PageRank)
 ├── storage/        # S3 / R2 object storage

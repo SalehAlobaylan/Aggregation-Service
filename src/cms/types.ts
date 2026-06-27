@@ -138,6 +138,8 @@ export interface UpdateContentItemRequest {
 export interface UpdateStatusRequest {
     status: ContentStatus;
     failure_reason?: string;
+    feed_visibility?: string;
+    chaptering_status?: string;
 }
 
 /**
@@ -149,6 +151,11 @@ export interface UpdateArtifactsRequest {
     duration_sec?: number;
     file_size_bytes?: number;
     storage_tier?: string;
+    playback_url?: string;
+    playback_type?: 'hls' | 'mp4' | 'audio' | string;
+    fallback_playback_url?: string;
+    has_video?: boolean;
+    media_renditions?: MediaRendition[];
     // Quality bookkeeping. Originals are write-once at first ingest.
     original_size_bytes?: number;
     original_bitrate_kbps?: number;
@@ -157,6 +164,136 @@ export interface UpdateArtifactsRequest {
     // Download-time signals merged into content_item.metadata jsonb (heatmap,
     // sponsor_segments, categories). Merged server-side — existing keys preserved.
     metadata?: Record<string, unknown>;
+}
+
+export interface MediaRendition {
+    type: 'hls' | 'mp4' | 'audio' | string;
+    url: string;
+    mime_type?: string;
+    width?: number;
+    height?: number;
+    bitrate_kbps?: number;
+    is_primary?: boolean;
+}
+
+export interface AtomizationPolicy {
+    chaptering_enabled: boolean;
+    auto_publish_high_confidence: boolean;
+    parent_feed_visible: boolean;
+    preserve_video: boolean;
+    remove_sponsor_segments: boolean;
+    min_chapter_minutes: number;
+    min_feed_unit_seconds?: number;
+    soft_max_chapter_minutes: number;
+    hard_max_chapter_minutes: number;
+    atomization_min_parent_seconds?: number;
+    max_chapters_per_parent: number;
+    chaptering_mode: string;
+    high_confidence_threshold: number;
+    preferred_playback_rendition: string;
+    fallback_playback_rendition: string;
+    audio_only_allowed: boolean;
+}
+
+export interface AtomizationSegment {
+    start: number;
+    end: number;
+    text: string;
+}
+
+export interface AtomizationChapter {
+    title: string;
+    summary?: string | null;
+    start_ms: number;
+    end_ms: number;
+    confidence?: number;
+    context_label?: string | null;
+    boundary_reason?: string | null;
+    standalone_score?: number;
+    contains_sponsor_intro?: boolean;
+    needs_review_reason?: string | null;
+    media_url?: string;
+    thumbnail_url?: string;
+    playback_url?: string;
+    playback_type?: string;
+    fallback_playback_url?: string;
+    has_video?: boolean;
+    media_renditions?: MediaRendition[];
+    transcript_segments?: AtomizationSegment[];
+    transcript_text?: string;
+}
+
+export interface AtomizationInputResponse {
+    item: {
+        id: string;
+        tenant_id: string;
+        type: ContentType;
+        title?: string | null;
+        source: SourceType;
+        source_name?: string | null;
+        source_feed_url?: string | null;
+        media_url?: string | null;
+        thumbnail_url?: string | null;
+        playback_url?: string | null;
+        fallback_playback_url?: string | null;
+        storage_tier?: string | null;
+        media_version?: number | null;
+        duration_sec?: number | null;
+        original_url?: string | null;
+        has_video?: boolean | null;
+    };
+    policy: AtomizationPolicy;
+    transcript?: {
+        transcript_id: string;
+        full_text: string;
+        language?: string | null;
+        segments: AtomizationSegment[];
+    };
+    segments: AtomizationSegment[];
+    sponsor_segments?: { start: number; end: number; category: string }[];
+    existing_chapters: unknown[];
+}
+
+export interface AtomizedChildResponse {
+    id: string;
+    status: string;
+    feed_visibility: string;
+}
+
+export interface AtomizationCandidate {
+    id: string;
+    tenant_id: string;
+    type: ContentType;
+    title?: string | null;
+    source_name?: string | null;
+    duration_sec?: number | null;
+    chaptering_status?: string | null;
+    transcript_id?: string | null;
+    existing_child_count: number;
+    media_url?: string | null;
+    thumbnail_url?: string | null;
+    excerpt?: string | null;
+    body_text?: string | null;
+}
+
+export interface ListAtomizationCandidatesResponse {
+    items: AtomizationCandidate[];
+    transcript_candidates?: AtomizationCandidate[];
+}
+
+export interface AtomizationRunReportRequest {
+    run_id?: string;
+    status: 'queued' | 'running' | 'completed' | 'needs_review' | 'failed';
+    phase: 'planning' | 'cutting' | 'renditions' | 'children' | 'embedding';
+    child_count?: number;
+    review_count?: number;
+    error_message?: string;
+}
+
+export interface AtomizationRunReportResponse {
+    run_id: string;
+    status: string;
+    phase: string;
 }
 
 // =============================================================================
@@ -198,6 +335,13 @@ export interface OpBudgetStatus {
 export interface InternalContentItem {
     id: string;
     tenant_id: string;
+    type?: ContentType;
+    title?: string | null;
+    excerpt?: string | null;
+    source_name?: string | null;
+    parent_content_item_id?: string | null;
+    feed_visibility?: string;
+    chaptering_status?: string | null;
     /** Empty string when the source is unknown / not applicable. */
     source_type: string;
     media_url?: string | null;
@@ -306,6 +450,16 @@ export interface RequestSttResponse {
     status?: string;
     reason?: string;
     error?: string;
+}
+
+export interface UpdateTranscriptionJobRequest {
+    status?: 'queued' | 'running' | 'skipped' | 'succeeded' | 'failed' | 'writeback_failed' | 'canceled';
+    error_message?: string;
+    provider_error_code?: string;
+    media_job_id?: string;
+    writeback_status?: string;
+    writeback_error?: string;
+    actual_cost_usd?: number;
 }
 
 /**

@@ -6,6 +6,7 @@ import { Job } from 'bullmq';
 import { join } from 'path';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type AIJob } from '../queues/index.js';
+import { getQueue } from '../queues/index.js';
 import { cmsClient } from '../cms/client.js';
 import { config } from '../config/index.js';
 
@@ -21,6 +22,7 @@ import {
 } from '../ai/media-client.js';
 import { generateEmbeddingViaEnrichment } from '../ai/enrichment-client.js';
 import { buildEmbeddingText } from '../ai/embeddings.js';
+import { shouldAtomizeParent } from './atomization.helpers.js';
 
 // Media services
 import { extractAudio, getMediaInfo } from '../media/transcoder.js';
@@ -40,6 +42,7 @@ export const aiWorker = createWorker({
             heroImageUrl,
             captionState = 'none',
             captionText,
+            forceStt = false,
         } = job.data;
 
         jobLogger.info('Processing AI job', {
@@ -63,9 +66,10 @@ export const aiWorker = createWorker({
 
         try {
             // 1. Generate transcript if media path provided and transcript operation requested
+            const wantsTranscript = operations.includes('transcript');
             let resolvedMediaPath = mediaPath;
 
-            if (!resolvedMediaPath && mediaUrl) {
+            if (wantsTranscript && !resolvedMediaPath && mediaUrl) {
                 try {
                     jobLogger.info('Downloading media for transcript', { mediaUrl });
                     const expectedExt = contentType === 'PODCAST' ? 'mp3' : 'mp4';
@@ -85,7 +89,6 @@ export const aiWorker = createWorker({
             //  - youtube_auto / none → ask the CMS guard (toggle + budget + state
             //    machine) whether to upgrade via STT; if allowed, run it via Media
             //    (existing sync/async routing). Media writes back source=stt_*.
-            const wantsTranscript = operations.includes('transcript');
             let sttAllowed = false;
             let transcriptionJobId: string | undefined;
             if (wantsTranscript && captionState === 'youtube_human') {
@@ -93,7 +96,7 @@ export const aiWorker = createWorker({
                 jobLogger.info('Human YouTube caption present — skipping STT', { contentItemId });
             } else if (wantsTranscript && resolvedMediaPath) {
                 try {
-                    const decision = await cmsClient.requestStt(contentItemId, false, job.id);
+                    const decision = await cmsClient.requestStt(contentItemId, forceStt, job.id);
                     sttAllowed = decision.triggered;
                     transcriptionJobId = decision.job_id;
                     if (!sttAllowed) {
@@ -176,6 +179,24 @@ export const aiWorker = createWorker({
                         }
                     }
                 } catch (transcriptError) {
+                    if (transcriptionJobId) {
+                        try {
+                            await cmsClient.updateTranscriptionJob(
+                                transcriptionJobId,
+                                {
+                                    status: 'failed',
+                                    error_message: transcriptError instanceof Error ? transcriptError.message : 'Transcript generation failed',
+                                },
+                                job.id
+                            );
+                        } catch (jobUpdateError) {
+                            jobLogger.warn('Failed to mark transcription job failed', {
+                                contentItemId,
+                                transcriptionJobId,
+                                error: jobUpdateError instanceof Error ? jobUpdateError.message : 'Unknown error',
+                            });
+                        }
+                    }
                     // Transcript is best-effort, don't fail the job
                     jobLogger.warn('Transcript generation failed (non-blocking)', {
                         contentItemId,
@@ -288,7 +309,58 @@ export const aiWorker = createWorker({
             }
 
             // 5. Set status to READY (all required artifacts exist now)
-            await cmsClient.updateStatus(contentItemId, { status: 'READY' }, job.id);
+            let isAtomizedChild = false;
+            let shouldPublishEmbeddingPendingChild = false;
+            let parentDurationSec: number | null | undefined;
+            try {
+                const currentItem = await cmsClient.getContentItem(contentItemId, job.id);
+                isAtomizedChild = !!currentItem.parent_content_item_id;
+                parentDurationSec = currentItem.duration_sec;
+                shouldPublishEmbeddingPendingChild =
+                    isAtomizedChild && currentItem.feed_visibility === 'embedding_pending';
+            } catch (itemError) {
+                jobLogger.warn('Could not read content item before READY update', {
+                    contentItemId,
+                    error: itemError instanceof Error ? itemError.message : 'Unknown error',
+                });
+            }
+            await cmsClient.updateStatus(
+                contentItemId,
+                shouldPublishEmbeddingPendingChild
+                    ? { status: 'READY', feed_visibility: 'visible', chaptering_status: 'published' }
+                    : { status: 'READY' },
+                job.id
+            );
+
+            if ((contentType === 'VIDEO' || contentType === 'PODCAST') && !isAtomizedChild) {
+                const atomizationQueue = getQueue(QUEUE_NAMES.ATOMIZATION);
+                if (atomizationQueue && shouldAtomizeParent(parentDurationSec)) {
+                    if (transcriptWritten) {
+                        const atomizationJobId = `atomize-${contentItemId}`;
+                        await atomizationQueue.add(
+                            atomizationJobId,
+                            { contentItemId, reason: 'media-ready' },
+                            {
+                                priority: 3,
+                                jobId: atomizationJobId,
+                                removeOnComplete: { age: 3600, count: 200 },
+                                removeOnFail: { age: 86400 },
+                            }
+                        );
+                        jobLogger.info('Atomization job enqueued', { contentItemId, transcriptWritten });
+                    } else {
+                        jobLogger.warn('Atomization deferred until timestamped transcript is written', {
+                            contentItemId,
+                            durationSec: parentDurationSec,
+                        });
+                    }
+                } else if (atomizationQueue) {
+                    jobLogger.info('Atomization skipped for parent media at or under 40 minutes', {
+                        contentItemId,
+                        durationSec: parentDurationSec,
+                    });
+                }
+            }
 
             jobLogger.info('AI job completed, status set to READY', {
                 contentItemId,

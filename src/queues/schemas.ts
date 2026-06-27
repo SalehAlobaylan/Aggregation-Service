@@ -103,6 +103,24 @@ export interface AIJob {
     // though STT (if any) runs asynchronously.
     captionState?: 'youtube_human' | 'youtube_auto' | 'none';
     captionText?: string;
+    forceStt?: boolean;
+}
+
+/**
+ * Atomization Job - turns one parent podcast/video item into chapter feed units.
+ */
+export interface AtomizationJob {
+    contentItemId: string;
+    reason: 'media-ready' | 'transcript-ready' | 'manual' | 'sweeper';
+}
+
+/**
+ * Atomization Sweep Job - periodically asks CMS for transcript-ready media
+ * parents that missed the original AI-worker enqueue moment.
+ */
+export interface AtomizationSweepJob {
+    trigger: 'auto' | 'manual';
+    tenantId?: string;
 }
 
 /**
@@ -210,6 +228,8 @@ export const QUEUE_NAMES = {
     NORMALIZE: 'normalize-queue',
     MEDIA: 'media-queue',
     AI: 'ai-queue',
+    ATOMIZATION: 'atomization-queue',
+    ATOMIZATION_SWEEP: 'atomization-sweep-queue',
     STORAGE_SWEEP: 'storage-sweep-queue',
     RECONCILE: 'reconcile-queue',
     QUALITY_REENCODE: 'quality-reencode-queue',

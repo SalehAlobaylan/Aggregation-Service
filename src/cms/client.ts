@@ -14,6 +14,7 @@ import type {
     CreateTranscriptRequest,
     CreateTranscriptResponse,
     RequestSttResponse,
+    UpdateTranscriptionJobRequest,
     LinkTranscriptRequest,
     UpdateEmbeddingRequest,
     ApiResponse,
@@ -37,6 +38,12 @@ import type {
     NewsCirculationPolicy,
     ClaimCirculationSourcesResponse,
     ReportSourceRunRequest,
+    AtomizationInputResponse,
+    AtomizationChapter,
+    AtomizationRunReportRequest,
+    AtomizationRunReportResponse,
+    AtomizedChildResponse,
+    ListAtomizationCandidatesResponse,
 } from './types.js';
 
 // Circuit breaker for CMS calls
@@ -348,6 +355,19 @@ export const cmsClient = {
         );
     },
 
+    async updateTranscriptionJob(
+        transcriptionJobId: string,
+        data: UpdateTranscriptionJobRequest,
+        requestId?: string
+    ): Promise<void> {
+        await makeProtectedRequest(
+            'PATCH',
+            `/transcription-jobs/${transcriptionJobId}`,
+            data,
+            requestId
+        );
+    },
+
     /**
      * Link transcript to content item
      * PATCH /internal/content-items/:id/transcript
@@ -519,6 +539,67 @@ export const cmsClient = {
             'GET',
             `/content-items/${id}`,
             undefined,
+            requestId
+        );
+    },
+
+    async getAtomizationInput(id: string, requestId?: string): Promise<AtomizationInputResponse> {
+        return makeRequest<AtomizationInputResponse>(
+            'GET',
+            `/content-items/${id}/atomization`,
+            undefined,
+            requestId
+        );
+    },
+
+    async listAtomizationCandidates(limit = 25, tenantId = 'default', requestId?: string): Promise<ListAtomizationCandidatesResponse> {
+        const params = new URLSearchParams({
+            limit: String(limit),
+            tenant_id: tenantId,
+        });
+        return makeRequest<ListAtomizationCandidatesResponse>(
+            'GET',
+            `/atomization/candidates?${params.toString()}`,
+            undefined,
+            requestId
+        );
+    },
+
+    async saveAtomizationPlan(
+        id: string,
+        chapters: AtomizationChapter[],
+        requestId?: string
+    ): Promise<{ chapters: unknown[] }> {
+        return makeProtectedRequest<{ chapters: unknown[] }>(
+            'POST',
+            `/content-items/${id}/atomization/plan`,
+            { chapters },
+            requestId
+        );
+    },
+
+    async createAtomizedChildren(
+        id: string,
+        chapters: AtomizationChapter[],
+        requestId?: string
+    ): Promise<{ children: AtomizedChildResponse[] }> {
+        return makeProtectedRequest<{ children: AtomizedChildResponse[] }>(
+            'POST',
+            `/content-items/${id}/atomization/children`,
+            { chapters },
+            requestId
+        );
+    },
+
+    async reportAtomizationRun(
+        id: string,
+        data: AtomizationRunReportRequest,
+        requestId?: string
+    ): Promise<AtomizationRunReportResponse> {
+        return makeProtectedRequest<AtomizationRunReportResponse>(
+            'POST',
+            `/content-items/${id}/atomization/runs`,
+            data,
             requestId
         );
     },

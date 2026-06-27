@@ -9,6 +9,8 @@ import { fetchWorker } from './fetch.worker.js';
 import { normalizeWorker } from './normalize.worker.js';
 import { mediaWorker } from './media.worker.js';
 import { aiWorker } from './ai.worker.js';
+import { atomizationWorker } from './atomization.worker.js';
+import { atomizationSweepWorker, syncAtomizationSweeper } from './atomization-sweep.worker.js';
 import { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
 import { reconcileWorker, syncReconcileSweeper } from './reconcile.worker.js';
 import { qualityWorker } from './quality.worker.js';
@@ -25,6 +27,8 @@ const workers: Worker[] = [
     normalizeWorker,
     mediaWorker,
     aiWorker,
+    atomizationWorker,
+    atomizationSweepWorker,
     storageWorker,
     reconcileWorker,
     qualityWorker,
@@ -54,6 +58,11 @@ export function startWorkers(): void {
     // Schedule the embedding reconciliation sweep (H2 backstop).
     syncReconcileSweeper().catch(err => {
         logger.error('Failed to sync embedding reconciliation sweeper', err);
+    });
+    // Schedule atomization candidate discovery for READY parents that missed
+    // the original AI-worker enqueue moment.
+    syncAtomizationSweeper().catch(err => {
+        logger.error('Failed to sync atomization candidate sweeper', err);
     });
     // Schedule the Feeds-Finding discovery sweep (interval/toggle from CMS config).
     syncDiscoverySweeper().catch(err => {
@@ -98,6 +107,8 @@ export { fetchWorker } from './fetch.worker.js';
 export { normalizeWorker } from './normalize.worker.js';
 export { mediaWorker } from './media.worker.js';
 export { aiWorker } from './ai.worker.js';
+export { atomizationWorker } from './atomization.worker.js';
+export { atomizationSweepWorker, syncAtomizationSweeper } from './atomization-sweep.worker.js';
 export { storageWorker, syncRepeatableSweepers } from './storage.worker.js';
 export { reconcileWorker, syncReconcileSweeper } from './reconcile.worker.js';
 export { qualityWorker } from './quality.worker.js';
