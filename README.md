@@ -35,6 +35,7 @@ Background subsystems run alongside the main pipeline: **Media Atomization** (lo
 Aggregation executes atomization; CMS owns policy and feed visibility.
 
 - Only parent media longer than 2400 seconds (>40m) should enter atomization. Do not atomize 15m/30m parents by default.
+- CMS owns tenant/source/episode policy, exclusions, and manual-trigger validation. Aggregation only queues/executes manual atomization after CMS proxies a validated request.
 - The worker waits for timestamped transcripts, calls Enrichment `/v1/chapters/generate`, normalizes boundaries, merges chapters below 270s with the best legal adjacent neighbor, cuts media with FFmpeg, creates HLS/MP4/audio renditions, writes child feed units to CMS, and queues child embeddings.
 - Visible child feed units must be 270-2400 seconds. If a sub-270s chapter cannot legally merge, it stays hidden/review-only.
 - Re-atomization must be idempotent: stable parent job IDs, old children archived/replaced through CMS, and no duplicate visible sibling chapters.
@@ -136,6 +137,7 @@ No public/consumer routes. Admin routes require an admin JWT (`verifyAdminAuth`)
 | POST | `/admin/discover` · `/admin/preview` | JWT | Feed discovery from a URL · fetch+normalize preview (no CMS write) |
 | POST | `/admin/discovery/{run,sweep-now,build-graph-now,resync-schedule}` | JWT | Discovery + source-graph control |
 | POST | `/admin/atomization/sweep-now` | JWT | Manually enqueue the atomization sweeper |
+| POST | `/admin/atomization/parents/:id/atomize` | JWT via CMS | Queue one CMS-validated parent for transcript-first atomization or direct atomization |
 | GET/POST | `/admin/queues*`, `/admin/jobs/:id`, `/admin/retry-failed`, `/admin/retry-pending` | JWT | Queue & job ops |
 | GET/POST | `/admin/ratelimits*`, `/admin/scheduled`, `/admin/storage/*`, `/admin/quality/*`, `/admin/itunes/search`, `/admin/restart` | JWT | Rate-limit, schedule, storage, quality, ops |
 | POST | `/internal/jobs/user-content` | token | Inject user-submitted content into the pipeline |

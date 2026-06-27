@@ -111,7 +111,7 @@ export interface AIJob {
  */
 export interface AtomizationJob {
     contentItemId: string;
-    reason: 'media-ready' | 'transcript-ready' | 'manual' | 'sweeper';
+    reason: 'media-ready' | 'transcript-ready' | 'manual' | 'reatomize' | 'sweeper';
 }
 
 /**

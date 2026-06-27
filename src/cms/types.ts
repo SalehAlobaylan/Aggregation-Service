@@ -243,6 +243,10 @@ export interface AtomizationInputResponse {
         has_video?: boolean | null;
     };
     policy: AtomizationPolicy;
+    effective_policy?: AtomizationPolicy;
+    policy_source?: 'tenant' | 'source' | 'episode' | string;
+    atomization_disabled_reason?: string | null;
+    manual_requested?: boolean;
     transcript?: {
         transcript_id: string;
         full_text: string;
@@ -288,6 +292,8 @@ export interface AtomizationRunReportRequest {
     child_count?: number;
     review_count?: number;
     error_message?: string;
+    trigger?: 'manual' | 'reatomize' | 'sweeper' | string;
+    requested_by?: string;
 }
 
 export interface AtomizationRunReportResponse {

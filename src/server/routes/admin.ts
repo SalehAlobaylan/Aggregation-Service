@@ -8,7 +8,7 @@ import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
-import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob, AtomizationSweepJob } from '../../queues/schemas.js';
+import type { SourceType, ContentType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob, AtomizationSweepJob, AtomizationJob, AIJob } from '../../queues/schemas.js';
 import { verifyAdminAuth } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
@@ -402,6 +402,80 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         if (!q) return reply.status(503).send({ success: false, message: 'atomization sweep queue unavailable' });
         const job = await q.add('manual-atomization-sweep', { trigger: 'manual', tenantId: 'default' } satisfies AtomizationSweepJob, { priority: 1 });
         return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Atomization candidate sweep queued' });
+    });
+
+    fastify.post<{
+        Params: { id: string };
+        Body: {
+            contentItemId?: string;
+            reason?: 'manual' | 'reatomize';
+            hasTranscript?: boolean;
+            contentType?: string;
+            mediaUrl?: string;
+            thumbnailUrl?: string;
+            title?: string | null;
+            excerpt?: string | null;
+            bodyText?: string | null;
+        };
+    }>('/admin/atomization/parents/:id/atomize', { preHandler: verifyAdminAuth }, async (request, reply) => {
+        const contentItemId = request.body?.contentItemId || request.params.id;
+        const reason = request.body?.reason === 'reatomize' ? 'reatomize' : 'manual';
+        if (!contentItemId) {
+            return reply.status(400).send({ success: false, message: 'contentItemId is required' });
+        }
+
+        if (!request.body?.hasTranscript) {
+            const aiQueue = getQueue(QUEUE_NAMES.AI);
+            if (!aiQueue) return reply.status(503).send({ success: false, message: 'AI queue unavailable for transcript request' });
+            if (!request.body?.mediaUrl) return reply.status(400).send({ success: false, message: 'mediaUrl is required when transcript is missing' });
+            const jobId = `atomization-transcript-${contentItemId}`;
+            const existing = await aiQueue.getJob(jobId);
+            if (existing) {
+                const state = await existing.getState();
+                if (state === 'failed' || state === 'completed') {
+                    await existing.remove();
+                } else {
+                    return reply.send({ success: true, jobId, message: 'Transcript request already queued' });
+                }
+            }
+            await aiQueue.add(
+                `atomization-transcript-${contentItemId}`,
+                {
+                    contentItemId,
+                    contentType: (request.body.contentType || 'PODCAST') as ContentType,
+                    operations: ['transcript'],
+                    textContent: {
+                        title: request.body.title ?? '',
+                        excerpt: request.body.excerpt ?? undefined,
+                        bodyText: request.body.bodyText ?? undefined,
+                    },
+                    mediaUrl: request.body.mediaUrl,
+                    heroImageUrl: request.body.thumbnailUrl ?? undefined,
+                    forceStt: true,
+                } satisfies AIJob,
+                { priority: 1, jobId, removeOnComplete: { age: 3600, count: 200 }, removeOnFail: { age: 86400 } }
+            );
+            return reply.send({ success: true, jobId, message: 'Transcript request queued before atomization' });
+        }
+
+        const atomizationQueue = getQueue(QUEUE_NAMES.ATOMIZATION);
+        if (!atomizationQueue) return reply.status(503).send({ success: false, message: 'atomization queue unavailable' });
+        const jobId = `${reason === 'reatomize' ? 'reatomize' : 'atomize'}-${contentItemId}`;
+        const existing = await atomizationQueue.getJob(jobId);
+        if (existing) {
+            const state = await existing.getState();
+            if (state === 'failed' || state === 'completed') {
+                await existing.remove();
+            } else {
+                return reply.send({ success: true, jobId, message: 'Atomization already queued' });
+            }
+        }
+        const job = await atomizationQueue.add(
+            jobId,
+            { contentItemId, reason } satisfies AtomizationJob,
+            { priority: 1, jobId, removeOnComplete: { age: 3600, count: 200 }, removeOnFail: { age: 86400 } }
+        );
+        return reply.send({ success: true, jobId: job.id ?? jobId, message: reason === 'reatomize' ? 'Re-atomization queued' : 'Atomization queued' });
     });
 
     /**

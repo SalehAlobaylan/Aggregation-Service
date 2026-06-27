@@ -47,7 +47,7 @@ export const atomizationWorker = createWorker({
             currentPhase = phase;
             const response = await cmsClient.reportAtomizationRun(
                 contentItemId,
-                { run_id: runId, status, phase, ...extra },
+                { run_id: runId, status, phase, trigger: job.data.reason, ...extra },
                 job.id
             );
             runId = response.run_id;
