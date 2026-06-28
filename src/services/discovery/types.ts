@@ -2,7 +2,7 @@ import type { DiscoveryProfileInput } from '../../queues/schemas.js';
 
 export type { DiscoveryProfileInput };
 
-export type DiscoveryVia = 'tavily' | 'crawl' | 'itunes' | 'youtube-search';
+export type DiscoveryVia = 'tavily' | 'crawl' | 'itunes' | 'youtube-search' | 'youtube-import';
 
 export interface SiteCandidate {
     siteUrl: string;
@@ -29,6 +29,10 @@ export interface FeedHealth {
     audio_first?: boolean;
     category?: string;
     duration_sec?: number;
+    // YouTube tagged the source as a podcast (or it was found via podcast-intent
+    // search / a pasted podcast lockup) — drives the card's "Podcast" badge.
+    is_podcast?: boolean;
+    episode_count?: number;
 }
 
 export interface SuggestionCandidate {

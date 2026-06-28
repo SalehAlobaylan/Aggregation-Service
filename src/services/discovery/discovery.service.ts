@@ -8,7 +8,7 @@ import { getSearchProvider } from './search-provider.js';
 import { resolveFeeds } from './feed-resolver.js';
 import { validateFeed } from './validator.js';
 import { scoreConfidence } from './scorer.js';
-import { searchYouTubeChannels, fetchYouTubeChannel } from '../../ai/enrichment-client.js';
+import { searchYouTubeChannels, searchYouTubePodcasts, fetchYouTubeChannel } from '../../ai/enrichment-client.js';
 import type { DiscoveryProfileInput, SuggestionCandidate } from './types.js';
 
 export async function runDiscovery(profile: DiscoveryProfileInput): Promise<SuggestionCandidate[]> {
@@ -151,10 +151,31 @@ export async function runDiscovery(profile: DiscoveryProfileInput): Promise<Sugg
         const wantArabic = (profile.languages ?? []).includes('ar');
         const hasArabic = (t: string) => /[؀-ۿ]/.test(t);
 
-        // 1. Gather distinct candidate channels from a couple of keyword searches.
-        const candIds: { id: string; fallbackTitle: string | null }[] = [];
+        // 1. Gather distinct candidate channels. Two nets:
+        //    (a) podcast-intent search ("بودكاست <topic>") — the primary fix:
+        //        plain keyword search returns videos whose OWNERS are the famous
+        //        podcast networks (إذاعة ثمانية, Mics مايكس, إذاعة مختلف …), which
+        //        the channels-only search never surfaced. Podcast-tagged first.
+        //    (b) the generic channel net — catches non-podcast media channels.
+        const candIds: { id: string; fallbackTitle: string | null; podcast: boolean }[] = [];
         const ytSeen = new Set<string>();
-        for (const q of queries.slice(0, 2)) {
+        const baseQueries = queries.slice(0, 3);
+        const podcastQueries = baseQueries.map((q) => (wantArabic ? `بودكاست ${q}` : `${q} podcast`));
+        for (const q of podcastQueries) {
+            let channels;
+            try {
+                channels = await searchYouTubePodcasts(q, { limit: 8 });
+            } catch (error) {
+                logger.debug('YouTube podcast search skipped', { q, error: error instanceof Error ? error.message : String(error) });
+                continue;
+            }
+            for (const ch of channels) {
+                if (!ch.channel_id || ytSeen.has(ch.channel_id) || seen.has(`yt:${ch.channel_id}`)) continue;
+                ytSeen.add(ch.channel_id);
+                candIds.push({ id: ch.channel_id, fallbackTitle: ch.title, podcast: true });
+            }
+        }
+        for (const q of baseQueries.slice(0, 2)) {
             let channels;
             try {
                 channels = await searchYouTubeChannels(q, { limit: 6 });
@@ -165,16 +186,18 @@ export async function runDiscovery(profile: DiscoveryProfileInput): Promise<Sugg
             for (const ch of channels) {
                 if (!ch.channel_id || ytSeen.has(ch.channel_id) || seen.has(`yt:${ch.channel_id}`)) continue;
                 ytSeen.add(ch.channel_id);
-                candIds.push({ id: ch.channel_id, fallbackTitle: ch.title });
+                candIds.push({ id: ch.channel_id, fallbackTitle: ch.title, podcast: false });
             }
         }
 
         // 2. Fetch channel details in PARALLEL batches — each InnerTube call is
-        //    ~0.8s, so serial fetching dominated the run. Then gate + score.
+        //    ~0.8s, so serial fetching dominated the run. Cap the pool (podcast
+        //    candidates are first, so they're kept). Then gate + score.
+        const pool = candIds.slice(0, 24);
         const BATCH = 5;
-        for (let i = 0; i < candIds.length; i += BATCH) {
+        for (let i = 0; i < pool.length; i += BATCH) {
             if (out.filter((o) => o.type === 'YOUTUBE').length >= maxSuggestions) break;
-            const batch = candIds.slice(i, i + BATCH);
+            const batch = pool.slice(i, i + BATCH);
             const infos = await Promise.all(batch.map((cc) => fetchYouTubeChannel(cc.id).catch(() => null)));
             for (let j = 0; j < infos.length; j++) {
                 const info = infos[j];
@@ -201,6 +224,7 @@ export async function runDiscovery(profile: DiscoveryProfileInput): Promise<Sugg
                         audio_first: info.audio_first,
                         category: info.category ?? undefined,
                         duration_sec: info.top_duration_sec || undefined,
+                        is_podcast: batch[j].podcast || undefined,
                     },
                     sampleItems: titles.slice(0, 10).map((t) => ({ title: t })),
                     discoveredVia: 'youtube-search',

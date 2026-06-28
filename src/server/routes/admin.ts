@@ -19,6 +19,7 @@ import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
 import { syncDiscoverySweeper } from '../../workers/discovery-sweep.worker.js';
 import { syncSourceGraphSweeper } from '../../workers/source-graph.worker.js';
 import { syncNewsCirculationSweeper } from '../../workers/news-circulation.worker.js';
+import { importYouTubeFeed, importYouTubeLinks } from '../../services/discovery/youtube-import.js';
 // quality-sweeper worker removed in Phase 7; re-encoding is now driven by
 // the storage sweeper (when archive_action='re_encode').
 import { probeContentItem } from '../../services/quality.service.js';
@@ -504,6 +505,64 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 return reply.send({ success: true, jobId: job.id ?? undefined, message: `Discovery queued for ${profile.name}` });
             } catch (error) {
                 logger.error('Admin discovery trigger failed', error);
+                return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
+            }
+        }
+    );
+
+    /**
+     * Import channels from a pasted youtubei/v1 payload (the manual seed path).
+     * POST /admin/discovery/import-youtube
+     *
+     * Synchronous: parses the blob, enriches each channel via guest InnerTube,
+     * and posts them as suggestions for review. bodyLimit is raised because a
+     * personalized home-feed dump easily exceeds Fastify's 1 MB default.
+     */
+    fastify.post<{
+        Body: { raw?: unknown; profileId?: string; tenantId?: string; keywords?: string[] };
+    }>(
+        '/admin/discovery/import-youtube',
+        { preHandler: verifyAdminAuth, bodyLimit: 16 * 1024 * 1024 },
+        async (request, reply) => {
+            const { raw, profileId, tenantId, keywords } = request.body ?? {};
+            if (!raw || typeof raw !== 'object') {
+                return reply.status(400).send({ success: false, message: 'raw youtubei/v1 payload (object) is required' });
+            }
+            try {
+                const result = await importYouTubeFeed({ raw, profileId, tenantId, keywords });
+                logger.info('Admin imported YouTube feed', { profileId, ...result });
+                return reply.send({ success: true, ...result });
+            } catch (error) {
+                logger.error('YouTube import failed', error);
+                return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
+            }
+        }
+    );
+
+    /**
+     * Import channels from pasted YouTube links/@handles (the low-friction seed
+     * path). POST /admin/discovery/import-youtube-links
+     *
+     * Synchronous: resolves each reference to its channel via guest InnerTube,
+     * enriches it, and posts suggestions for review — same path as the JSON paste,
+     * minus the 1 MB DevTools blob.
+     */
+    fastify.post<{
+        Body: { inputs?: string[]; profileId?: string; tenantId?: string; keywords?: string[] };
+    }>(
+        '/admin/discovery/import-youtube-links',
+        { preHandler: verifyAdminAuth },
+        async (request, reply) => {
+            const { inputs, profileId, tenantId, keywords } = request.body ?? {};
+            if (!Array.isArray(inputs) || inputs.length === 0) {
+                return reply.status(400).send({ success: false, message: 'inputs (array of YouTube links/@handles) is required' });
+            }
+            try {
+                const result = await importYouTubeLinks({ inputs, profileId, tenantId, keywords });
+                logger.info('Admin imported YouTube links', { profileId, ...result });
+                return reply.send({ success: true, ...result });
+            } catch (error) {
+                logger.error('YouTube link import failed', error);
                 return reply.status(500).send({ success: false, message: error instanceof Error ? error.message : 'Unknown error' });
             }
         }

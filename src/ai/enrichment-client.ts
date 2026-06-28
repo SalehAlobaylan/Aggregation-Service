@@ -463,6 +463,105 @@ export async function searchYouTubeChannels(
     return data.channels ?? [];
 }
 
+export interface ExtractedChannel {
+    channel_id: string;
+    title: string | null;
+    handle: string | null;
+    is_podcast: boolean;
+    episode_count: number;
+    subscribers: number;
+    mention_count: number;
+}
+
+/**
+ * Podcast-intent YouTube search via Enrichment's guest InnerTube. Unlike the
+ * channels-only `searchYouTubeChannels`, this parses YouTube's podcast shelves +
+ * video owners for a "بودكاست <topic>" query, so the famous podcast networks
+ * (إذاعة ثمانية / Mics مايكس …) actually surface. No API key, no quota.
+ */
+export async function searchYouTubePodcasts(
+    query: string,
+    opts: { limit?: number; requestId?: string } = {},
+): Promise<ExtractedChannel[]> {
+    const response = await fetch(`${baseUrl()}/v1/extract/youtube/podcast-search`, {
+        method: 'POST',
+        body: JSON.stringify({ query, limit: opts.limit ?? 15 }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(opts.requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/youtube/podcast-search failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    const data = (await response.json()) as { channels: ExtractedChannel[] };
+    return data.channels ?? [];
+}
+
+/**
+ * Parse a pasted youtubei/v1 response (e.g. an admin's personalized home feed)
+ * into the distinct channels it references — the manual seed path. Stateless;
+ * the admin stays the authenticated session, we store no credentials.
+ */
+export async function parseYouTubeFeed(
+    raw: unknown,
+    requestId?: string,
+): Promise<ExtractedChannel[]> {
+    const response = await fetch(`${baseUrl()}/v1/extract/youtube/parse-feed`, {
+        method: 'POST',
+        body: JSON.stringify({ raw }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/youtube/parse-feed failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    const data = (await response.json()) as { channels: ExtractedChannel[] };
+    return data.channels ?? [];
+}
+
+/**
+ * Resolve pasted YouTube references (a @handle, channel URL, /channel/UC… URL,
+ * raw UC… id, or any video / share / shorts link) into the channels behind them
+ * via guest InnerTube (no auth, no quota). The low-friction seed path — each line
+ * is two taps off YouTube's Share button instead of a 1 MB DevTools JSON paste.
+ */
+export async function resolveYouTubeLinks(
+    inputs: string[],
+    requestId?: string,
+): Promise<ExtractedChannel[]> {
+    const response = await fetch(`${baseUrl()}/v1/extract/youtube/resolve-links`, {
+        method: 'POST',
+        body: JSON.stringify({ inputs }),
+        headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders(),
+            ...tracingHeaders(requestId),
+        },
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+            `Enrichment /v1/extract/youtube/resolve-links failed: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+    }
+    const data = (await response.json()) as { channels: ExtractedChannel[] };
+    return data.channels ?? [];
+}
+
 export interface AppleRelatedShow {
     adam_id: string;
     title: string | null;
