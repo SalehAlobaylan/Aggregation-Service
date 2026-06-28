@@ -44,6 +44,7 @@ import type {
     AtomizationRunReportResponse,
     AtomizedChildResponse,
     ListAtomizationCandidatesResponse,
+    AtomizationRepairResponse,
 } from './types.js';
 
 // Circuit breaker for CMS calls
@@ -561,6 +562,16 @@ export const cmsClient = {
             'GET',
             `/atomization/candidates?${params.toString()}`,
             undefined,
+            requestId
+        );
+    },
+
+    async repairAtomizationLeaks(tenantId = 'default', requestId?: string): Promise<AtomizationRepairResponse> {
+        const params = new URLSearchParams({ tenant_id: tenantId });
+        return makeProtectedRequest<AtomizationRepairResponse>(
+            'POST',
+            `/atomization/repair-leaks?${params.toString()}`,
+            {},
             requestId
         );
     },

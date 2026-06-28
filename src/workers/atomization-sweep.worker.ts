@@ -13,6 +13,23 @@ export const atomizationSweepWorker = createWorker({
     concurrency: 1,
     processor: async (job: Job<AtomizationSweepJob>, jobLogger): Promise<void> => {
         const tenantId = job.data.tenantId || 'default';
+        try {
+            const repair = await cmsClient.repairAtomizationLeaks(tenantId, job.id);
+            if (repair.updated_count > 0) {
+                jobLogger.info('Atomization sweep repaired feed invariants before candidate selection', {
+                    tenantId,
+                    updated: repair.updated_count,
+                    archivedShortParentChildren: repair.archived_short_parent_child_count ?? 0,
+                    hiddenDurationViolations: repair.hidden_duration_violation_count ?? 0,
+                    remainingDurationViolations: repair.remaining_count,
+                });
+            }
+        } catch (error) {
+            jobLogger.warn('Atomization sweep: preflight repair failed; continuing candidate selection', {
+                tenantId,
+                error: error instanceof Error ? error.message : 'Unknown error',
+            });
+        }
         const { items, transcript_candidates: transcriptCandidates = [] } = await cmsClient.listAtomizationCandidates(ATOMIZATION_SWEEP_BATCH, tenantId, job.id);
         const aiQueue = getQueue(QUEUE_NAMES.AI);
         let transcriptEnqueued = 0;

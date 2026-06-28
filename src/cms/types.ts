@@ -285,6 +285,17 @@ export interface ListAtomizationCandidatesResponse {
     transcript_candidates?: AtomizationCandidate[];
 }
 
+export interface AtomizationRepairResponse {
+    updated_count: number;
+    remaining_count: number;
+    hidden_duration_violation_count?: number;
+    archived_short_parent_child_count?: number;
+    restored_parent_count?: number;
+    restored_fuzzy_chapter_count?: number;
+    remaining_visible_under_floor_count?: number;
+    remaining_visible_over_hard_max_count?: number;
+}
+
 export interface AtomizationRunReportRequest {
     run_id?: string;
     status: 'queued' | 'running' | 'completed' | 'needs_review' | 'failed';
