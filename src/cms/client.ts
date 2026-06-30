@@ -31,6 +31,7 @@ import type {
     ResolveProfileResponse,
     UpdateContentItemQualityRequest,
     UpdateContentItemQualityResponse,
+    StorageArtifactEventRequest,
     InternalContentItem,
     WriteOpMetricsRequest,
     OpBudgetStatus,
@@ -465,6 +466,8 @@ export const cmsClient = {
             limit?: number;
             delete_failed_immediately?: boolean;
             max_bytes?: number;
+            include_atomized_parents?: boolean;
+            archive_action?: 'delete' | 'move_to_cold' | 're_encode' | string;
         },
         requestId?: string
     ): Promise<ListStorageCandidatesResponse> {
@@ -475,6 +478,8 @@ export const cmsClient = {
         if (params.limit !== undefined) qs.set('limit', String(params.limit));
         if (params.delete_failed_immediately !== undefined) qs.set('delete_failed_immediately', String(params.delete_failed_immediately));
         if (params.max_bytes !== undefined) qs.set('max_bytes', String(params.max_bytes));
+        if (params.include_atomized_parents !== undefined) qs.set('include_atomized_parents', String(params.include_atomized_parents));
+        if (params.archive_action !== undefined) qs.set('archive_action', String(params.archive_action));
         return makeRequest<ListStorageCandidatesResponse>(
             'GET',
             `/storage/candidates?${qs.toString()}`,
@@ -645,12 +650,13 @@ export const cmsClient = {
      * default exists) — caller falls back to DEFAULT_ENCODE_PROFILE.
      */
     async resolveQualityProfile(
-        params: { tenant_id?: string; source_type?: string },
+        params: { tenant_id?: string; source_type?: string; preset_key?: string },
         requestId?: string
     ): Promise<ResolveProfileResponse | null> {
         const qs = new URLSearchParams();
         if (params.tenant_id) qs.set('tenant_id', params.tenant_id);
         if (params.source_type) qs.set('source_type', params.source_type);
+        if (params.preset_key) qs.set('preset_key', params.preset_key);
         const query = qs.toString() ? `?${qs.toString()}` : '';
         try {
             return await makeRequest<ResolveProfileResponse>(
@@ -677,6 +683,23 @@ export const cmsClient = {
         return makeProtectedRequest<UpdateContentItemQualityResponse>(
             'PATCH',
             `/content-items/${id}/quality`,
+            data,
+            requestId
+        );
+    },
+
+    /**
+     * POST /internal/storage/artifact-events
+     * Execution ledger for storage/quality actions. Best effort from workers:
+     * failures are logged by callers but should not hide the primary result.
+     */
+    async recordStorageArtifactEvent(
+        data: StorageArtifactEventRequest,
+        requestId?: string
+    ): Promise<{ success: boolean; event_id: string }> {
+        return makeProtectedRequest<{ success: boolean; event_id: string }>(
+            'POST',
+            '/storage/artifact-events',
             data,
             requestId
         );

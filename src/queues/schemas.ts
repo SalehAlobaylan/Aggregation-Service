@@ -151,6 +151,7 @@ export interface QualityReencodeJob {
     tenantId: string;
     ruleId?: number;
     trigger: 'manual' | 'rule' | 'ingest';
+    contentRole?: string;
 }
 
 /**

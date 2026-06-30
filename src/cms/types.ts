@@ -156,6 +156,9 @@ export interface UpdateArtifactsRequest {
     fallback_playback_url?: string;
     has_video?: boolean;
     media_renditions?: MediaRendition[];
+    media_suitability?: 'audio_first_talking_head' | 'audio_first_show' | 'visual_dependent' | 'unsuitable' | 'unknown' | string;
+    media_suitability_confidence?: number;
+    media_suitability_reasons?: string[];
     // Quality bookkeeping. Originals are write-once at first ingest.
     original_size_bytes?: number;
     original_bitrate_kbps?: number;
@@ -369,6 +372,9 @@ export interface InternalContentItem {
     current_quality_profile_id?: number | null;
     current_bitrate_kbps?: number | null;
     duration_sec?: number | null;
+    media_suitability?: string;
+    media_suitability_confidence?: number | null;
+    media_suitability_reasons?: unknown;
 }
 
 // =============================================================================
@@ -409,6 +415,7 @@ export interface QualityProfile {
     max_input_duration_sec?: number | null;
 
     is_active: boolean;
+    preset_key?: string;
 }
 
 export interface ResolveProfileResponse {
@@ -423,11 +430,43 @@ export interface UpdateContentItemQualityRequest {
     current_bitrate_kbps?: number;
     current_quality_profile_id?: number;
     bump_version?: boolean;
+    old_media_url?: string;
+    old_size_bytes?: number;
+    old_storage_key?: string;
+    new_storage_key?: string;
+    event_reason?: string;
 }
 
 export interface UpdateContentItemQualityResponse {
     success: boolean;
     media_version: number;
+}
+
+export interface StorageArtifactEventRequest {
+    tenant_id?: string;
+    content_item_id: string;
+    parent_content_item_id?: string | null;
+    event_type: string;
+    status?: 'success' | 'skipped' | 'error' | 'approval_required' | string;
+    reason?: string;
+    trigger?: string;
+    source?: string;
+    storage_tier?: string;
+    old_storage_tier?: string;
+    old_media_url?: string;
+    new_media_url?: string;
+    old_size_bytes?: number;
+    new_size_bytes?: number;
+    freed_bytes?: number;
+    deleted_bytes?: number;
+    quality_profile_id?: number;
+    artifact_keys?: unknown;
+    recovery_payload?: unknown;
+    error?: string;
+    created_by?: string;
+    storage_state?: string;
+    storage_state_reason?: string;
+    storage_recovery_status?: string;
 }
 
 /**
@@ -486,6 +525,7 @@ export interface StoragePolicy {
     id: number;
     tenant_id: string | null;
     enabled: boolean;
+    preset?: 'balanced' | 'conservative' | 'storage_saver' | 'critical_pressure' | string;
     max_storage_bytes: number;
     target_utilization_pct: number;
     min_age_days: number;
@@ -511,14 +551,27 @@ export interface ListStoragePoliciesResponse {
 
 export interface StorageCandidate {
     id: string;
-    tenant_id: string;
+    tenant_id?: string;
     type: string;
     status: string;
+    title?: string;
+    source_name?: string;
     media_url?: string;
     thumbnail_url?: string;
     file_size_bytes: number;
     view_count: number;
     created_at: string;
+    published_at?: string;
+    parent_content_item_id?: string;
+    is_feed_unit?: boolean;
+    feed_visibility?: string;
+    duration_sec?: number;
+    original_url?: string;
+    source_feed_url?: string;
+    source_episode_id?: string;
+    media_suitability?: string;
+    content_role?: 'hot_feed_unit' | 'normal_feed_unit' | 'dormant_feed_unit' | 'atomized_parent_source' | 'unsuitable_media' | 'failed_or_orphan_artifact' | string;
+    protection_reason?: string;
 }
 
 export interface ListStorageCandidatesResponse {

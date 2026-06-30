@@ -1,7 +1,7 @@
 /**
  * Storage circulation service.
  *
- * Owns the "delete S3 objects + archive DB rows" cycle for one tenant.
+ * Owns bounded storage relief for one tenant.
  * Used by:
  *   - the storage worker's repeatable BullMQ tick
  *   - the manual `/admin/storage/sweep` endpoint
@@ -106,6 +106,8 @@ export async function runSweepForTenant(
             min_age_days: policy.min_age_days,
             max_view_count: policy.min_view_count_for_keep,
             delete_failed_immediately: policy.delete_failed_immediately,
+            include_atomized_parents: true,
+            archive_action: policy.archive_action,
             limit: 1000,
             max_bytes: maxBytes,
         });
@@ -127,15 +129,54 @@ export async function runSweepForTenant(
             ? ['processed', 'original']
             : ['processed', 'original', 'thumbnail'];
 
-        const action = policy.archive_action ?? 'delete';
-        const moveToCold = action === 'move_to_cold' && isColdTierConfigured();
-        if (action === 'move_to_cold' && !moveToCold) {
-            logger.warn('storage.sweep: archive_action=move_to_cold but cold tier is not configured; falling back to delete', {
+        const configuredAction = policy.archive_action ?? 're_encode';
+        const moveToCold = configuredAction === 'move_to_cold' && isColdTierConfigured();
+        const action = configuredAction === 'move_to_cold' && !moveToCold ? 're_encode' : configuredAction;
+        if (configuredAction === 'move_to_cold' && !moveToCold) {
+            logger.warn('storage.sweep: archive_action=move_to_cold but cold tier is not configured; falling back to re-encode guardrails', {
                 tenantId,
             });
         }
 
-        if (action === 're_encode') {
+        if (action === 'delete' && trigger === 'auto') {
+            for (const candidate of candidates.data) {
+                await cmsClient.recordStorageArtifactEvent({
+                    tenant_id: tenantId,
+                    content_item_id: candidate.id,
+                    event_type: 'recoverable_deleted',
+                    status: 'approval_required',
+                    reason: isColdTierConfigured()
+                        ? 'auto_delete_requires_approval'
+                        : 'degraded_no_cold_delete_requires_approval',
+                    trigger,
+                    source: 'aggregation_storage_sweep',
+                    old_media_url: candidate.media_url,
+                    old_size_bytes: candidate.file_size_bytes,
+                    artifact_keys: { artifacts },
+                    recovery_payload: {
+                        original_url: candidate.original_url,
+                        source_feed_url: candidate.source_feed_url,
+                        source_episode_id: candidate.source_episode_id,
+                        parent_content_item_id: candidate.parent_content_item_id,
+                        is_feed_unit: candidate.is_feed_unit,
+                        feed_visibility: candidate.feed_visibility,
+                        duration_sec: candidate.duration_sec,
+                        media_suitability: candidate.media_suitability,
+                    },
+                }).catch(err => logger.warn('storage.sweep: failed to record delete approval requirement', {
+                    err,
+                    contentId: candidate.id,
+                }));
+            }
+            errorMessage = isColdTierConfigured()
+                ? 'auto_delete_requires_approval'
+                : 'degraded_no_cold_delete_requires_approval';
+            logger.warn('storage.sweep: automatic recoverable delete requires approval; no objects were deleted', {
+                tenantId,
+                candidateCount: candidates.data.length,
+                coldTierConfigured: isColdTierConfigured(),
+            });
+        } else if (action === 're_encode') {
             // Enqueue one QUALITY_REENCODE job per candidate. We don't wait
             // for them here — they run async on the quality.worker queue and
             // patch CMS as each completes. The sweep run row records the
@@ -147,19 +188,19 @@ export async function runSweepForTenant(
                 logger.error('storage.sweep: QUALITY_REENCODE queue not initialised; cannot re-encode', { tenantId });
                 errorMessage = 'quality_queue_not_initialised';
             } else {
+                const roleProfileCache = new Map<string, number>();
                 for (const candidate of candidates.data) {
-                    // Pick the explicit target if set on the policy; otherwise
-                    // pass 0 — the re-encode worker reads the per-item resolved
-                    // ingest profile when it sees targetProfileId<=0.
-                    const targetId = policy.re_encode_target_profile_id ?? 0;
+                    const targetId = await resolveReencodeTargetForRole(policy, candidate, roleProfileCache);
+                    const contentRole = candidate.content_role ?? storageRoleForCandidate(candidate);
                     const payload: QualityReencodeJob = {
                         contentItemId: candidate.id,
                         targetProfileId: targetId,
                         tenantId,
                         trigger: trigger === 'manual' ? 'manual' : 'rule',
+                        contentRole,
                     };
                     try {
-                        const jobId = `reencode:${tenantId}:${candidate.id}:${targetId}`;
+                        const jobId = buildReencodeJobId(tenantId, candidate.id, targetId, contentRole);
                         const existing = await queue.getJob(jobId);
                         if (existing) {
                             logger.info('storage.sweep: re-encode already queued; skipping duplicate', {
@@ -167,6 +208,21 @@ export async function runSweepForTenant(
                                 jobId,
                                 state: await existing.getState().catch(() => 'unknown'),
                             });
+                            await cmsClient.recordStorageArtifactEvent({
+                                tenant_id: tenantId,
+                                content_item_id: candidate.id,
+                                event_type: 'reencoded',
+                                status: 'skipped',
+                                reason: 'already_queued',
+                                trigger,
+                                source: 'aggregation_storage_sweep',
+                                old_media_url: candidate.media_url,
+                                old_size_bytes: candidate.file_size_bytes,
+                                artifact_keys: { job_id: jobId, content_role: contentRole, target_profile_id: targetId },
+                            }).catch(err => logger.warn('storage.sweep: failed to record duplicate re-encode skip', {
+                                err,
+                                contentId: candidate.id,
+                            }));
                             continue;
                         }
                         await queue.add('reencode', payload, {
@@ -184,6 +240,22 @@ export async function runSweepForTenant(
                         logger.error('storage.sweep: failed to enqueue re-encode', err, {
                             contentId: candidate.id,
                         });
+                        await cmsClient.recordStorageArtifactEvent({
+                            tenant_id: tenantId,
+                            content_item_id: candidate.id,
+                            event_type: 'reencoded',
+                            status: 'error',
+                            reason: 'queue_enqueue_failed',
+                            trigger,
+                            source: 'aggregation_storage_sweep',
+                            old_media_url: candidate.media_url,
+                            old_size_bytes: candidate.file_size_bytes,
+                            artifact_keys: { content_role: contentRole, target_profile_id: targetId },
+                            error: err instanceof Error ? err.message : String(err),
+                        }).catch(writeErr => logger.warn('storage.sweep: failed to record re-encode enqueue error', {
+                            err: writeErr,
+                            contentId: candidate.id,
+                        }));
                     }
                 }
             }
@@ -200,6 +272,21 @@ export async function runSweepForTenant(
                     if (moveResult.movedCount === 0) {
                         // Nothing moved (probably already gone) — skip the CMS update so
                         // we don't lie about the URL change.
+                        await cmsClient.recordStorageArtifactEvent({
+                            tenant_id: tenantId,
+                            content_item_id: candidate.id,
+                            event_type: 'moved_cold',
+                            status: 'skipped',
+                            reason: 'no_objects_moved',
+                            trigger,
+                            source: 'aggregation_storage_sweep',
+                            old_media_url: candidate.media_url,
+                            old_size_bytes: candidate.file_size_bytes,
+                            artifact_keys: { artifacts },
+                        }).catch(err => logger.warn('storage.sweep: failed to record cold move skip', {
+                            err,
+                            contentId: candidate.id,
+                        }));
                         continue;
                     }
                     // Track moves separately from deletes so the sweep-run row
@@ -222,6 +309,22 @@ export async function runSweepForTenant(
                     logger.error('storage.sweep: failed to move to cold', err, {
                         contentId: candidate.id,
                     });
+                    await cmsClient.recordStorageArtifactEvent({
+                        tenant_id: tenantId,
+                        content_item_id: candidate.id,
+                        event_type: 'moved_cold',
+                        status: 'error',
+                        reason: 'move_to_cold_failed',
+                        trigger,
+                        source: 'aggregation_storage_sweep',
+                        old_media_url: candidate.media_url,
+                        old_size_bytes: candidate.file_size_bytes,
+                        artifact_keys: { artifacts },
+                        error: err instanceof Error ? err.message : String(err),
+                    }).catch(writeErr => logger.warn('storage.sweep: failed to record cold move error', {
+                        err: writeErr,
+                        contentId: candidate.id,
+                    }));
                 }
             }
 
@@ -253,6 +356,22 @@ export async function runSweepForTenant(
                     logger.error('storage.sweep: failed to delete objects', err, {
                         contentId: candidate.id,
                     });
+                    await cmsClient.recordStorageArtifactEvent({
+                        tenant_id: tenantId,
+                        content_item_id: candidate.id,
+                        event_type: 'recoverable_deleted',
+                        status: 'error',
+                        reason: 'delete_objects_failed',
+                        trigger,
+                        source: 'aggregation_storage_sweep',
+                        old_media_url: candidate.media_url,
+                        old_size_bytes: candidate.file_size_bytes,
+                        artifact_keys: { artifacts },
+                        error: err instanceof Error ? err.message : String(err),
+                    }).catch(writeErr => logger.warn('storage.sweep: failed to record delete error', {
+                        err: writeErr,
+                        contentId: candidate.id,
+                    }));
                 }
             }
 
@@ -300,6 +419,89 @@ export async function runSweepForTenant(
         skipped: false,
         error: errorMessage,
     };
+}
+
+async function resolveReencodeTargetForRole(
+    policy: StoragePolicy,
+    candidate: { tenant_id?: string; type?: string; content_role?: string; media_suitability?: string },
+    cache: Map<string, number>
+): Promise<number> {
+    if (policy.re_encode_target_profile_id && policy.re_encode_target_profile_id > 0) {
+        return policy.re_encode_target_profile_id;
+    }
+    const role = candidate.content_role ?? storageRoleForCandidate(candidate);
+    const presetKey = presetKeyForStorageRole(role);
+    if (!presetKey) return 0;
+
+    const tenantId = candidate.tenant_id ?? policy.tenant_id ?? undefined;
+    const sourceType = candidate.type;
+    const cacheKey = `${tenantId ?? ''}:${sourceType ?? ''}:${presetKey}`;
+    if (cache.has(cacheKey)) return cache.get(cacheKey) ?? 0;
+
+    try {
+        const resolved = await cmsClient.resolveQualityProfile({
+            tenant_id: tenantId,
+            source_type: sourceType,
+            preset_key: presetKey,
+        });
+        const id = resolved?.profile?.id ?? 0;
+        cache.set(cacheKey, id);
+        return id;
+    } catch (err) {
+        logger.warn('storage.sweep: role profile resolution failed; falling back to per-item profile', {
+            err,
+            role,
+            presetKey,
+            tenantId,
+            sourceType,
+        });
+        cache.set(cacheKey, 0);
+        return 0;
+    }
+}
+
+function presetKeyForStorageRole(role: string): string | null {
+    switch (role) {
+        case 'atomized_parent_source':
+        case 'dormant_feed_unit':
+        case 'unsuitable_media':
+        case 'failed_or_orphan_artifact':
+            return 'storage-saver';
+        case 'normal_feed_unit':
+            return 'mobile-feed';
+        case 'hot_feed_unit':
+            return 'high-quality';
+        default:
+            return null;
+    }
+}
+
+function storageRoleForCandidate(candidate: { status?: string; is_feed_unit?: boolean; feed_visibility?: string; duration_sec?: number; parent_content_item_id?: string; media_suitability?: string; view_count?: number }): string {
+    if (candidate.status === 'FAILED') return 'failed_or_orphan_artifact';
+    if (candidate.media_suitability === 'visual_dependent' || candidate.media_suitability === 'unsuitable') return 'unsuitable_media';
+    if (!candidate.parent_content_item_id && candidate.is_feed_unit === false && (candidate.duration_sec ?? 0) > 2400) return 'atomized_parent_source';
+    if (candidate.is_feed_unit && candidate.feed_visibility === 'visible') {
+        return (candidate.view_count ?? 0) <= 5 ? 'dormant_feed_unit' : 'normal_feed_unit';
+    }
+    return 'dormant_feed_unit';
+}
+
+function buildReencodeJobId(
+    tenantId: string,
+    contentItemId: string,
+    targetProfileId: number,
+    contentRole: string
+): string {
+    const safe = (value: string) =>
+        value.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
+
+    return [
+        'reencode',
+        safe(tenantId),
+        safe(contentItemId),
+        String(targetProfileId),
+        safe(contentRole),
+    ].join('-');
 }
 
 /**

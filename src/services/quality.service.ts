@@ -31,6 +31,7 @@ import {
 import { cleanupTempFile } from '../media/downloader.js';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
+import type { InternalContentItem } from '../cms/types.js';
 
 /**
  * Convert a CMS QualityProfile row into the EncodeProfile shape ffmpeg uses.
@@ -222,9 +223,25 @@ function isStorageMissingError(err: unknown): boolean {
     );
 }
 
+async function recordStorageArtifactEventBestEffort(
+    data: Parameters<typeof cmsClient.recordStorageArtifactEvent>[0]
+): Promise<void> {
+    try {
+        await cmsClient.recordStorageArtifactEvent(data);
+    } catch (err) {
+        logger.warn('Quality re-encode could not write storage artifact ledger event', {
+            err,
+            contentItemId: data.content_item_id,
+            eventType: data.event_type,
+            status: data.status,
+        });
+    }
+}
+
 async function markMissingSourceFailed(
     contentItemId: string,
-    candidates: string[] | undefined
+    candidates: string[] | undefined,
+    item?: InternalContentItem | null
 ): Promise<void> {
     try {
         await cmsClient.updateStatus(contentItemId, {
@@ -241,6 +258,24 @@ async function markMissingSourceFailed(
             candidates,
         });
     }
+    await recordStorageArtifactEventBestEffort({
+        tenant_id: item?.tenant_id,
+        content_item_id: contentItemId,
+        parent_content_item_id: item?.parent_content_item_id ?? undefined,
+        event_type: 'reencoded',
+        status: 'error',
+        reason: 'source_object_missing',
+        trigger: 'quality_reencode',
+        source: 'aggregation_quality_worker',
+        storage_tier: item?.storage_tier ?? undefined,
+        old_media_url: item?.media_url ?? undefined,
+        old_size_bytes: item?.file_size_bytes,
+        artifact_keys: { source_candidates: candidates ?? [] },
+        error: 'source object missing',
+        storage_state: 'missing',
+        storage_state_reason: 'quality_reencode_source_object_missing',
+        storage_recovery_status: 'at_risk',
+    });
 }
 
 /**
@@ -263,9 +298,10 @@ export async function reencodeOneItem(args: {
     tenantId: string;
     ruleId?: number;
     trigger: 'manual' | 'rule' | 'ingest';
+    contentRole?: string;
 }): Promise<ReencodeResult> {
     const start = Date.now();
-    const { contentItemId, targetProfileId, tenantId, ruleId, trigger } = args;
+    const { contentItemId, targetProfileId, tenantId, ruleId, trigger, contentRole } = args;
     // tenantId / ruleId are kept on the args for compatibility with the
     // BullMQ job payload shape (storage sweeps fill them in for telemetry),
     // but the per-history-row writes that consumed them were dropped in
@@ -286,12 +322,13 @@ export async function reencodeOneItem(args: {
 
     let tempIn: string | undefined;
     let tempOut: string | undefined;
+    let item: InternalContentItem | null = null;
 
     try {
         // 1. Pull the item record first — we need its source_type for the
         // "auto" profile-resolution path AND its tier/version/URL regardless
         // of which path we take.
-        const item = await cmsClient.getContentItem(contentItemId);
+        item = await cmsClient.getContentItem(contentItemId);
 
         // Resolve the profile. Storage sweeps pass targetProfileId=0 to mean
         // "auto-pick the resolved ingest profile for this item" (the
@@ -317,6 +354,22 @@ export async function reencodeOneItem(args: {
             logger.info('Quality re-encode skipped — already at target profile', {
                 contentItemId,
                 targetProfileId: profile.id,
+            });
+            await recordStorageArtifactEventBestEffort({
+                tenant_id: item.tenant_id,
+                content_item_id: contentItemId,
+                parent_content_item_id: item.parent_content_item_id ?? undefined,
+                event_type: 'reencoded',
+                status: 'skipped',
+                reason: 'already_target_profile',
+                trigger: 'quality_reencode',
+                source: 'aggregation_quality_worker',
+                storage_tier: item.storage_tier ?? undefined,
+                old_media_url: item.media_url ?? undefined,
+                new_media_url: item.media_url ?? undefined,
+                old_size_bytes: item.file_size_bytes,
+                new_size_bytes: item.file_size_bytes,
+                quality_profile_id: profile.id,
             });
             result.success = true;
             result.skippedIdempotent = true;
@@ -345,7 +398,7 @@ export async function reencodeOneItem(args: {
                 mediaUrl: item.media_url,
                 candidates: source.candidates,
             });
-            await markMissingSourceFailed(contentItemId, source.candidates);
+            await markMissingSourceFailed(contentItemId, source.candidates, item);
             return nonRetryableResult(
                 result,
                 'source_object_missing',
@@ -378,6 +431,21 @@ export async function reencodeOneItem(args: {
                 sourceKey,
                 reason: preflightBeforeProbe,
             });
+            await recordStorageArtifactEventBestEffort({
+                tenant_id: item.tenant_id,
+                content_item_id: contentItemId,
+                parent_content_item_id: item.parent_content_item_id ?? undefined,
+                event_type: 'reencoded',
+                status: 'skipped',
+                reason: preflightBeforeProbe,
+                trigger: 'quality_reencode',
+                source: 'aggregation_quality_worker',
+                storage_tier: tier,
+                old_media_url: item.media_url ?? undefined,
+                old_size_bytes: downloaded.size,
+                quality_profile_id: profile.id,
+                artifact_keys: { old_key: sourceKey },
+            });
             return nonRetryableResult(result, preflightBeforeProbe, start, { oldKey: sourceKey });
         }
 
@@ -398,6 +466,21 @@ export async function reencodeOneItem(args: {
                 contentItemId,
                 sourceKey,
                 reason: preflightAfterProbe,
+            });
+            await recordStorageArtifactEventBestEffort({
+                tenant_id: item.tenant_id,
+                content_item_id: contentItemId,
+                parent_content_item_id: item.parent_content_item_id ?? undefined,
+                event_type: 'reencoded',
+                status: 'skipped',
+                reason: preflightAfterProbe,
+                trigger: 'quality_reencode',
+                source: 'aggregation_quality_worker',
+                storage_tier: tier,
+                old_media_url: item.media_url ?? undefined,
+                old_size_bytes: downloaded.size,
+                quality_profile_id: profile.id,
+                artifact_keys: { old_key: sourceKey },
             });
             return nonRetryableResult(result, preflightAfterProbe, start, { oldKey: sourceKey });
         }
@@ -432,6 +515,11 @@ export async function reencodeOneItem(args: {
             current_bitrate_kbps: result.newBitrateKbps || result.originalBitrateKbps,
             current_quality_profile_id: profile.id,
             bump_version: true,
+            old_media_url: item.media_url ?? undefined,
+            old_size_bytes: result.originalSizeBytes || item.file_size_bytes,
+            old_storage_key: sourceKey,
+            new_storage_key: newKey,
+            event_reason: contentRole ? `storage_quality_reencode:${contentRole}` : 'storage_quality_reencode',
         });
         result.mediaUrl = newUrl;
         logger.info('Quality re-encode patched CMS', {
@@ -452,7 +540,7 @@ export async function reencodeOneItem(args: {
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (isStorageMissingError(err)) {
-            await markMissingSourceFailed(contentItemId, result.sourceCandidates);
+            await markMissingSourceFailed(contentItemId, result.sourceCandidates, item);
             return nonRetryableResult(
                 result,
                 'source_object_missing',

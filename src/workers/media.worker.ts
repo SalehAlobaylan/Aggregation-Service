@@ -37,6 +37,63 @@ import { captionsToFullText } from '../media/captions.js';
 import { lookup as lookupMime } from 'mime-types';
 
 type CaptionState = 'youtube_human' | 'youtube_auto' | 'none';
+type MediaSuitabilityVerdict =
+    | 'audio_first_talking_head'
+    | 'audio_first_show'
+    | 'visual_dependent'
+    | 'unsuitable'
+    | 'unknown';
+
+interface MediaSuitabilityResult {
+    verdict: MediaSuitabilityVerdict;
+    confidence: number;
+    reasons: string[];
+}
+
+function classifyMediaSuitability(args: {
+    contentType: string;
+    sourceType: string;
+    title?: string;
+    excerpt?: string;
+    mediaInfo: { duration: number; hasVideo: boolean; hasAudio: boolean; width?: number; height?: number };
+    hasCaptions: boolean;
+    categories?: string[];
+    downloadKind?: string;
+}): MediaSuitabilityResult {
+    const reasons: string[] = [];
+    const text = `${args.title ?? ''} ${args.excerpt ?? ''} ${(args.categories ?? []).join(' ')}`.toLowerCase();
+    const visualTerms = ['sports', 'match', 'highlights', 'documentary', 'screen', 'tutorial', 'explainer', 'gameplay', 'animation'];
+    const talkingTerms = ['podcast', 'interview', 'episode', 'show', 'conversation', 'بودكاست', 'مقابلة', 'حلقة'];
+
+    if (args.downloadKind === 'photo') {
+        return { verdict: 'unsuitable', confidence: 0.9, reasons: ['image artifact is not audio-first media'] };
+    }
+    if (!args.mediaInfo.hasAudio) {
+        return { verdict: 'unsuitable', confidence: 0.85, reasons: ['no audio track'] };
+    }
+    if (args.contentType === 'PODCAST' || args.sourceType === 'PODCAST') {
+        reasons.push('podcast source/type');
+        return { verdict: 'audio_first_talking_head', confidence: 0.85, reasons };
+    }
+    if (visualTerms.some(term => text.includes(term))) {
+        reasons.push('visual-dependent title/category hint');
+        return { verdict: 'visual_dependent', confidence: 0.68, reasons };
+    }
+    if (talkingTerms.some(term => text.includes(term))) {
+        reasons.push('audio-consumable title/category hint');
+        return { verdict: 'audio_first_show', confidence: 0.72, reasons };
+    }
+    if (args.hasCaptions && args.mediaInfo.hasAudio && args.mediaInfo.duration >= 270) {
+        reasons.push('captioned long-form audio media');
+        return { verdict: 'audio_first_show', confidence: 0.62, reasons };
+    }
+    if (args.mediaInfo.hasVideo && args.mediaInfo.hasAudio && args.mediaInfo.duration >= 270) {
+        reasons.push('long-form audio/video media, visual dependency unknown');
+        return { verdict: 'unknown', confidence: 0.45, reasons };
+    }
+    reasons.push('insufficient suitability signals');
+    return { verdict: 'unknown', confidence: 0.35, reasons };
+}
 
 export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
@@ -243,6 +300,16 @@ export const mediaWorker = createWorker({
             if (downloadResult.heatmap?.length) downloadMeta['heatmap'] = downloadResult.heatmap;
             if (downloadResult.sponsorSegments?.length) downloadMeta['sponsor_segments'] = downloadResult.sponsorSegments;
             if (downloadResult.categories?.length) downloadMeta['categories'] = downloadResult.categories;
+            const suitability = classifyMediaSuitability({
+                contentType,
+                sourceType,
+                title: job.data.textContent?.title,
+                excerpt: job.data.textContent?.excerpt,
+                mediaInfo,
+                hasCaptions: Boolean(downloadResult.captions?.segments?.length),
+                categories: downloadResult.categories,
+                downloadKind: downloadRef?.mediaKind,
+            });
 
             await cmsClient.updateArtifacts(contentItemId, {
                 media_url: mediaUrl,
@@ -253,6 +320,9 @@ export const mediaWorker = createWorker({
                 original_bitrate_kbps: originalBitrateKbps,
                 current_bitrate_kbps: originalBitrateKbps,
                 current_quality_profile_id: ingestProfileId ?? undefined,
+                media_suitability: suitability.verdict,
+                media_suitability_confidence: suitability.confidence,
+                media_suitability_reasons: suitability.reasons,
                 metadata: Object.keys(downloadMeta).length > 0 ? downloadMeta : undefined,
             }, job.id);
 

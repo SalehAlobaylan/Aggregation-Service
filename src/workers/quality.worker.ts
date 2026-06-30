@@ -52,6 +52,7 @@ export const qualityWorker = createWorker({
             contentItemId: data.contentItemId,
             targetProfileId: data.targetProfileId,
             trigger: data.trigger,
+            contentRole: data.contentRole,
         });
 
         const result = await reencodeOneItem({
@@ -60,6 +61,7 @@ export const qualityWorker = createWorker({
             tenantId: data.tenantId,
             ruleId: data.ruleId,
             trigger: data.trigger,
+            contentRole: data.contentRole,
         });
 
         if (!result.success) {
