@@ -1166,7 +1166,32 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         };
     }
     let cachedStats: { at: number; data: StatsPayload } | null = null;
+    let statsInFlight: Promise<StatsPayload> | null = null;
     const STORAGE_STATS_TTL_MS = 60 * 1000;
+
+    async function loadStorageStatsPayload(): Promise<StatsPayload> {
+        const primary = await computeStorageUsage('primary');
+        const payload: StatsPayload = {
+            used_bytes: primary.usedBytes,
+            object_count: primary.objectCount,
+            by_artifact_type: primary.byArtifactType,
+            cold_enabled: isColdTierConfigured(),
+        };
+        if (payload.cold_enabled) {
+            try {
+                const cold = await computeStorageUsage('cold');
+                payload.cold = {
+                    used_bytes: cold.usedBytes,
+                    object_count: cold.objectCount,
+                    by_artifact_type: cold.byArtifactType,
+                };
+            } catch (coldErr) {
+                logger.warn('storage.stats: cold tier query failed', { error: (coldErr as Error).message });
+            }
+        }
+        cachedStats = { at: Date.now(), data: payload };
+        return payload;
+    }
 
     fastify.get(
         '/admin/storage/stats',
@@ -1176,26 +1201,12 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 return reply.send(cachedStats.data);
             }
             try {
-                const primary = await computeStorageUsage('primary');
-                const payload: StatsPayload = {
-                    used_bytes: primary.usedBytes,
-                    object_count: primary.objectCount,
-                    by_artifact_type: primary.byArtifactType,
-                    cold_enabled: isColdTierConfigured(),
-                };
-                if (payload.cold_enabled) {
-                    try {
-                        const cold = await computeStorageUsage('cold');
-                        payload.cold = {
-                            used_bytes: cold.usedBytes,
-                            object_count: cold.objectCount,
-                            by_artifact_type: cold.byArtifactType,
-                        };
-                    } catch (coldErr) {
-                        logger.warn('storage.stats: cold tier query failed', { error: (coldErr as Error).message });
-                    }
+                if (!statsInFlight) {
+                    statsInFlight = loadStorageStatsPayload().finally(() => {
+                        statsInFlight = null;
+                    });
                 }
-                cachedStats = { at: Date.now(), data: payload };
+                const payload = await statsInFlight;
                 return reply.send(payload);
             } catch (err) {
                 logger.error('storage.stats: failed', err);
@@ -1329,6 +1340,10 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     missing_objects: out.missingObjects,
                     orphan_count: out.orphanCount,
                     missing_count: out.missingCount,
+                    scanned_object_count: out.scannedObjectCount,
+                    scanned_cms_item_count: out.scannedCmsItemCount,
+                    partial: out.partial,
+                    truncated_reason: out.truncatedReason,
                 });
             } catch (err) {
                 logger.error('storage.reconcile: failed', err);

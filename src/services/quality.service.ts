@@ -278,6 +278,50 @@ async function markMissingSourceFailed(
     });
 }
 
+function terminalReencodeSkipReason(item: InternalContentItem, contentRole?: string): string | null {
+    if (!item.media_url) return 'missing_media_url';
+    if (contentRole === 'failed_or_orphan_artifact') return 'failed_or_orphan_artifact';
+    if (item.status === 'FAILED') return 'failed_content_item';
+    if (item.storage_state === 'missing') return 'storage_state_missing';
+    if (item.storage_state === 'recoverable_deleted') return 'storage_state_recoverable_deleted';
+    if (item.storage_state === 'unrecoverable') return 'storage_state_unrecoverable';
+    return null;
+}
+
+async function recordTerminalReencodeSkip(
+    contentItemId: string,
+    item: InternalContentItem,
+    reason: string
+): Promise<void> {
+    logger.warn('Quality re-encode skipped before source lookup', {
+        contentItemId,
+        reason,
+        status: item.status,
+        storageState: item.storage_state,
+        mediaUrl: item.media_url,
+    });
+    await recordStorageArtifactEventBestEffort({
+        tenant_id: item.tenant_id,
+        content_item_id: contentItemId,
+        parent_content_item_id: item.parent_content_item_id ?? undefined,
+        event_type: 'reencoded',
+        status: 'skipped',
+        reason,
+        trigger: 'quality_reencode',
+        source: 'aggregation_quality_worker',
+        storage_tier: item.storage_tier ?? undefined,
+        old_media_url: item.media_url ?? undefined,
+        old_size_bytes: item.file_size_bytes,
+        artifact_keys: {
+            content_role: reason === 'failed_or_orphan_artifact' ? 'failed_or_orphan_artifact' : undefined,
+            storage_state: item.storage_state ?? undefined,
+        },
+        storage_state: item.storage_state ?? undefined,
+        storage_state_reason: item.storage_state_reason ?? undefined,
+        storage_recovery_status: item.storage_recovery_status ?? undefined,
+    });
+}
+
 /**
  * Re-encode one content item to a target profile. End-to-end:
  *   1. Resolve the item's current media key + tier from CMS.
@@ -329,6 +373,12 @@ export async function reencodeOneItem(args: {
         // "auto" profile-resolution path AND its tier/version/URL regardless
         // of which path we take.
         item = await cmsClient.getContentItem(contentItemId);
+
+        const terminalSkipReason = terminalReencodeSkipReason(item, contentRole);
+        if (terminalSkipReason) {
+            await recordTerminalReencodeSkip(contentItemId, item, terminalSkipReason);
+            return nonRetryableResult(result, terminalSkipReason, start);
+        }
 
         // Resolve the profile. Storage sweeps pass targetProfileId=0 to mean
         // "auto-pick the resolved ingest profile for this item" (the

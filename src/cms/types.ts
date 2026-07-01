@@ -355,6 +355,7 @@ export interface OpBudgetStatus {
 export interface InternalContentItem {
     id: string;
     tenant_id: string;
+    status?: ContentStatus;
     type?: ContentType;
     title?: string | null;
     excerpt?: string | null;
@@ -366,6 +367,9 @@ export interface InternalContentItem {
     source_type: string;
     media_url?: string | null;
     thumbnail_url?: string | null;
+    storage_state?: string | null;
+    storage_state_reason?: string | null;
+    storage_recovery_status?: string | null;
     storage_tier?: string | null;
     media_version: number;
     file_size_bytes: number;

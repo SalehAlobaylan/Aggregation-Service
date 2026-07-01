@@ -192,6 +192,24 @@ export async function runSweepForTenant(
                 for (const candidate of candidates.data) {
                     const targetId = await resolveReencodeTargetForRole(policy, candidate, roleProfileCache);
                     const contentRole = candidate.content_role ?? storageRoleForCandidate(candidate);
+                    if (!candidate.media_url || contentRole === 'failed_or_orphan_artifact') {
+                        await cmsClient.recordStorageArtifactEvent({
+                            tenant_id: tenantId,
+                            content_item_id: candidate.id,
+                            event_type: 'reencoded',
+                            status: 'skipped',
+                            reason: !candidate.media_url ? 'missing_media_url' : 'failed_or_orphan_artifact',
+                            trigger,
+                            source: 'aggregation_storage_sweep',
+                            old_media_url: candidate.media_url,
+                            old_size_bytes: candidate.file_size_bytes,
+                            artifact_keys: { content_role: contentRole, target_profile_id: targetId },
+                        }).catch(err => logger.warn('storage.sweep: failed to record unsafe re-encode skip', {
+                            err,
+                            contentId: candidate.id,
+                        }));
+                        continue;
+                    }
                     const payload: QualityReencodeJob = {
                         contentItemId: candidate.id,
                         targetProfileId: targetId,
@@ -513,62 +531,135 @@ export async function reconcileStorage(): Promise<{
     missingObjects: string[];
     orphanCount: number;
     missingCount: number;
+    scannedObjectCount: number;
+    scannedCmsItemCount: number;
+    partial: boolean;
+    truncatedReason?: string;
 }> {
+    const maxObjects = 1_000;
+    const maxObjectIdsToResolve = 250;
+    const maxCmsItems = 250;
+
     // 1) Build set of every key currently in S3
     const s3Keys = new Set<string>();
+    const keysByContentId = new Map<string, Set<string>>();
+    const processedByContentId = new Set<string>();
+    let objectLimitHit = false;
     for await (const page of listAllObjects()) {
         for (const obj of page) {
-            if (obj.Key) s3Keys.add(obj.Key);
+            if (!obj.Key) continue;
+            s3Keys.add(obj.Key);
+            const parsed = parseContentObjectKey(obj.Key);
+            if (parsed) {
+                const keys = keysByContentId.get(parsed.contentId) ?? new Set<string>();
+                keys.add(obj.Key);
+                keysByContentId.set(parsed.contentId, keys);
+                if (parsed.artifact === 'processed') {
+                    processedByContentId.add(parsed.contentId);
+                }
+            }
+            if (s3Keys.size >= maxObjects) {
+                objectLimitHit = true;
+                break;
+            }
+        }
+        if (objectLimitHit) {
+            break;
         }
     }
 
-    // 2) Walk CMS items and figure out which keys we expect
+    // 2) Resolve the CMS rows that correspond to observed object IDs. This is
+    // intentionally indexed by id; the previous nested key-per-item scan made
+    // reconcile slow enough to trip the Console proxy timeout.
+    const cmsIdsWithObjects = new Set<string>();
+    const resolvedObjectIds = new Set<string>();
+    const objectIds = Array.from(keysByContentId.keys());
+    const objectIdsToResolve = objectIds.slice(0, maxObjectIdsToResolve);
+    const objectIdLimitHit = objectIds.length > objectIdsToResolve.length;
+    for (let i = 0; i < objectIdsToResolve.length; i += 100) {
+        const ids = objectIdsToResolve.slice(i, i + 100);
+        if (ids.length === 0) continue;
+        ids.forEach(id => resolvedObjectIds.add(id));
+        const list = await cmsClient.listContentItems({ ids, limit: ids.length });
+        for (const item of list.data ?? []) {
+            cmsIdsWithObjects.add(item.id);
+        }
+    }
+
+    // 3) Walk a bounded CMS sample to report expected processed artifacts that
+    // are missing. Orphan detection remains complete unless maxObjects is hit.
     const expectedKeys = new Set<string>();
     const missing: string[] = [];
 
     let page = 1;
     const limit = 500;
+    let scannedCmsItemCount = 0;
+    let cmsLimitHit = false;
     while (true) {
         const list = await cmsClient.listContentItems({ page, limit });
         if (!list.data || list.data.length === 0) break;
 
         for (const item of list.data) {
-            // The original_url field in the response holds the *source* URL,
-            // not a storage key. We only know storage keys are derived from
-            // contentItemId. Inspect S3 to see which artifacts exist.
-            const id = item.id;
-            const expected = ['processed', 'thumbnail', 'original'];
-            for (const art of expected) {
-                // Look for any extension (.mp4, .jpg, .json etc.) — we just
-                // check whether at least one key matches `content/{id}/{art}.*`
-                let found = false;
-                for (const key of s3Keys) {
-                    if (key.startsWith(`content/${id}/${art}.`)) {
-                        expectedKeys.add(key);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found && art === 'processed' && item.metadata && (item.metadata as Record<string, unknown>)['expects_processed']) {
-                    missing.push(`content/${id}/${art}.*`);
-                }
+            scannedCmsItemCount += 1;
+            const keys = keysByContentId.get(item.id);
+            if (keys) {
+                keys.forEach(key => expectedKeys.add(key));
+            }
+            if (item.metadata && (item.metadata as Record<string, unknown>)['expects_processed'] && !processedByContentId.has(item.id)) {
+                missing.push(`content/${item.id}/processed.*`);
+            }
+            if (scannedCmsItemCount >= maxCmsItems) {
+                cmsLimitHit = true;
+                break;
             }
         }
 
+        if (cmsLimitHit) break;
         if (list.data.length < limit) break;
         page += 1;
-        if (page > 100) break; // safety net
     }
 
     const orphanKeys: string[] = [];
     for (const key of s3Keys) {
-        if (!expectedKeys.has(key)) orphanKeys.push(key);
+        const parsed = parseContentObjectKey(key);
+        if (parsed) {
+            if (resolvedObjectIds.has(parsed.contentId) && !cmsIdsWithObjects.has(parsed.contentId)) {
+                orphanKeys.push(key);
+            }
+            continue;
+        }
+        if (!expectedKeys.has(key)) {
+            orphanKeys.push(key);
+        }
     }
+
+    const partial = objectLimitHit || objectIdLimitHit || cmsLimitHit;
 
     return {
         orphanKeys,
         missingObjects: missing,
         orphanCount: orphanKeys.length,
         missingCount: missing.length,
+        scannedObjectCount: s3Keys.size,
+        scannedCmsItemCount,
+        partial,
+        truncatedReason: partial
+            ? [
+                objectLimitHit ? `object_limit_${maxObjects}` : '',
+                objectIdLimitHit ? `object_id_resolution_limit_${maxObjectIdsToResolve}` : '',
+                cmsLimitHit ? `cms_item_limit_${maxCmsItems}` : '',
+            ].filter(Boolean).join(',')
+            : undefined,
     };
+}
+
+function parseContentObjectKey(key: string): { contentId: string; artifact: string } | null {
+    const parts = key.split('/');
+    if (parts.length < 3 || parts[0] !== 'content' || !parts[1]) {
+        return null;
+    }
+    const filename = parts[parts.length - 1] ?? '';
+    const dot = filename.lastIndexOf('.');
+    const artifact = dot > 0 ? filename.slice(0, dot) : filename;
+    return { contentId: parts[1], artifact };
 }

@@ -11,6 +11,11 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
+const cmsMocks = vi.hoisted(() => ({
+    getContentItem: vi.fn(),
+    recordStorageArtifactEvent: vi.fn(),
+}));
+
 // Mock the config import so keyFromUrl has stable prefixes regardless of env.
 // We need a complete-enough shape because pino (via the logger) reads logLevel
 // at module-load time, and the storage client reads its own config fields.
@@ -39,8 +44,16 @@ vi.mock('../../src/config/index.js', () => ({
     getRedactedConfig: () => ({}),
 }));
 
+vi.mock('../../src/cms/client.js', () => ({
+    cmsClient: {
+        getContentItem: cmsMocks.getContentItem,
+        recordStorageArtifactEvent: cmsMocks.recordStorageArtifactEvent,
+    },
+}));
+
 // We import after the mock so the module sees our fake config.
 import {
+    reencodeOneItem,
     toEncodeProfile,
     versionedKey,
     keyFromUrl,
@@ -135,6 +148,51 @@ describe('keyFromUrl', () => {
         expect(keyFromUrl(null)).toBeNull();
         expect(keyFromUrl(undefined)).toBeNull();
         expect(keyFromUrl('')).toBeNull();
+    });
+});
+
+describe('reencodeOneItem terminal lifecycle guards', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        cmsMocks.recordStorageArtifactEvent.mockResolvedValue({ success: true, event_id: 'evt-1' });
+    });
+
+    it('skips stale failed/orphan re-encode jobs without marking content failed again', async () => {
+        cmsMocks.getContentItem.mockResolvedValue({
+            id: '99999999-2222-3333-4444-555555555555',
+            tenant_id: 'default',
+            status: 'FAILED',
+            source_type: '',
+            media_url: null,
+            thumbnail_url: 'https://primary/content/999/thumb.jpg',
+            storage_state: 'missing',
+            storage_state_reason: 'quality_reencode_source_object_missing',
+            storage_recovery_status: 'at_risk',
+            storage_tier: null,
+            media_version: 1,
+            file_size_bytes: 0,
+        });
+
+        const result = await reencodeOneItem({
+            contentItemId: '99999999-2222-3333-4444-555555555555',
+            targetProfileId: 3,
+            tenantId: 'default',
+            trigger: 'rule',
+            contentRole: 'failed_or_orphan_artifact',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.nonRetryable).toBe(true);
+        expect(result.error).toBe('missing_media_url');
+        expect(cmsMocks.recordStorageArtifactEvent).toHaveBeenCalledWith(expect.objectContaining({
+            content_item_id: '99999999-2222-3333-4444-555555555555',
+            event_type: 'reencoded',
+            status: 'skipped',
+            reason: 'missing_media_url',
+            storage_state: 'missing',
+            storage_state_reason: 'quality_reencode_source_object_missing',
+            storage_recovery_status: 'at_risk',
+        }));
     });
 });
 

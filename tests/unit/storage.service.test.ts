@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     getStorageOpBudget: vi.fn(),
     listStorageCandidates: vi.fn(),
+    listContentItems: vi.fn(),
     recordStorageArtifactEvent: vi.fn(),
     createSweepRun: vi.fn(),
     archiveItems: vi.fn(),
@@ -19,6 +20,7 @@ vi.mock('../../src/cms/client.js', () => ({
     cmsClient: {
         getStorageOpBudget: mocks.getStorageOpBudget,
         listStorageCandidates: mocks.listStorageCandidates,
+        listContentItems: mocks.listContentItems,
         recordStorageArtifactEvent: mocks.recordStorageArtifactEvent,
         createSweepRun: mocks.createSweepRun,
         archiveItems: mocks.archiveItems,
@@ -48,7 +50,7 @@ vi.mock('../../src/observability/logger.js', () => ({
     },
 }));
 
-import { runSweepForTenant } from '../../src/services/storage.service.js';
+import { reconcileStorage, runSweepForTenant } from '../../src/services/storage.service.js';
 import type { StoragePolicy } from '../../src/cms/types.js';
 
 function policy(overrides: Partial<StoragePolicy> = {}): StoragePolicy {
@@ -162,5 +164,83 @@ describe('runSweepForTenant delete safety', () => {
             jobId: 'reencode-default-11111111-2222-3333-4444-555555555555-3-atomized_parent_source',
         }));
         expect(result.reEncodedCount).toBe(1);
+    });
+
+    it('skips re-encode candidates that have no media artifact to shrink', async () => {
+        const queue = {
+            getJob: vi.fn().mockResolvedValue(null),
+            add: vi.fn().mockResolvedValue({ id: 'job-1' }),
+        };
+        mocks.getQueue.mockReturnValue(queue);
+        mocks.listStorageCandidates.mockResolvedValue({
+            data: [{
+                id: '99999999-2222-3333-4444-555555555555',
+                type: 'NEWS',
+                status: 'FAILED',
+                media_url: undefined,
+                thumbnail_url: 'https://primary/content/999/thumb.jpg',
+                file_size_bytes: 123_456,
+                view_count: 0,
+                created_at: new Date().toISOString(),
+                parent_content_item_id: undefined,
+                is_feed_unit: true,
+                feed_visibility: 'visible',
+                duration_sec: undefined,
+                media_suitability: 'unknown',
+                content_role: 'failed_or_orphan_artifact',
+            }],
+            total: 1,
+            total_bytes: 123_456,
+        });
+
+        const result = await runSweepForTenant(policy({ archive_action: 're_encode' }), 'auto');
+
+        expect(queue.add).not.toHaveBeenCalled();
+        expect(mocks.recordStorageArtifactEvent).toHaveBeenCalledWith(expect.objectContaining({
+            content_item_id: '99999999-2222-3333-4444-555555555555',
+            event_type: 'reencoded',
+            status: 'skipped',
+            reason: 'missing_media_url',
+        }));
+        expect(result.reEncodedCount).toBe(0);
+    });
+});
+
+describe('reconcileStorage', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('indexes object keys by content id instead of treating existing CMS objects as orphan', async () => {
+        async function* pages() {
+            yield [
+                { Key: 'content/11111111-2222-3333-4444-555555555555/processed.mp4', Size: 100 },
+                { Key: 'content/22222222-2222-3333-4444-555555555555/processed.mp4', Size: 100 },
+                { Key: 'loose/orphan.bin', Size: 50 },
+            ];
+        }
+        mocks.listAllObjects.mockImplementation(pages);
+        mocks.listContentItems.mockImplementation(async (params: { ids?: string[]; page?: number }) => {
+            if (params.ids?.length) {
+                return {
+                    data: params.ids.includes('11111111-2222-3333-4444-555555555555')
+                        ? [{ id: '11111111-2222-3333-4444-555555555555', metadata: {}, type: 'VIDEO', source: 'YOUTUBE', status: 'READY', original_url: '' }]
+                        : [],
+                    total: 1,
+                    page: 1,
+                    limit: params.ids.length,
+                };
+            }
+            return { data: [], total: 0, page: params.page ?? 1, limit: 500 };
+        });
+
+        const result = await reconcileStorage();
+
+        expect(result.orphanKeys).toEqual([
+            'content/22222222-2222-3333-4444-555555555555/processed.mp4',
+            'loose/orphan.bin',
+        ]);
+        expect(result.scannedObjectCount).toBe(3);
+        expect(result.partial).toBe(false);
     });
 });
