@@ -38,6 +38,9 @@ interface TriggerBody {
     url: string;
     name?: string;
     settings?: Record<string, unknown>;
+    /** The CMS source public UUID. When present, the run uses it as sourceId so
+     *  fetch/normalize telemetry reports back to source_run_telemetry. */
+    sourceId?: string;
 }
 
 interface TriggerResponse {
@@ -293,7 +296,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         '/admin/trigger',
         { preHandler: verifyAdminAuth },
         async (request, reply) => {
-            const { sourceType, url, name, settings } = request.body;
+            const { sourceType, url, name, settings, sourceId } = request.body;
 
             if (!sourceType || !url) {
                 return reply.status(400).send({
@@ -302,9 +305,12 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 });
             }
 
+            const isUuid = typeof sourceId === 'string'
+                && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sourceId);
+
             try {
                 const jobId = await scheduler.triggerPoll({
-                    id: `manual-${Date.now()}`,
+                    id: isUuid ? sourceId : `manual-${Date.now()}`,
                     type: sourceType,
                     name: name || url,
                     url,
