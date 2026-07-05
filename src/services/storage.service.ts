@@ -29,6 +29,13 @@ export interface SweepResult {
     error?: string;
 }
 
+export interface SweepOptions {
+    candidateIds?: string[];
+    maxBytes?: number;
+    limit?: number;
+    archiveAction?: 'move_to_cold' | 're_encode';
+}
+
 /**
  * Run one sweep cycle for the given policy. Returns a SweepResult and writes
  * a sweep-run row back to CMS. Safe to call when policy is disabled — it
@@ -36,7 +43,8 @@ export interface SweepResult {
  */
 export async function runSweepForTenant(
     policy: StoragePolicy,
-    trigger: 'auto' | 'manual' = 'auto'
+    trigger: 'auto' | 'manual' = 'auto',
+    options: SweepOptions = {}
 ): Promise<SweepResult> {
     const tenantId = policy.tenant_id ?? 'default';
     const startedAt = new Date().toISOString();
@@ -85,7 +93,10 @@ export async function runSweepForTenant(
         );
         const overage = usage.usedBytes - targetBytes;
 
-        if (overage <= 0 && trigger === 'auto') {
+        const scopedCandidateIds = [...new Set((options.candidateIds ?? []).map(id => id.trim()).filter(Boolean))];
+        const scoped = scopedCandidateIds.length > 0;
+
+        if (overage <= 0 && trigger === 'auto' && !scoped) {
             const finishedAt = new Date().toISOString();
             await cmsClient.createSweepRun({
                 tenant_id: tenantId,
@@ -98,8 +109,13 @@ export async function runSweepForTenant(
             return { tenantId, deletedCount: 0, freedBytes: 0, skipped: true, reason: 'under target' };
         }
 
-        // Manual triggers always do at least one batch worth. Auto triggers cap at the overage.
-        const maxBytes = trigger === 'manual' && overage <= 0 ? undefined : Math.max(overage, 0);
+        // Manual triggers normally do at least one batch worth. Scoped Autopilot
+        // sweeps pass an explicit maxBytes/candidateIds set, so they never expand
+        // to the general candidate pool.
+        const requestedMaxBytes = options.maxBytes && options.maxBytes > 0 ? options.maxBytes : undefined;
+        const maxBytes = requestedMaxBytes ?? (trigger === 'manual' && overage <= 0 ? undefined : Math.max(overage, 0));
+        const archiveAction = options.archiveAction ?? policy.archive_action;
+        const limit = Math.max(1, Math.min(options.limit ?? (scoped ? scopedCandidateIds.length : 1000), 1000));
 
         const candidates = await cmsClient.listStorageCandidates({
             tenant_id: tenantId,
@@ -107,9 +123,10 @@ export async function runSweepForTenant(
             max_view_count: policy.min_view_count_for_keep,
             delete_failed_immediately: policy.delete_failed_immediately,
             include_atomized_parents: true,
-            archive_action: policy.archive_action,
-            limit: 1000,
+            archive_action: archiveAction,
+            limit,
             max_bytes: maxBytes,
+            ids: scopedCandidateIds,
         });
 
         if (candidates.data.length === 0) {
@@ -129,7 +146,7 @@ export async function runSweepForTenant(
             ? ['processed', 'original']
             : ['processed', 'original', 'thumbnail'];
 
-        const configuredAction = policy.archive_action ?? 're_encode';
+        const configuredAction = archiveAction ?? 're_encode';
         const moveToCold = configuredAction === 'move_to_cold' && isColdTierConfigured();
         const action = configuredAction === 'move_to_cold' && !moveToCold ? 're_encode' : configuredAction;
         if (configuredAction === 'move_to_cold' && !moveToCold) {

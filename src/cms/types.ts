@@ -551,6 +551,10 @@ export interface ListStoragePoliciesResponse {
     global: StoragePolicy | null;
     overrides: StoragePolicy[];
     all: StoragePolicy[];
+    /** Tenants where the Media Circulation Autopilot is enabled (stage 5,
+     *  single-actor rule): the repeatable auto-sweep defers for these tenants;
+     *  Autopilot runs trigger bounded sweeps instead. Manual sweeps unaffected. */
+    autopilot_tenants?: string[];
 }
 
 export interface StorageCandidate {

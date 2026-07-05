@@ -26,6 +26,16 @@ export const storageWorker = createWorker({
         jobLogger.info('Storage sweep tick', { tenantId, trigger });
 
         const policies = await cmsClient.listStoragePolicies();
+
+        // Single-actor rule (Autopilot stage 5, G4): when the Media Circulation
+        // Autopilot manages this tenant, the self-scheduled repeatable tick
+        // defers — Autopilot runs trigger bounded sweeps (trigger='manual')
+        // through the same path instead. Two automation loops never both act.
+        if (trigger === 'auto' && (policies.autopilot_tenants ?? []).includes(tenantId)) {
+            jobLogger.info('Storage sweep tick deferred — tenant is Autopilot-managed', { tenantId });
+            return;
+        }
+
         const policy =
             policies.all.find(p => p.tenant_id === tenantId) ??
             policies.global ??

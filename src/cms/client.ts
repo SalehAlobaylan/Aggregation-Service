@@ -466,6 +466,7 @@ export const cmsClient = {
             limit?: number;
             delete_failed_immediately?: boolean;
             max_bytes?: number;
+            ids?: string[];
             include_atomized_parents?: boolean;
             archive_action?: 'delete' | 'move_to_cold' | 're_encode' | string;
         },
@@ -478,6 +479,7 @@ export const cmsClient = {
         if (params.limit !== undefined) qs.set('limit', String(params.limit));
         if (params.delete_failed_immediately !== undefined) qs.set('delete_failed_immediately', String(params.delete_failed_immediately));
         if (params.max_bytes !== undefined) qs.set('max_bytes', String(params.max_bytes));
+        if (params.ids?.length) qs.set('ids', params.ids.join(','));
         if (params.include_atomized_parents !== undefined) qs.set('include_atomized_parents', String(params.include_atomized_parents));
         if (params.archive_action !== undefined) qs.set('archive_action', String(params.archive_action));
         return makeRequest<ListStorageCandidatesResponse>(

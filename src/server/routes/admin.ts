@@ -1271,6 +1271,10 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     interface SweepBody {
         tenant_id?: string;
         trigger?: 'auto' | 'manual';
+        candidate_ids?: string[];
+        max_bytes?: number;
+        limit?: number;
+        archive_action?: 'move_to_cold' | 're_encode' | string;
     }
 
     /**
@@ -1295,11 +1299,25 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     return reply.status(404).send({ error: 'No policy found' });
                 }
                 const effective = { ...policy, tenant_id: tenantId };
-                const result = await runSweepForTenant(effective, trigger);
+                const archiveAction =
+                    request.body?.archive_action === 'move_to_cold' || request.body?.archive_action === 're_encode'
+                        ? request.body.archive_action
+                        : undefined;
+                const candidateIds = Array.isArray(request.body?.candidate_ids)
+                    ? request.body.candidate_ids.map(id => id.trim()).filter(Boolean)
+                    : undefined;
+                const result = await runSweepForTenant(effective, trigger, {
+                    archiveAction,
+                    candidateIds,
+                    maxBytes: request.body?.max_bytes,
+                    limit: request.body?.limit,
+                });
                 cachedStats = null;
                 return reply.send({
                     success: true,
                     deleted_count: result.deletedCount,
+                    moved_to_cold_count: result.movedToColdCount,
+                    re_encoded_count: result.reEncodedCount,
                     freed_bytes: result.freedBytes,
                     skipped: result.skipped,
                     reason: result.reason,
