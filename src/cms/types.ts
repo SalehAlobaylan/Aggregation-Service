@@ -215,6 +215,10 @@ export interface AtomizationChapter {
     standalone_score?: number;
     contains_sponsor_intro?: boolean;
     needs_review_reason?: string | null;
+    // Stage 6 (S4/S5): normalized review-reason codes emitted alongside the
+    // free text so the CMS Studio Autopilot trust gate keys on a fixed taxonomy.
+    needs_review_code?: string | null;
+    needs_review_codes?: string[];
     media_url?: string;
     thumbnail_url?: string;
     playback_url?: string;

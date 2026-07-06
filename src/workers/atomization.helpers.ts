@@ -9,7 +9,45 @@ const DEFAULT_ATOMIZATION_MIN_PARENT_SEC = 40 * 60;
 const SHORT_CHAPTER_UNMERGEABLE_REASON = 'Chapter below 4:30 and cannot merge without exceeding hard max.';
 const MIN_CHAPTER_REVIEW_REASON = 'Chapter is below the 4:30 minimum feed duration.';
 const HARD_MAX_CHAPTER_REVIEW_REASON = 'Chapter exceeds hard maximum duration.';
+const PLANNER_FALLBACK_REASON = 'Fallback single chapter; planner returned no usable chapters.';
 const DURATION_BUCKET_MS = [5, 10, 15, 20, 30, 40].map(minutes => minutes * 60_000);
+
+// Stage-6 review-reason code taxonomy (S4/S5). Kept in sync with CMS
+// models.StudioReviewCode* and deriveStudioReviewCodes; CMS re-derives when a
+// chapter arrives without codes, so this is the authoritative forward path.
+const STUDIO_REVIEW_CODE_PRECEDENCE = [
+    'sponsor_intro',
+    'planner_fallback',
+    'low_confidence',
+    'merged_short',
+    'below_min',
+    'above_hard_max',
+    'short_unmergeable',
+] as const;
+
+function deriveStudioReviewCodes(chapter: AtomizationChapter, highConfThreshold: number): { primary: string | null; codes: string[] } {
+    const codes: string[] = [];
+    if (chapter.contains_sponsor_intro) codes.push('sponsor_intro');
+    const reason = chapter.needs_review_reason ?? '';
+    if (reason.includes('planner returned no usable chapters')) codes.push('planner_fallback');
+    const boundary = chapter.boundary_reason ?? '';
+    const mergedShort = boundary.includes('merged_short_chapter');
+    if (typeof chapter.confidence === 'number' && chapter.confidence < highConfThreshold && !mergedShort) codes.push('low_confidence');
+    if (mergedShort) codes.push('merged_short');
+    if (reason.includes('cannot merge without exceeding hard max')) codes.push('short_unmergeable');
+    if (reason.includes('below the 4:30 minimum feed duration')) codes.push('below_min');
+    if (reason.includes('exceeds hard maximum duration')) codes.push('above_hard_max');
+    if (codes.length === 0) return { primary: null, codes: [] };
+    const primary = STUDIO_REVIEW_CODE_PRECEDENCE.find(c => codes.includes(c)) ?? null;
+    return { primary, codes };
+}
+
+export function annotateReviewCodes(chapters: AtomizationChapter[], highConfThreshold: number): AtomizationChapter[] {
+    return chapters.map(chapter => {
+        const { primary, codes } = deriveStudioReviewCodes(chapter, highConfThreshold);
+        return { ...chapter, needs_review_code: primary, needs_review_codes: codes };
+    });
+}
 
 export function shouldAtomizeParent(durationSec?: number | null, minParentSec = DEFAULT_ATOMIZATION_MIN_PARENT_SEC): boolean {
     return typeof durationSec === 'number' && durationSec > minParentSec;
@@ -67,7 +105,7 @@ export function normalizeGeneratedChapters(
             summary: null,
             confidence: 0.65,
             standalone_score: 0.65,
-            needs_review_reason: 'Fallback single chapter; planner returned no usable chapters.',
+            needs_review_reason: PLANNER_FALLBACK_REASON,
         });
     }
 
@@ -96,7 +134,8 @@ export function normalizeGeneratedChapters(
             needs_review_reason: needsReview,
         };
     });
-    return mergeShortChapters(normalized, input);
+    const threshold = input.effective_policy?.high_confidence_threshold ?? input.policy.high_confidence_threshold;
+    return annotateReviewCodes(mergeShortChapters(normalized, input), threshold);
 }
 
 export function mergeShortChapters(chapters: AtomizationChapter[], input: AtomizationInputResponse): AtomizationChapter[] {
