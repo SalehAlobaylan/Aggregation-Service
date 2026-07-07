@@ -6,6 +6,7 @@ import Parser from 'rss-parser';
 import { logger } from '../observability/logger.js';
 import { scraperService } from '../services/scraper.service.js';
 import { rateLimiter } from '../services/rate-limiter.js';
+import { safeFetch } from '../utils/safe-fetch.js';
 import type { Fetcher, FetchResult, RawFetchedItem, SourceConfig } from './types.js';
 
 const parser = new Parser({
@@ -82,7 +83,18 @@ export const rssFetcher: Fetcher = {
 
         try {
             logger.info('Fetching RSS feed', { url: config.url, sourceId: config.id });
-            const feed = await parser.parseURL(config.url);
+            const response = await safeFetch(config.url, {
+                timeoutMs: 15000,
+                rateLimit: false,
+                headers: {
+                    'User-Agent': 'WahbBot/1.0 (Content Aggregation Service)',
+                    Accept: 'application/rss+xml, application/xml, text/xml, */*',
+                },
+            });
+            if (!response.ok) {
+                throw new Error(`RSS fetch failed: ${response.status}`);
+            }
+            const feed = await parser.parseString(response.body);
 
             for (const entry of feed.items || []) {
                 try {

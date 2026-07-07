@@ -6,6 +6,7 @@ import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 import { logger } from '../observability/logger.js';
 import { loadAllowlist, isDomainAllowed } from '../config/allowlist.js';
+import { safeFetch } from '../utils/safe-fetch.js';
 
 export interface ScrapedArticle {
     title: string;
@@ -40,26 +41,21 @@ export async function scrapeArticle(
     }
 
     try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-        const response = await fetch(url, {
+        const response = await safeFetch(url, {
+            timeoutMs: timeout,
+            rateLimit: false,
             headers: {
                 'User-Agent': 'WahbBot/1.0 (Content Aggregation Service)',
-                'Accept': 'text/html,application/xhtml+xml',
+                Accept: 'text/html,application/xhtml+xml',
             },
-            signal: controller.signal,
         });
-
-        clearTimeout(timeoutId);
 
         if (!response.ok) {
             logger.warn('Failed to fetch article', { url, status: response.status });
             return null;
         }
 
-        const html = await response.text();
-        return parseArticleHtml(html, url);
+        return parseArticleHtml(response.body, response.url);
     } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
             logger.warn('Article fetch timeout', { url });

@@ -54,6 +54,33 @@ export const DEFAULT_ENCODE_PROFILE: EncodeProfile = {
     audioBitrateKbps: 128,
 };
 
+function runFfmpegWithTimeout(
+    command: ReturnType<typeof ffmpeg>,
+    label: string,
+    reject: (reason?: unknown) => void,
+    timeoutMs = config.mediaJobTimeoutMs
+): void {
+    let timedOut = false;
+    const timer = setTimeout(() => {
+        timedOut = true;
+        logger.warn('FFmpeg command timed out; killing child process', { label, timeoutMs });
+        command.kill('SIGKILL');
+        reject(new Error(`FFmpeg ${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref();
+
+    const clearTimer = () => clearTimeout(timer);
+    command.once('end', clearTimer);
+    command.once('error', (err) => {
+        clearTimer();
+        if (timedOut) {
+            logger.debug('Ignoring FFmpeg error after timeout kill', { label, error: err.message });
+        }
+    });
+
+    command.run();
+}
+
 function videoCodecFlag(codec: EncodeProfile['videoCodec']): string {
     switch (codec) {
         case 'h265':
@@ -156,7 +183,7 @@ export function transcodeToMp4(
         let duration = 0;
         const opts = buildEncodeOptions(profile);
 
-        ffmpeg(inputPath)
+        const command = ffmpeg(inputPath)
             .outputOptions(opts)
             .output(outputPath)
             .on('start', (cmd) => {
@@ -187,8 +214,8 @@ export function transcodeToMp4(
             .on('error', (err) => {
                 logger.error('FFmpeg transcode error', err);
                 reject(err);
-            })
-            .run();
+            });
+        runFfmpegWithTimeout(command, 'transcodeToMp4', reject);
     });
 }
 
@@ -227,7 +254,7 @@ export function audioToMp4(
             }
         }
 
-        ffmpeg()
+        const command = ffmpeg()
             .input(imagePath)
             .inputOptions(['-loop 1'])  // Loop still image
             .input(inputPath)
@@ -263,8 +290,8 @@ export function audioToMp4(
             .on('error', (err) => {
                 logger.error('Audio-to-MP4 error', err);
                 reject(err);
-            })
-            .run();
+            });
+        runFfmpegWithTimeout(command, 'audioToMp4', reject);
     });
 }
 
@@ -348,7 +375,7 @@ export function extractThumbnail(
             ? `scale=-2:'min(${maxHeight},ih)'`
             : `scale=-2:360`;
 
-        ffmpeg(inputPath)
+        const command = ffmpeg(inputPath)
             .seekInput(offsetSeconds)
             .outputOptions(['-vframes 1', `-vf ${scaleFilter}`])
             .output(outputPath)
@@ -359,8 +386,8 @@ export function extractThumbnail(
             .on('error', (err) => {
                 logger.error('Thumbnail extraction error', err);
                 reject(err);
-            })
-            .run();
+            });
+        runFfmpegWithTimeout(command, 'extractThumbnail', reject);
     });
 }
 
@@ -400,7 +427,7 @@ export function extractAudio(
     return new Promise((resolve, reject) => {
         logger.info('Extracting audio', { inputPath, outputPath });
 
-        ffmpeg(inputPath)
+        const command = ffmpeg(inputPath)
             .noVideo()
             .audioCodec('libmp3lame')
             .audioBitrate(128)
@@ -412,8 +439,8 @@ export function extractAudio(
             .on('error', (err) => {
                 logger.error('Audio extraction error', err);
                 reject(err);
-            })
-            .run();
+            });
+        runFfmpegWithTimeout(command, 'extractAudio', reject);
     });
 }
 
@@ -426,7 +453,7 @@ export function cutMediaSegment(
 ): Promise<TranscodeResult> {
     return new Promise((resolve, reject) => {
         logger.info('Cutting media segment', { inputPath, outputPath, startSec, durationSec });
-        ffmpeg(inputPath)
+        const command = ffmpeg(inputPath)
             .inputOptions([`-ss ${Math.max(0, startSec)}`])
             .duration(Math.max(0.1, durationSec))
             .outputOptions(buildEncodeOptions(profile))
@@ -442,8 +469,8 @@ export function cutMediaSegment(
             .on('error', (err) => {
                 logger.error('Media segment cut failed', err);
                 reject(err);
-            })
-            .run();
+            });
+        runFfmpegWithTimeout(command, 'cutMediaSegment', reject);
     });
 }
 
@@ -456,7 +483,7 @@ export function createHlsVod(
         await mkdir(outputDir, { recursive: true });
         const playlistPath = join(outputDir, playlistName);
         logger.info('Creating HLS VOD rendition', { inputPath, outputDir, playlistName });
-        ffmpeg(inputPath)
+        const command = ffmpeg(inputPath)
             .outputOptions([
                 '-c copy',
                 '-hls_time 6',
@@ -476,8 +503,8 @@ export function createHlsVod(
             .on('error', (err) => {
                 logger.error('HLS VOD creation failed', err);
                 reject(err);
-            })
-            .run();
+            });
+        runFfmpegWithTimeout(command, 'createHlsVod', reject);
     });
 }
 

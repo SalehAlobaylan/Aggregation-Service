@@ -26,6 +26,7 @@ export class RateLimitedError extends Error {}
 export interface SafeFetchOptions {
     timeoutMs?: number;
     headers?: Record<string, string>;
+    method?: 'GET' | 'HEAD';
     /** Set false to skip the per-host rate limiter (default: enabled). */
     rateLimit?: boolean;
 }
@@ -36,6 +37,11 @@ export interface SafeFetchResult {
     url: string; // final URL after redirects
     body: string;
     contentType: string;
+}
+
+export interface SafeFetchResponseResult {
+    response: Response;
+    url: string;
 }
 
 function isPrivateIPv4(ip: string): boolean {
@@ -127,7 +133,7 @@ async function readCapped(resp: Response, maxBytes: number): Promise<string> {
     return Buffer.concat(chunks).toString('utf-8');
 }
 
-export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Promise<SafeFetchResult> {
+export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions = {}): Promise<SafeFetchResponseResult> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     let currentUrl = rawUrl;
 
@@ -147,6 +153,7 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
         let resp: Response;
         try {
             resp = await fetch(u.toString(), {
+                method: opts.method ?? 'GET',
                 redirect: 'manual',
                 signal: controller.signal,
                 headers: {
@@ -167,15 +174,23 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
             }
         }
 
-        const body = await readCapped(resp, MAX_BYTES);
         return {
-            ok: resp.ok,
-            status: resp.status,
+            response: resp,
             url: u.toString(),
-            body,
-            contentType: resp.headers.get('content-type') ?? '',
         };
     }
 
     throw new Error('too many redirects');
+}
+
+export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Promise<SafeFetchResult> {
+    const { response: resp, url } = await safeFetchResponse(rawUrl, opts);
+    const body = await readCapped(resp, MAX_BYTES);
+    return {
+        ok: resp.ok,
+        status: resp.status,
+        url,
+        body,
+        contentType: resp.headers.get('content-type') ?? '',
+    };
 }

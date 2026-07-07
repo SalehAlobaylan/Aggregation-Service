@@ -17,6 +17,7 @@ import {
     downloadHttp,
     downloadTelegram,
     cleanupTempFile,
+    isAllowedYouTubeUrl,
 } from '../media/downloader.js';
 import {
     transcodeToMp4,
@@ -129,8 +130,11 @@ export const mediaWorker = createWorker({
             if (await objectExists(processedKey)) {
                 jobLogger.info('Content already processed, skipping', { contentItemId });
 
-                // Still enqueue AI job if needed
+                // A previous attempt may have uploaded the object and then
+                // failed before CMS artifact write-back. Repair that idempotent
+                // write before enqueueing AI so the feed has playback metadata.
                 const publicUrl = getPublicUrl(processedKey);
+                await repairExistingArtifacts(contentItemId, processedKey, publicUrl, job.id);
                 await enqueueAIJob(job, contentItemId, contentType, undefined, publicUrl);
                 return;
             }
@@ -139,7 +143,7 @@ export const mediaWorker = createWorker({
             jobLogger.info('Downloading media', { sourceUrl });
 
             let downloadResult;
-            const isYouTube = sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be');
+            const isYouTube = isAllowedYouTubeUrl(sourceUrl);
 
             if (sourceType === 'TELEGRAM') {
                 if (!downloadRef) {
@@ -451,6 +455,36 @@ async function enqueueAIJob(
     );
 
     job.log(`Enqueued AI job for ${contentItemId}`);
+}
+
+async function repairExistingArtifacts(
+    contentItemId: string,
+    processedKey: string,
+    publicUrl: string,
+    requestId?: string
+): Promise<void> {
+    const ext = processedKey.split('.').pop()?.toLowerCase();
+    const isAudio = ext === 'mp3' || ext === 'm4a' || ext === 'aac' || ext === 'ogg' || ext === 'opus';
+    const isImage = ext === 'jpg' || ext === 'jpeg' || ext === 'png' || ext === 'webp' || ext === 'gif';
+    const playbackType = isAudio ? 'audio' : 'mp4';
+    const mimeType = isAudio
+        ? `audio/${ext || 'mpeg'}`
+        : isImage
+            ? inferImageMimeType(ext || 'jpg')
+            : containerMime(ext);
+    await cmsClient.updateArtifacts(contentItemId, {
+        media_url: publicUrl,
+        thumbnail_url: isImage ? publicUrl : undefined,
+        playback_url: publicUrl,
+        playback_type: playbackType,
+        has_video: !isAudio && !isImage,
+        media_renditions: [{
+            type: playbackType,
+            url: publicUrl,
+            mime_type: mimeType,
+            is_primary: true,
+        }],
+    }, requestId);
 }
 
 function inferImageMimeType(format: string): string {

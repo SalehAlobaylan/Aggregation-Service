@@ -6,6 +6,7 @@ import * as cheerio from 'cheerio';
 import { logger } from '../observability/logger.js';
 import { rateLimiter } from '../services/rate-limiter.js';
 import { scraperService } from '../services/scraper.service.js';
+import { safeFetch } from '../utils/safe-fetch.js';
 import type { Fetcher, FetchResult, RawFetchedItem, SourceConfig, WebsiteSourceConfig } from './types.js';
 
 interface WebsiteSelectors {
@@ -47,25 +48,20 @@ function toAbsoluteUrl(baseUrl: string, maybeRelativeUrl: string): string | null
 }
 
 async function fetchWebsiteHtml(url: string, timeoutMs = 15000): Promise<string> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'WahbBot/1.0 (Website Fetcher)',
-                Accept: 'text/html,application/xhtml+xml',
-            },
-        });
+    const response = await safeFetch(url, {
+        timeoutMs,
+        rateLimit: false,
+        headers: {
+            'User-Agent': 'WahbBot/1.0 (Website Fetcher)',
+            Accept: 'text/html,application/xhtml+xml',
+        },
+    });
 
-        if (!response.ok) {
-            throw new Error(`Failed to fetch website (status ${response.status})`);
-        }
-
-        return response.text();
-    } finally {
-        clearTimeout(timeoutId);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch website (status ${response.status})`);
     }
+
+    return response.body;
 }
 
 export const websiteFetcher: Fetcher = {

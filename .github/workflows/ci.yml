@@ -30,9 +30,8 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Lint (if configured)
-        run: npm run lint || echo "No lint script configured"
-        continue-on-error: true
+      - name: Lint
+        run: npm run lint
 
   unit-tests:
     name: Unit Tests
@@ -51,8 +50,7 @@ jobs:
         run: npm ci
 
       - name: Run unit tests
-        run: npm run test:unit || echo "No unit tests configured"
-        continue-on-error: true
+        run: npm run test:unit
 
   integration-tests:
     name: Integration Tests
@@ -82,8 +80,7 @@ jobs:
         run: npm ci
 
       - name: Run integration tests
-        run: npm run test:integration || echo "No integration tests configured"
-        continue-on-error: true
+        run: npm run test:integration
         env:
           REDIS_URL: redis://localhost:6379
           CMS_BASE_URL: http://localhost:3000/internal
@@ -176,5 +173,4 @@ jobs:
         run: npm ci
 
       - name: Run contract tests
-        run: npm run test:contract || echo "No contract tests configured"
-        continue-on-error: true
+        run: npm run test:contract

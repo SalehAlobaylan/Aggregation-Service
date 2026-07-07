@@ -10,6 +10,7 @@ import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
+import { assertPublicUrl, safeFetchResponse } from '../utils/safe-fetch.js';
 import {
     createTelegramClient,
     disconnectTelegramClient,
@@ -61,6 +62,7 @@ const SPONSORBLOCK_ARGS = [
 // almost certainly a mistake or abuse.
 export const MAX_MEDIA_DOWNLOAD_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
 const MAX_YTDLP_BUF = 4 * 1024 * 1024; // Tail keeps --print-json and recent logs.
+const MEDIA_RESPONSE_TIMEOUT_MS = 30_000;
 
 interface TelegramDownloadRef {
     channelUsername: string;
@@ -112,6 +114,82 @@ function getTempPath(contentItemId: string, extension: string): string {
     return join(config.mediaTempDir, `${contentItemId}.${extension}`);
 }
 
+export function isAllowedYouTubeUrl(rawUrl: string): boolean {
+    try {
+        const { protocol, hostname } = new URL(rawUrl);
+        if (protocol !== 'https:' && protocol !== 'http:') return false;
+        const host = hostname.toLowerCase();
+        return host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com');
+    } catch {
+        return false;
+    }
+}
+
+async function assertAllowedYouTubeUrl(rawUrl: string): Promise<void> {
+    if (!isAllowedYouTubeUrl(rawUrl)) {
+        throw new Error('blocked non-YouTube media URL');
+    }
+    await assertPublicUrl(rawUrl);
+}
+
+function runYtDlp(args: string[], url: string, timeoutMs = config.mediaJobTimeoutMs): Promise<{ stdout: string; stderr: string }> {
+    return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        const proc = spawn('yt-dlp', args, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        let stdout = '';
+        let stderr = '';
+        let settled = false;
+        let timedOut = false;
+        let closed = false;
+
+        const settle = (fn: typeof resolve | typeof reject, value: unknown) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            fn(value as never);
+        };
+
+        const timer = setTimeout(() => {
+            timedOut = true;
+            logger.warn('yt-dlp timed out; killing child process', { url, timeoutMs });
+            proc.kill('SIGTERM');
+            setTimeout(() => {
+                if (!closed) proc.kill('SIGKILL');
+            }, 5000).unref();
+        }, timeoutMs);
+        timer.unref();
+
+        proc.stdout.on('data', (data) => {
+            stdout = boundedAppend(stdout, data.toString(), MAX_YTDLP_BUF);
+        });
+
+        proc.stderr.on('data', (data) => {
+            stderr = boundedAppend(stderr, data.toString(), MAX_YTDLP_BUF);
+        });
+
+        proc.on('close', async (code) => {
+            closed = true;
+            if (timedOut) {
+                settle(reject, new Error(`yt-dlp timed out after ${timeoutMs}ms`));
+                return;
+            }
+            if (code !== 0) {
+                logger.error('yt-dlp failed', { code, stderr, url });
+                settle(reject, new Error(`yt-dlp exited with code ${code}: ${stderr}`));
+                return;
+            }
+            settle(resolve, { stdout, stderr });
+        });
+
+        proc.on('error', (error) => {
+            logger.error('yt-dlp spawn error', error);
+            settle(reject, error);
+        });
+    });
+}
+
 /**
  * Download YouTube video using yt-dlp
  */
@@ -120,6 +198,7 @@ export async function downloadYouTube(
     contentItemId: string
 ): Promise<DownloadResult> {
     await ensureTempDir();
+    await assertAllowedYouTubeUrl(url);
 
     const outputTemplate = getTempPath(contentItemId, '%(ext)s');
     const outputPath = getTempPath(contentItemId, 'mp4'); // Expected output
@@ -137,38 +216,6 @@ export async function downloadYouTube(
         '--print-json',
         url,
     ];
-
-    const runYtDlp = (args: string[]) => new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-        // yt-dlp arguments for best quality video+audio merged to mp4
-        const proc = spawn('yt-dlp', args, {
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-
-        let stdout = '';
-        let stderr = '';
-
-        proc.stdout.on('data', (data) => {
-            stdout = boundedAppend(stdout, data.toString(), MAX_YTDLP_BUF);
-        });
-
-        proc.stderr.on('data', (data) => {
-            stderr = boundedAppend(stderr, data.toString(), MAX_YTDLP_BUF);
-        });
-
-        proc.on('close', async (code) => {
-            if (code !== 0) {
-                logger.error('yt-dlp failed', { code, stderr, url });
-                reject(new Error(`yt-dlp exited with code ${code}: ${stderr}`));
-                return;
-            }
-            resolve({ stdout, stderr });
-        });
-
-        proc.on('error', (error) => {
-            logger.error('yt-dlp spawn error', error);
-            reject(error);
-        });
-    });
 
     const parseResult = async (stdout: string): Promise<DownloadResult> => {
         try {
@@ -220,7 +267,7 @@ export async function downloadYouTube(
     };
 
     try {
-        const { stdout } = await runYtDlp(buildArgs(true));
+        const { stdout } = await runYtDlp(buildArgs(true), url);
         return parseResult(stdout);
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -232,7 +279,7 @@ export async function downloadYouTube(
             contentItemId,
             error: message,
         });
-        const { stdout } = await runYtDlp(buildArgs(false));
+        const { stdout } = await runYtDlp(buildArgs(false), url);
         return parseResult(stdout);
     }
 }
@@ -245,62 +292,38 @@ export async function downloadYouTubeAudio(
     contentItemId: string
 ): Promise<DownloadResult> {
     await ensureTempDir();
+    await assertAllowedYouTubeUrl(url);
 
     const outputPath = getTempPath(contentItemId, 'm4a');
 
     logger.info('Starting YouTube audio download', { url, contentItemId });
 
-    return new Promise((resolve, reject) => {
-        const args = [
-            '-f', 'bestaudio[ext=m4a]/bestaudio',
-            '-x', '--audio-format', 'm4a',
-            '-o', outputPath,
-            '--no-playlist',
-            '--print-json',
-            url,
-        ];
+    const args = [
+        '-f', 'bestaudio[ext=m4a]/bestaudio',
+        '-x', '--audio-format', 'm4a',
+        '-o', outputPath,
+        '--no-playlist',
+        '--print-json',
+        url,
+    ];
 
-        const proc = spawn('yt-dlp', args, {
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
+    const { stdout } = await runYtDlp(args, url);
+    try {
+        const metadata = JSON.parse(stdout.trim().split('\n').pop() || '{}');
 
-        let stdout = '';
-        let stderr = '';
-
-        proc.stdout.on('data', (data) => {
-            stdout = boundedAppend(stdout, data.toString(), MAX_YTDLP_BUF);
-        });
-
-        proc.stderr.on('data', (data) => {
-            stderr = boundedAppend(stderr, data.toString(), MAX_YTDLP_BUF);
-        });
-
-        proc.on('close', async (code) => {
-            if (code !== 0) {
-                reject(new Error(`yt-dlp audio exited with code ${code}: ${stderr}`));
-                return;
-            }
-
-            try {
-                const metadata = JSON.parse(stdout.trim().split('\n').pop() || '{}');
-
-                resolve({
-                    filePath: outputPath,
-                    format: 'm4a',
-                    duration: metadata.duration,
-                    title: metadata.title,
-                    thumbnailUrl: metadata.thumbnail,
-                });
-            } catch {
-                resolve({
-                    filePath: outputPath,
-                    format: 'm4a',
-                });
-            }
-        });
-
-        proc.on('error', reject);
-    });
+        return {
+            filePath: outputPath,
+            format: 'm4a',
+            duration: metadata.duration,
+            title: metadata.title,
+            thumbnailUrl: metadata.thumbnail,
+        };
+    } catch {
+        return {
+            filePath: outputPath,
+            format: 'm4a',
+        };
+    }
 }
 
 /**
@@ -320,9 +343,12 @@ export async function downloadHttp(
 
     logger.info('Starting HTTP download', { url, contentItemId, ext });
 
-    const response = await fetch(url, {
+    const { response } = await safeFetchResponse(url, {
+        timeoutMs: MEDIA_RESPONSE_TIMEOUT_MS,
+        rateLimit: false,
         headers: {
             'User-Agent': 'WahbBot/1.0 (Media Download)',
+            Accept: 'audio/*,video/*,application/octet-stream,*/*;q=0.5',
         },
     });
 
@@ -435,7 +461,10 @@ export async function downloadTelegram(
         if (typeof mediaData === 'string') {
             // Some clients may return a local path when file mode is used.
             // Verify and reuse that path as the downloaded artifact.
-            await stat(mediaData);
+            const mediaStats = await stat(mediaData);
+            if (mediaStats.size > MAX_MEDIA_DOWNLOAD_BYTES) {
+                throw new Error(`Telegram media exceeds size cap: ${mediaStats.size} > ${MAX_MEDIA_DOWNLOAD_BYTES} bytes`);
+            }
             return {
                 filePath: mediaData,
                 format: extension,
@@ -448,6 +477,9 @@ export async function downloadTelegram(
 
         if (buffer.length === 0) {
             throw new Error('Telegram media download returned unsupported data type');
+        }
+        if (buffer.length > MAX_MEDIA_DOWNLOAD_BYTES) {
+            throw new Error(`Telegram media exceeds size cap: ${buffer.length} > ${MAX_MEDIA_DOWNLOAD_BYTES} bytes`);
         }
 
         await writeFile(outputPath, buffer);

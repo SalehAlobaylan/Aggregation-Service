@@ -5,6 +5,7 @@
 import Parser from 'rss-parser';
 import { logger } from '../observability/logger.js';
 import { rateLimiter } from '../services/rate-limiter.js';
+import { safeFetch } from '../utils/safe-fetch.js';
 import type { Fetcher, FetchResult, RawFetchedItem, SourceConfig } from './types.js';
 
 // Standard rss-parser without complex customFields
@@ -60,7 +61,18 @@ export const podcastFetcher: Fetcher = {
 
         try {
             logger.info('Fetching podcast feed', { url: config.url, sourceId: config.id });
-            const feed = await parser.parseURL(config.url);
+            const response = await safeFetch(config.url, {
+                timeoutMs: 20000,
+                rateLimit: false,
+                headers: {
+                    'User-Agent': 'WahbBot/1.0 (Podcast Aggregation)',
+                    Accept: 'application/rss+xml, application/xml, text/xml, */*',
+                },
+            });
+            if (!response.ok) {
+                throw new Error(`Podcast feed fetch failed: ${response.status}`);
+            }
+            const feed = await parser.parseString(response.body);
 
             const showName = feed.title || 'Unknown Podcast';
             // Access image from feed - rss-parser includes itunes data in standard fields
