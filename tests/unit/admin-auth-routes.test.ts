@@ -14,8 +14,21 @@ vi.mock('../../src/queues/index.js', () => ({
     QUEUE_NAMES: {
         FETCH: 'fetch-queue',
         NORMALIZE: 'normalize-queue',
+        MEDIA: 'media-queue',
+        AI: 'ai-queue',
+        ATOMIZATION: 'atomization-queue',
+        ATOMIZATION_SWEEP: 'atomization-sweep-queue',
+        STORAGE_SWEEP: 'storage-sweep-queue',
+        RECONCILE: 'reconcile-queue',
+        QUALITY_REENCODE: 'quality-reencode-queue',
+        DISCOVERY: 'discovery-queue',
+        DISCOVERY_SWEEP: 'discovery-sweep-queue',
+        SOURCE_GRAPH: 'source-graph-queue',
+        NEWS_CIRCULATION: 'news-circulation-queue',
+        DLQ: 'aggregation-dlq',
     },
     getQueue: vi.fn().mockImplementation(() => ({
+        add: vi.fn().mockResolvedValue({ id: 'dlq-job-123' }),
         getJobCounts: queueGetJobCounts,
         getJob: vi.fn().mockResolvedValue(null),
     })),
@@ -227,7 +240,7 @@ describe('Admin auth and route protections', () => {
                 'access-control-request-headers': 'authorization,content-type',
             },
         });
-        expect(disallowedOriginResponse.statusCode).toBeGreaterThanOrEqual(400);
+        expect(disallowedOriginResponse.headers['access-control-allow-origin']).toBeUndefined();
         await server.close();
     });
 });

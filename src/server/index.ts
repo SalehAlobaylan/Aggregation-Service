@@ -2,6 +2,7 @@
  * Fastify server setup
  */
 import Fastify, { FastifyInstance } from 'fastify';
+import type { FastifyCorsOptions } from '@fastify/cors';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 import { healthRoutes } from './routes/health.js';
@@ -13,8 +14,11 @@ import { internalRoutes } from './routes/internal.js';
 let server: FastifyInstance | null = null;
 
 async function registerCors(fastify: FastifyInstance): Promise<void> {
-    const corsOptions = {
-        origin: true,
+    const allowedOrigins = new Set(config.platformConsoleOrigins);
+    const corsOptions: FastifyCorsOptions = {
+        origin: (origin, callback) => {
+            callback(null, !origin || allowedOrigins.has(origin));
+        },
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Authorization', 'Content-Type', 'Origin', 'Accept'],
     };
@@ -29,12 +33,15 @@ async function registerCors(fastify: FastifyInstance): Promise<void> {
     }
 
     fastify.addHook('onRequest', async (request, reply) => {
-        reply.header('Access-Control-Allow-Origin', '*');
+        const origin = request.headers.origin;
+        if (origin && allowedOrigins.has(origin)) {
+            reply.header('Access-Control-Allow-Origin', origin);
+        }
         reply.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
         reply.header('Access-Control-Allow-Headers', 'Authorization,Content-Type,Origin,Accept');
 
         if (request.method === 'OPTIONS') {
-            await reply.status(204).send();
+            await reply.status(origin && !allowedOrigins.has(origin) ? 403 : 204).send();
         }
     });
 }

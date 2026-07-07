@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 import { createWriteStream } from 'fs';
 import { mkdir, unlink, stat, writeFile } from 'fs/promises';
 import { join, basename } from 'path';
+import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
@@ -55,6 +56,12 @@ const SPONSORBLOCK_ARGS = [
     '--sponsorblock-mark', 'all',
 ];
 
+// Safety cap for a single media download. Code default (not env) per config
+// discipline. Podcast/video episodes are well under this; anything larger is
+// almost certainly a mistake or abuse.
+export const MAX_MEDIA_DOWNLOAD_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
+const MAX_YTDLP_BUF = 4 * 1024 * 1024; // Tail keeps --print-json and recent logs.
+
 interface TelegramDownloadRef {
     channelUsername: string;
     channelId?: string;
@@ -62,6 +69,31 @@ interface TelegramDownloadRef {
     mediaKind: 'audio' | 'voice' | 'video' | 'photo';
     fileName?: string;
     mimeType?: string;
+}
+
+/**
+ * Throws if a Content-Length header declares a size over the cap.
+ */
+export function assertContentLengthWithinCap(
+    contentLengthHeader: string | null,
+    cap: number = MAX_MEDIA_DOWNLOAD_BYTES
+): void {
+    if (!contentLengthHeader) {
+        return;
+    }
+
+    const declared = Number(contentLengthHeader);
+    if (Number.isFinite(declared) && declared > cap) {
+        throw new Error(`media download exceeds size cap: ${declared} > ${cap} bytes`);
+    }
+}
+
+/**
+ * Append `chunk` to `buf` but keep only the last `maxBytes` characters.
+ */
+export function boundedAppend(buf: string, chunk: string, maxBytes: number): string {
+    const next = buf + chunk;
+    return next.length > maxBytes ? next.slice(next.length - maxBytes) : next;
 }
 
 /**
@@ -116,11 +148,11 @@ export async function downloadYouTube(
         let stderr = '';
 
         proc.stdout.on('data', (data) => {
-            stdout += data.toString();
+            stdout = boundedAppend(stdout, data.toString(), MAX_YTDLP_BUF);
         });
 
         proc.stderr.on('data', (data) => {
-            stderr += data.toString();
+            stderr = boundedAppend(stderr, data.toString(), MAX_YTDLP_BUF);
         });
 
         proc.on('close', async (code) => {
@@ -236,11 +268,11 @@ export async function downloadYouTubeAudio(
         let stderr = '';
 
         proc.stdout.on('data', (data) => {
-            stdout += data.toString();
+            stdout = boundedAppend(stdout, data.toString(), MAX_YTDLP_BUF);
         });
 
         proc.stderr.on('data', (data) => {
-            stderr += data.toString();
+            stderr = boundedAppend(stderr, data.toString(), MAX_YTDLP_BUF);
         });
 
         proc.on('close', async (code) => {
@@ -313,10 +345,32 @@ export async function downloadHttp(
         throw new Error(`HTTP download returned non-media content-type: ${contentType}`);
     }
 
-    const fileStream = createWriteStream(outputPath);
+    assertContentLengthWithinCap(response.headers.get('content-length'));
 
-    // @ts-expect-error - Node.js fetch body is a ReadableStream
-    await pipeline(response.body, fileStream);
+    const fileStream = createWriteStream(outputPath);
+    let bytesWritten = 0;
+    const capCounter = new Transform({
+        transform(chunk, _encoding, callback) {
+            bytesWritten += chunk.length;
+            if (bytesWritten > MAX_MEDIA_DOWNLOAD_BYTES) {
+                callback(
+                    new Error(
+                        `media download exceeds size cap during stream: > ${MAX_MEDIA_DOWNLOAD_BYTES} bytes`
+                    )
+                );
+                return;
+            }
+            callback(null, chunk);
+        },
+    });
+
+    try {
+        // @ts-expect-error - Node.js fetch body is a ReadableStream
+        await pipeline(response.body, capCounter, fileStream);
+    } catch (error) {
+        await cleanupTempFile(outputPath).catch(() => {});
+        throw error;
+    }
 
     const fileStats = await stat(outputPath);
 
