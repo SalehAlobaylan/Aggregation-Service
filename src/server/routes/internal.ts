@@ -12,9 +12,11 @@ import {
     type NewsCirculationJob,
     type SourceGraphJob,
 } from '../../queues/index.js';
+import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { uploadBuffer, getStorageKey } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
+import { cmsClient } from '../../cms/client.js';
 
 interface UserContentResponse {
     success: boolean;
@@ -30,6 +32,20 @@ interface InternalQueueStats {
     completed: number;
     failed: number;
     delayed: number;
+}
+
+interface InternalRetryBody {
+    ids?: string[];
+    source?: string;
+    limit?: number;
+}
+
+interface InternalRetryResponse {
+    success: boolean;
+    message: string;
+    requeued: number;
+    total: number;
+    errors: string[];
 }
 
 function extensionFromMime(mime: string | undefined, filename: string | undefined): string {
@@ -70,6 +86,102 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
         }
         return reply.send({ data });
     });
+
+    async function retryContentItems(
+        status: 'PENDING' | 'FAILED',
+        body: InternalRetryBody | undefined,
+        namePrefix: string,
+        priority: number,
+    ): Promise<{ statusCode: number; payload: InternalRetryResponse }> {
+        const { source, ids, limit = status === 'FAILED' ? 100 : 200 } = body ?? {};
+        const safeLimit = Math.max(1, Math.min(limit, 500));
+
+        const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
+        if (!mediaQueue) {
+            return {
+                statusCode: 503,
+                payload: {
+                    success: false,
+                    message: 'Media queue is not available',
+                    requeued: 0,
+                    total: 0,
+                    errors: [],
+                },
+            };
+        }
+
+        let listResult;
+        try {
+            listResult = await cmsClient.listContentItems({
+                status,
+                source: ids?.length ? undefined : source?.toUpperCase(),
+                ids,
+                limit: safeLimit,
+            });
+        } catch (err) {
+            logger.error(`internal ${namePrefix}: failed to list content items from CMS`, err);
+            return {
+                statusCode: 502,
+                payload: {
+                    success: false,
+                    message: `Failed to fetch ${status} items from CMS: ${err instanceof Error ? err.message : String(err)}`,
+                    requeued: 0,
+                    total: 0,
+                    errors: [],
+                },
+            };
+        }
+
+        const aiQueue = getQueue(QUEUE_NAMES.AI);
+        let requeued = 0;
+        const errors: string[] = [];
+
+        for (const item of listResult.data) {
+            try {
+                if (status === 'FAILED') {
+                    await cmsClient.updateStatus(item.id, { status: 'PENDING' });
+                }
+                await enqueueRetryJob(
+                    { media: mediaQueue, ai: aiQueue },
+                    item,
+                    { namePrefix, priority },
+                );
+                requeued++;
+                logger.info(`internal ${namePrefix}: requeued item`, { contentItemId: item.id, source: item.source });
+            } catch (err) {
+                const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
+                errors.push(msg);
+                logger.warn(`internal ${namePrefix}: failed to requeue item`, { contentItemId: item.id, error: msg });
+            }
+        }
+
+        return {
+            statusCode: 200,
+            payload: {
+                success: true,
+                message: `Re-queued ${requeued} of ${listResult.data.length} ${status} items`,
+                requeued,
+                total: listResult.total,
+                errors,
+            },
+        };
+    }
+
+    fastify.post<{ Body: InternalRetryBody; Reply: InternalRetryResponse }>(
+        '/internal/retry-pending',
+        async (request, reply) => {
+            const result = await retryContentItems('PENDING', request.body, 'pipeline-autopilot-pending', 5);
+            return reply.status(result.statusCode).send(result.payload);
+        }
+    );
+
+    fastify.post<{ Body: InternalRetryBody; Reply: InternalRetryResponse }>(
+        '/internal/retry-failed',
+        async (request, reply) => {
+            const result = await retryContentItems('FAILED', request.body, 'pipeline-autopilot-failed', 3);
+            return reply.status(result.statusCode).send(result.payload);
+        }
+    );
 
     fastify.post<{ Body: { tenant_id?: string }; Reply: { success: boolean; jobId?: string; message?: string } }>(
         '/internal/circulation/sweep-now',
