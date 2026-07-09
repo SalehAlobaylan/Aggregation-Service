@@ -26,6 +26,11 @@ export interface TranscodeResult {
     duration: number;
 }
 
+export interface FfmpegRunOptions {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+}
+
 /**
  * EncodeProfile drives `transcodeToMp4`. The Quality Management System lets
  * admins create named profiles in CMS; the worker resolves them and passes
@@ -58,26 +63,54 @@ function runFfmpegWithTimeout(
     command: ReturnType<typeof ffmpeg>,
     label: string,
     reject: (reason?: unknown) => void,
-    timeoutMs = config.mediaJobTimeoutMs
+    options: FfmpegRunOptions = {}
 ): void {
-    let timedOut = false;
-    const timer = setTimeout(() => {
-        timedOut = true;
-        logger.warn('FFmpeg command timed out; killing child process', { label, timeoutMs });
+    const timeoutMs = options.timeoutMs ?? config.mediaJobTimeoutMs;
+    const signal = options.signal;
+    let killed = false;
+    let settled = false;
+
+    const cleanup = () => {
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+    };
+
+    const abortCommand = (reason: unknown, source: 'timeout' | 'signal') => {
+        if (settled) return;
+        killed = true;
+        logger.warn('FFmpeg command aborted; killing child process', { label, timeoutMs, source });
+        cleanup();
         command.kill('SIGKILL');
-        reject(new Error(`FFmpeg ${label} timed out after ${timeoutMs}ms`));
+        reject(reason);
+    };
+
+    const abortReason = () => {
+        const reason = signal?.reason;
+        return reason instanceof Error
+            ? reason
+            : new Error(`FFmpeg ${label} aborted`);
+    };
+
+    const onAbort = () => abortCommand(abortReason(), 'signal');
+    const timer = setTimeout(() => {
+        abortCommand(new Error(`FFmpeg ${label} timed out after ${timeoutMs}ms`), 'timeout');
     }, timeoutMs);
     timer.unref();
 
-    const clearTimer = () => clearTimeout(timer);
-    command.once('end', clearTimer);
+    command.once('end', cleanup);
     command.once('error', (err) => {
-        clearTimer();
-        if (timedOut) {
-            logger.debug('Ignoring FFmpeg error after timeout kill', { label, error: err.message });
+        cleanup();
+        if (killed) {
+            logger.debug('Ignoring FFmpeg error after abort kill', { label, error: err.message });
         }
     });
 
+    if (signal?.aborted) {
+        abortCommand(abortReason(), 'signal');
+        return;
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
     command.run();
 }
 
@@ -175,7 +208,8 @@ export function getMediaInfo(inputPath: string): Promise<MediaInfo> {
 export function transcodeToMp4(
     inputPath: string,
     outputPath: string,
-    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE
+    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE,
+    options: FfmpegRunOptions = {}
 ): Promise<TranscodeResult> {
     return new Promise((resolve, reject) => {
         logger.info('Starting MP4 transcode', { inputPath, outputPath, profile });
@@ -215,7 +249,7 @@ export function transcodeToMp4(
                 logger.error('FFmpeg transcode error', err);
                 reject(err);
             });
-        runFfmpegWithTimeout(command, 'transcodeToMp4', reject);
+        runFfmpegWithTimeout(command, 'transcodeToMp4', reject, options);
     });
 }
 
@@ -235,7 +269,8 @@ export function audioToMp4(
     inputPath: string,
     outputPath: string,
     coverImagePath?: string,
-    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE
+    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE,
+    options: FfmpegRunOptions = {}
 ): Promise<TranscodeResult> {
     return new Promise(async (resolve, reject) => {
         logger.info('Starting audio-to-MP4 conversion', { inputPath, outputPath, profile });
@@ -291,7 +326,7 @@ export function audioToMp4(
                 logger.error('Audio-to-MP4 error', err);
                 reject(err);
             });
-        runFfmpegWithTimeout(command, 'audioToMp4', reject);
+        runFfmpegWithTimeout(command, 'audioToMp4', reject, options);
     });
 }
 
@@ -365,6 +400,7 @@ export function extractThumbnail(
     outputPath: string,
     offsetSeconds: number = 2,
     maxHeight: number = 360,
+    options: FfmpegRunOptions = {}
 ): Promise<string> {
     return new Promise((resolve, reject) => {
         logger.info('Extracting thumbnail', { inputPath, outputPath, offsetSeconds, maxHeight });
@@ -387,7 +423,7 @@ export function extractThumbnail(
                 logger.error('Thumbnail extraction error', err);
                 reject(err);
             });
-        runFfmpegWithTimeout(command, 'extractThumbnail', reject);
+        runFfmpegWithTimeout(command, 'extractThumbnail', reject, options);
     });
 }
 
@@ -422,7 +458,8 @@ export function containerMime(container: string | undefined): string {
  */
 export function extractAudio(
     inputPath: string,
-    outputPath: string
+    outputPath: string,
+    options: FfmpegRunOptions = {}
 ): Promise<string> {
     return new Promise((resolve, reject) => {
         logger.info('Extracting audio', { inputPath, outputPath });
@@ -440,7 +477,7 @@ export function extractAudio(
                 logger.error('Audio extraction error', err);
                 reject(err);
             });
-        runFfmpegWithTimeout(command, 'extractAudio', reject);
+        runFfmpegWithTimeout(command, 'extractAudio', reject, options);
     });
 }
 
@@ -449,7 +486,8 @@ export function cutMediaSegment(
     outputPath: string,
     startSec: number,
     durationSec: number,
-    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE
+    profile: EncodeProfile = DEFAULT_ENCODE_PROFILE,
+    options: FfmpegRunOptions = {}
 ): Promise<TranscodeResult> {
     return new Promise((resolve, reject) => {
         logger.info('Cutting media segment', { inputPath, outputPath, startSec, durationSec });
@@ -470,14 +508,15 @@ export function cutMediaSegment(
                 logger.error('Media segment cut failed', err);
                 reject(err);
             });
-        runFfmpegWithTimeout(command, 'cutMediaSegment', reject);
+        runFfmpegWithTimeout(command, 'cutMediaSegment', reject, options);
     });
 }
 
 export function createHlsVod(
     inputPath: string,
     outputDir: string,
-    playlistName = 'index.m3u8'
+    playlistName = 'index.m3u8',
+    options: FfmpegRunOptions = {}
 ): Promise<{ playlistPath: string; duration: number }> {
     return new Promise(async (resolve, reject) => {
         await mkdir(outputDir, { recursive: true });
@@ -504,9 +543,13 @@ export function createHlsVod(
                 logger.error('HLS VOD creation failed', err);
                 reject(err);
             });
-        runFfmpegWithTimeout(command, 'createHlsVod', reject);
+        runFfmpegWithTimeout(command, 'createHlsVod', reject, options);
     });
 }
+
+export const transcoderTestUtils = {
+    runFfmpegWithTimeout,
+};
 
 export const transcoder = {
     getMediaInfo,

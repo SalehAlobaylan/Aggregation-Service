@@ -100,7 +100,7 @@ export const mediaWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA,
     concurrency: 2, // Media processing is resource-intensive
     timeoutMs: config.mediaJobTimeoutMs, // 30 min default — FFmpeg transcodes can be slow
-    processor: async (job: Job<MediaJob>, jobLogger): Promise<void> => {
+    processor: async (job: Job<MediaJob>, jobLogger, signal): Promise<void> => {
         const {
             contentItemId,
             contentType,
@@ -151,7 +151,7 @@ export const mediaWorker = createWorker({
                 }
                 downloadResult = await downloadTelegram(downloadRef, contentItemId);
             } else if (isYouTube) {
-                downloadResult = await downloadYouTube(sourceUrl, contentItemId);
+                downloadResult = await downloadYouTube(sourceUrl, contentItemId, signal);
             } else {
                 // Podcast enclosure or direct URL
                 const extension = contentType === 'PODCAST' ? 'mp3' : 'mp4';
@@ -220,7 +220,7 @@ export const mediaWorker = createWorker({
                 isImageArtifact = true;
             } else if (mediaInfo.hasVideo || contentType === 'VIDEO') {
                 const outPath = join(config.mediaTempDir, `${contentItemId}_processed.${outExt}`);
-                const result = await transcodeToMp4(downloadResult.filePath, outPath, ingestProfile);
+                const result = await transcodeToMp4(downloadResult.filePath, outPath, ingestProfile, { signal });
                 processedPath = result.outputPath;
                 duration = result.duration;
                 processedMimeType = outMime;
@@ -230,7 +230,7 @@ export const mediaWorker = createWorker({
                 // For You feed needs a video container. The audio side of the
                 // ingest profile (codec + bitrate) is honoured by audioToMp4.
                 const outPath = join(config.mediaTempDir, `${contentItemId}_processed.mp4`);
-                const result = await audioToMp4(downloadResult.filePath, outPath, undefined, ingestProfile);
+                const result = await audioToMp4(downloadResult.filePath, outPath, undefined, ingestProfile, { signal });
                 processedPath = result.outputPath;
                 duration = result.duration || mediaInfo.duration;
                 processedMimeType = 'video/mp4';
@@ -250,7 +250,7 @@ export const mediaWorker = createWorker({
                 thumbnailPath = join(config.mediaTempDir, `${contentItemId}_thumb.jpg`);
                 const thumbOffset = rawProfile?.thumbnail_offset_seconds ?? 2;
                 const thumbMaxH = rawProfile?.thumbnail_max_height ?? 360;
-                await extractThumbnail(processedPath, thumbnailPath, thumbOffset, thumbMaxH);
+                await extractThumbnail(processedPath, thumbnailPath, thumbOffset, thumbMaxH, { signal });
                 tempFiles.push(thumbnailPath);
 
                 // Upload thumbnail
@@ -384,6 +384,7 @@ export const mediaWorker = createWorker({
                 mediaUrl,
                 captionState,
                 captionText,
+                true,
             );
 
             jobLogger.info('Media job completed successfully', { contentItemId });
@@ -425,7 +426,8 @@ async function enqueueAIJob(
     mediaPath?: string,
     mediaUrl?: string,
     captionState: CaptionState = 'none',
-    captionText?: string
+    captionText?: string,
+    replaceCompleted = false
 ): Promise<void> {
     const aiQueue = getQueue(QUEUE_NAMES.AI);
     if (!aiQueue) {
@@ -436,6 +438,17 @@ async function enqueueAIJob(
     const operations = contentType === 'ARTICLE'
         ? ['embedding']
         : ['transcript', 'embedding'];
+    const jobId = `ai-${contentItemId}`;
+    const existing = await aiQueue.getJob(jobId);
+    if (existing) {
+        const state = await existing.getState();
+        if (state === 'failed' || (state === 'completed' && replaceCompleted)) {
+            await existing.remove();
+        } else {
+            job.log(`AI job already queued for ${contentItemId} (${state})`);
+            return;
+        }
+    }
 
     await aiQueue.add(
         `ai-${contentType}-${contentItemId}`,
@@ -451,6 +464,7 @@ async function enqueueAIJob(
         },
         {
             priority: 2,
+            jobId,
         }
     );
 

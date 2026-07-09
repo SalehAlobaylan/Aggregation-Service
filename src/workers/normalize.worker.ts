@@ -307,6 +307,20 @@ export const normalizeWorker = createWorker({
 
                             if (mediaQueue) {
                                 const downloadRef = (normalized.metadata as Record<string, unknown>)?.telegramDownloadRef as TelegramDownloadRef | undefined;
+                                const mediaJobId = `media-${contentItemId}`;
+                                const existingMediaJob = await mediaQueue.getJob(mediaJobId);
+                                if (existingMediaJob) {
+                                    const state = await existingMediaJob.getState();
+                                    if (state === 'failed' || state === 'completed') {
+                                        await existingMediaJob.remove();
+                                    } else {
+                                        jobLogger.debug('Media job already queued for content item', {
+                                            contentItemId,
+                                            state,
+                                        });
+                                        continue;
+                                    }
+                                }
 
                                 await mediaQueue.add(
                                     `media-${normalized.type}-${contentItemId}`,
@@ -323,7 +337,7 @@ export const normalizeWorker = createWorker({
                                         downloadRef,
                                         operations: ['download', 'transcode', 'thumbnail'],
                                     },
-                                    { priority: normalized.type === 'VIDEO' ? 2 : 3 }
+                                    { priority: normalized.type === 'VIDEO' ? 2 : 3, jobId: mediaJobId }
                                 );
 
                                 mediaEnqueued++;

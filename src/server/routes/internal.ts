@@ -296,6 +296,35 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
                 });
             }
 
+            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
+            if (!mediaQueue) {
+                return reply.status(500).send({
+                    success: false,
+                    message: 'media queue is not initialised',
+                });
+            }
+
+            const jobId = `user-content-${contentItemId}`;
+            const existing = await mediaQueue.getJob(jobId);
+            if (existing) {
+                const state = await existing.getState();
+                if (state === 'failed' || state === 'completed') {
+                    await existing.remove();
+                } else {
+                    logger.info('User-submitted audio already queued', {
+                        contentItemId,
+                        tenantId,
+                        jobId: existing.id ?? jobId,
+                        state,
+                    });
+                    return reply.status(202).send({
+                        success: true,
+                        contentItemId,
+                        jobId: existing.id ?? jobId,
+                    });
+                }
+            }
+
             const ext = extensionFromMime(audioMime, audioFilename);
             const sourceKey = getStorageKey(contentItemId, 'original', ext);
             let sourceUrl: string;
@@ -317,14 +346,6 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
                 });
             }
 
-            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
-            if (!mediaQueue) {
-                return reply.status(500).send({
-                    success: false,
-                    message: 'media queue is not initialised',
-                });
-            }
-
             const mediaJob: MediaJob = {
                 contentItemId,
                 contentType,
@@ -332,7 +353,10 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
                 sourceUrl,
                 operations: ['download', 'transcode', 'thumbnail'],
             };
-            const job = await mediaQueue.add('user-content', mediaJob);
+            const job = await mediaQueue.add('user-content', mediaJob, {
+                priority: 2,
+                jobId,
+            });
 
             logger.info('User-submitted audio enqueued', {
                 contentItemId,

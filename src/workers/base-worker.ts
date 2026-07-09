@@ -12,7 +12,7 @@ export interface WorkerConfig {
     queueName: string;
     concurrency?: number;
     timeoutMs?: number;
-    processor: (job: Job, jobLogger: ReturnType<typeof createLogger>) => Promise<void>;
+    processor: (job: Job, jobLogger: ReturnType<typeof createLogger>, signal?: AbortSignal) => Promise<void>;
 }
 
 /**
@@ -38,7 +38,11 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
             jobLogger.info(`Job started`, { name: job.name, data: job.data });
 
             try {
-                await withTimeout(processor(job, jobLogger), timeoutMs, queueName, job.id);
+                await runProcessorWithTimeout(processor, job, jobLogger, {
+                    timeoutMs,
+                    queueName,
+                    jobId: job.id,
+                });
 
                 const durationSec = (Date.now() - startTime) / 1000;
                 jobDuration.labels(queueName, job.data?.sourceType || 'unknown').observe(durationSec);
@@ -103,20 +107,42 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
     return worker;
 }
 
-/**
- * Race a promise against a timeout. Throws a named error if the timeout fires first.
- */
-function withTimeout(promise: Promise<void>, ms: number, queueName: string, jobId?: string): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-            reject(new Error(`Job timed out after ${ms}ms in queue ${queueName} (jobId: ${jobId ?? 'unknown'})`));
-        }, ms);
+interface ProcessorTimeoutOptions {
+    timeoutMs: number;
+    queueName: string;
+    jobId?: string;
+}
 
-        promise.then(
-            (val) => { clearTimeout(timer); resolve(val); },
-            (err) => { clearTimeout(timer); reject(err); }
-        );
-    });
+function jobTimeoutError(timeoutMs: number, queueName: string, jobId?: string): Error {
+    return new Error(`Job timed out after ${timeoutMs}ms in queue ${queueName} (jobId: ${jobId ?? 'unknown'})`);
+}
+
+/**
+ * Run a processor with a cooperative timeout signal. The timeout aborts work,
+ * but the job is not failed/completed until the processor actually returns.
+ */
+export async function runProcessorWithTimeout(
+    processor: WorkerConfig['processor'],
+    job: Job,
+    jobLogger: ReturnType<typeof createLogger>,
+    options: ProcessorTimeoutOptions
+): Promise<void> {
+    const controller = new AbortController();
+    const timeoutError = jobTimeoutError(options.timeoutMs, options.queueName, options.jobId);
+    const timer = setTimeout(() => {
+        controller.abort(timeoutError);
+    }, options.timeoutMs);
+    timer.unref();
+
+    try {
+        await processor(job, jobLogger, controller.signal);
+        if (controller.signal.aborted) {
+            const reason = controller.signal.reason;
+            throw reason instanceof Error ? reason : timeoutError;
+        }
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /**

@@ -36,7 +36,7 @@ async function main(): Promise<void> {
 
         // Start workers
         logger.info('Starting workers...');
-        startWorkers();
+        await startWorkers();
 
         // Start HTTP server
         logger.info('Starting HTTP server...');

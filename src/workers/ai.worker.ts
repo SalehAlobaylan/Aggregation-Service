@@ -31,7 +31,7 @@ import { cleanupTempFile, downloadHttp } from '../media/downloader.js';
 export const aiWorker = createWorker({
     queueName: QUEUE_NAMES.AI,
     concurrency: 3, // AI processing with moderate concurrency
-    processor: async (job: Job<AIJob>, jobLogger): Promise<void> => {
+    processor: async (job: Job<AIJob>, jobLogger, signal): Promise<void> => {
         const {
             contentItemId,
             contentType,
@@ -122,7 +122,7 @@ export const aiWorker = createWorker({
                     let audioPath = resolvedMediaPath;
                     if (resolvedMediaPath.endsWith('.mp4') || resolvedMediaPath.endsWith('.webm')) {
                         audioPath = join(config.mediaTempDir, `${contentItemId}_audio.mp3`);
-                        await extractAudio(resolvedMediaPath, audioPath);
+                        await extractAudio(resolvedMediaPath, audioPath, { signal });
                         tempFiles.push(audioPath);
                     }
 
@@ -220,18 +220,15 @@ export const aiWorker = createWorker({
 
                     if (embeddingText.length > 0) {
                         embeddingAttempted = true;
-                        // Generate + persist BGE-M3 embedding (1024-dim dense
-                        // + optional sparse) via Enrichment. content_id
-                        // triggers server-side write-back to CMS.
+                        // Generate + persist the Qwen3 dense text embedding via
+                        // Enrichment. content_id triggers server-side write-back
+                        // to CMS.
                         //
                         // For long-form content (ARTICLE/VIDEO/PODCAST) enable:
                         //   - extractTags:   topic tags via LLM (one extra call)
-                        //   - extractSparse: BGE-M3 sparse lexical weights —
-                        //                    no extra cost (same forward pass)
-                        //                    but required for /v1/related
-                        //                    hybrid retrieval to work on this
-                        //                    item. TWEET/COMMENT skip both.
-                        const wantsHybridEnrichment =
+                        // NEWS also gets tags for story clustering and admin
+                        // review context. TWEET/COMMENT skip the extra call.
+                        const wantsTagExtraction =
                             contentType === 'NEWS'
                             || contentType === 'ARTICLE'
                             || contentType === 'VIDEO'
@@ -242,8 +239,7 @@ export const aiWorker = createWorker({
                             contentItemId,
                             {
                                 requestId: job.id,
-                                extractTags: wantsHybridEnrichment,
-                                extractSparse: wantsHybridEnrichment,
+                                extractTags: wantsTagExtraction,
                             },
                         );
 
@@ -254,7 +250,7 @@ export const aiWorker = createWorker({
                             embeddingDim: embedResult.embedding.length,
                             textLength: embeddingText.length,
                             tagCount: embedResult.tags?.length ?? 0,
-                            hybridEnabled: wantsHybridEnrichment,
+                            tagExtractionEnabled: wantsTagExtraction,
                             writeBackStatus: embedResult.writeBackStatus,
                         });
                     } else {

@@ -9,8 +9,14 @@ import { enqueueRetryJob, type RetryItem } from '../../src/queues/retry-routing.
 
 function mkQueues() {
     return {
-        media: { add: vi.fn().mockResolvedValue(undefined) },
-        ai: { add: vi.fn().mockResolvedValue(undefined) },
+        media: {
+            add: vi.fn().mockResolvedValue(undefined),
+            getJob: vi.fn().mockResolvedValue(null),
+        },
+        ai: {
+            add: vi.fn().mockResolvedValue(undefined),
+            getJob: vi.fn().mockResolvedValue(null),
+        },
     };
 }
 
@@ -111,6 +117,9 @@ describe('enqueueRetryJob', () => {
         expect(route).toBe('media');
         expect(q.ai.add).not.toHaveBeenCalled();
         expect(q.media.add.mock.calls[0][1].operations).toEqual(['download']);
+        expect(q.media.add.mock.calls[0][2]).toEqual(expect.objectContaining({
+            jobId: 'media-c1',
+        }));
     });
 
     it('routes video to the media queue (full pipeline)', async () => {
@@ -131,5 +140,101 @@ describe('enqueueRetryJob', () => {
             'transcode',
             'thumbnail',
         ]);
+        expect(q.media.add.mock.calls[0][2]).toEqual(expect.objectContaining({
+            jobId: 'media-c1',
+        }));
+    });
+
+    it('keeps deterministic AI job ids for text retries', async () => {
+        const q = mkQueues();
+        const item: RetryItem = {
+            ...base,
+            type: 'NEWS',
+            source: 'RSS',
+            title: 'Headline',
+            metadata: {},
+        };
+
+        await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-pending',
+            priority: 3,
+        });
+
+        expect(q.ai.add.mock.calls[0][2]).toEqual(expect.objectContaining({
+            jobId: 'ai-c1',
+        }));
+    });
+
+    it('removes stale failed media retry jobs before requeueing', async () => {
+        const q = mkQueues();
+        const remove = vi.fn().mockResolvedValue(undefined);
+        q.media.getJob.mockResolvedValue({
+            getState: vi.fn().mockResolvedValue('failed'),
+            remove,
+        });
+        const item: RetryItem = {
+            ...base,
+            type: 'VIDEO',
+            source: 'YOUTUBE',
+            metadata: {},
+        };
+
+        const route = await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-media',
+            priority: 3,
+        });
+
+        expect(route).toBe('media');
+        expect(remove).toHaveBeenCalledOnce();
+        expect(q.media.add).toHaveBeenCalledOnce();
+    });
+
+    it('coalesces active media retry jobs without enqueueing a duplicate', async () => {
+        const q = mkQueues();
+        const remove = vi.fn();
+        q.media.getJob.mockResolvedValue({
+            getState: vi.fn().mockResolvedValue('active'),
+            remove,
+        });
+        const item: RetryItem = {
+            ...base,
+            type: 'VIDEO',
+            source: 'YOUTUBE',
+            metadata: {},
+        };
+
+        const route = await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-media',
+            priority: 3,
+        });
+
+        expect(route).toBe('media');
+        expect(remove).not.toHaveBeenCalled();
+        expect(q.media.add).not.toHaveBeenCalled();
+    });
+
+    it('removes stale completed AI retry jobs before requeueing', async () => {
+        const q = mkQueues();
+        const remove = vi.fn().mockResolvedValue(undefined);
+        q.ai.getJob.mockResolvedValue({
+            getState: vi.fn().mockResolvedValue('completed'),
+            remove,
+        });
+        const item: RetryItem = {
+            ...base,
+            type: 'NEWS',
+            source: 'RSS',
+            title: 'Headline',
+            metadata: {},
+        };
+
+        const route = await enqueueRetryJob(q as never, item, {
+            namePrefix: 'retry-pending',
+            priority: 3,
+        });
+
+        expect(route).toBe('ai');
+        expect(remove).toHaveBeenCalledOnce();
+        expect(q.ai.add).toHaveBeenCalledOnce();
     });
 });

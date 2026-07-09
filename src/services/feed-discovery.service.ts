@@ -1,5 +1,6 @@
 import { JSDOM } from 'jsdom';
 import { logger } from '../observability/logger.js';
+import { safeFetch } from '../utils/safe-fetch.js';
 
 export interface DiscoveredFeed {
     url: string;
@@ -32,28 +33,19 @@ function parseFeedTypeFromBody(body: string): DiscoveredFeed['type'] | null {
 }
 
 async function fetchText(url: string, timeoutMs = 8000): Promise<{ body: string; contentType: string }> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'WahbBot/1.0 (Feed Discovery)',
-                Accept: 'text/html,application/rss+xml,application/atom+xml,application/xml,text/xml,*/*',
-            },
-        });
+    const result = await safeFetch(url, {
+        timeoutMs,
+        rateLimit: false,
+    });
 
-        if (!response.ok) {
-            return { body: '', contentType: '' };
-        }
-
-        return {
-            body: await response.text(),
-            contentType: response.headers.get('content-type') || '',
-        };
-    } finally {
-        clearTimeout(timeout);
+    if (!result.ok) {
+        return { body: '', contentType: '' };
     }
+
+    return {
+        body: result.body,
+        contentType: result.contentType,
+    };
 }
 
 async function probeCommonFeedPaths(baseUrl: URL): Promise<DiscoveredFeed[]> {

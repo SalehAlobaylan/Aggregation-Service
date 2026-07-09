@@ -2,12 +2,36 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 
-const queueGetJobCounts = vi.fn().mockResolvedValue({
-    waiting: 1,
-    active: 2,
-    completed: 3,
-    failed: 0,
-    delayed: 0,
+const mocks = vi.hoisted(() => {
+    const queueGetJobCounts = vi.fn().mockResolvedValue({
+        waiting: 1,
+        active: 2,
+        completed: 3,
+        failed: 0,
+        delayed: 0,
+    });
+    const queueClean = vi.fn().mockResolvedValue([]);
+    const queueDrain = vi.fn().mockResolvedValue(undefined);
+    const queueGetActive = vi.fn().mockResolvedValue([]);
+    const workers = [
+        {
+            pause: vi.fn().mockResolvedValue(undefined),
+            resume: vi.fn().mockResolvedValue(undefined),
+        },
+        {
+            pause: vi.fn().mockResolvedValue(undefined),
+            resume: vi.fn().mockResolvedValue(undefined),
+        },
+    ];
+
+    return {
+        queueGetJobCounts,
+        queueClean,
+        queueDrain,
+        queueGetActive,
+        workers,
+        getAllWorkers: vi.fn(() => workers),
+    };
 });
 
 vi.mock('../../src/queues/index.js', () => ({
@@ -29,9 +53,20 @@ vi.mock('../../src/queues/index.js', () => ({
     },
     getQueue: vi.fn().mockImplementation(() => ({
         add: vi.fn().mockResolvedValue({ id: 'dlq-job-123' }),
-        getJobCounts: queueGetJobCounts,
+        getJobCounts: mocks.queueGetJobCounts,
         getJob: vi.fn().mockResolvedValue(null),
+        clean: mocks.queueClean,
+        drain: mocks.queueDrain,
+        getActive: mocks.queueGetActive,
     })),
+}));
+
+vi.mock('../../src/workers/index.js', () => ({
+    getAllWorkers: mocks.getAllWorkers,
+    syncDiscoverySweeper: vi.fn().mockResolvedValue(undefined),
+    syncNewsCirculationSweeper: vi.fn().mockResolvedValue(undefined),
+    syncRepeatableSweepers: vi.fn().mockResolvedValue(undefined),
+    syncSourceGraphSweeper: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../src/services/scheduler.service.js', () => ({
@@ -200,6 +235,40 @@ describe('Admin auth and route protections', () => {
 
         expect(adminResponse.statusCode).toBe(200);
         expect(managerResponse.statusCode).toBe(200);
+        await server.close();
+    });
+
+    it('resumes paused workers when queue purge fails', async () => {
+        const server = await buildServer();
+        const token = makeJwt(
+            {
+                iss: 'cms-service',
+                aud: 'platform-console',
+                role: 'admin',
+                exp: Math.floor(Date.now() / 1000) + 3600,
+            },
+            'test-jwt-secret'
+        );
+
+        mocks.queueClean.mockRejectedValueOnce(new Error('clean failed'));
+
+        const response = await server.inject({
+            method: 'POST',
+            url: '/admin/queues/purge',
+            headers: { authorization: `Bearer ${token}` },
+            payload: {
+                queue: 'fetch-queue',
+                states: ['active', 'failed'],
+            },
+        });
+
+        expect(response.statusCode).toBe(500);
+        expect(mocks.getAllWorkers).toHaveBeenCalled();
+        for (const worker of mocks.workers) {
+            expect(worker.pause).toHaveBeenCalledTimes(1);
+            expect(worker.resume).toHaveBeenCalledTimes(1);
+        }
+
         await server.close();
     });
 

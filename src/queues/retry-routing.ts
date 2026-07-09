@@ -50,6 +50,16 @@ export async function enqueueRetryJob(
 
     if (!requiresMediaJob) {
         if (!queues.ai) return 'skipped';
+        const jobId = `ai-${item.id}`;
+        const existing = await queues.ai.getJob(jobId);
+        if (existing) {
+            const state = await existing.getState();
+            if (state === 'failed' || state === 'completed') {
+                await existing.remove();
+            } else {
+                return 'ai';
+            }
+        }
         await queues.ai.add(
             `${opts.namePrefix}-embed-${item.source}-${item.id}`,
             {
@@ -63,12 +73,22 @@ export async function enqueueRetryJob(
                 },
             },
             // Deterministic id coalesces with the normal-path AI job for this item.
-            { priority: opts.priority, jobId: `ai-${item.id}` },
+            { priority: opts.priority, jobId },
         );
         return 'ai';
     }
 
     const downloadRef = meta.telegramDownloadRef as MediaJob['downloadRef'] | undefined;
+    const jobId = `media-${item.id}`;
+    const existing = await queues.media.getJob(jobId);
+    if (existing) {
+        const state = await existing.getState();
+        if (state === 'failed' || state === 'completed') {
+            await existing.remove();
+        } else {
+            return 'media';
+        }
+    }
     await queues.media.add(
         `${opts.namePrefix}-${item.source}-${item.id}`,
         {
@@ -79,7 +99,7 @@ export async function enqueueRetryJob(
             operations: isPhoto ? ['download'] : ['download', 'transcode', 'thumbnail'],
             downloadRef,
         },
-        { priority: opts.priority },
+        { priority: opts.priority, jobId },
     );
     return 'media';
 }

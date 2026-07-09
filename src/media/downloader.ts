@@ -132,8 +132,15 @@ async function assertAllowedYouTubeUrl(rawUrl: string): Promise<void> {
     await assertPublicUrl(rawUrl);
 }
 
-function runYtDlp(args: string[], url: string, timeoutMs = config.mediaJobTimeoutMs): Promise<{ stdout: string; stderr: string }> {
+interface YtDlpRunOptions {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+}
+
+function runYtDlp(args: string[], url: string, options: YtDlpRunOptions = {}): Promise<{ stdout: string; stderr: string }> {
     return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        const timeoutMs = options.timeoutMs ?? config.mediaJobTimeoutMs;
+        const signal = options.signal;
         const proc = spawn('yt-dlp', args, {
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -142,24 +149,49 @@ function runYtDlp(args: string[], url: string, timeoutMs = config.mediaJobTimeou
         let stderr = '';
         let settled = false;
         let timedOut = false;
+        let aborted = false;
         let closed = false;
 
         const settle = (fn: typeof resolve | typeof reject, value: unknown) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
             fn(value as never);
+        };
+
+        const killProcess = () => {
+            proc.kill('SIGTERM');
+            setTimeout(() => {
+                if (!closed) proc.kill('SIGKILL');
+            }, 5000).unref();
+        };
+
+        const abortReason = () => {
+            const reason = signal?.reason;
+            return reason instanceof Error ? reason : new Error('yt-dlp aborted');
+        };
+
+        const onAbort = () => {
+            if (settled) return;
+            aborted = true;
+            logger.warn('yt-dlp aborted; killing child process', { url, timeoutMs });
+            killProcess();
         };
 
         const timer = setTimeout(() => {
             timedOut = true;
             logger.warn('yt-dlp timed out; killing child process', { url, timeoutMs });
-            proc.kill('SIGTERM');
-            setTimeout(() => {
-                if (!closed) proc.kill('SIGKILL');
-            }, 5000).unref();
+            killProcess();
         }, timeoutMs);
         timer.unref();
+
+        if (signal?.aborted) {
+            aborted = true;
+            killProcess();
+        } else {
+            signal?.addEventListener('abort', onAbort, { once: true });
+        }
 
         proc.stdout.on('data', (data) => {
             stdout = boundedAppend(stdout, data.toString(), MAX_YTDLP_BUF);
@@ -171,6 +203,10 @@ function runYtDlp(args: string[], url: string, timeoutMs = config.mediaJobTimeou
 
         proc.on('close', async (code) => {
             closed = true;
+            if (aborted) {
+                settle(reject, abortReason());
+                return;
+            }
             if (timedOut) {
                 settle(reject, new Error(`yt-dlp timed out after ${timeoutMs}ms`));
                 return;
@@ -195,7 +231,8 @@ function runYtDlp(args: string[], url: string, timeoutMs = config.mediaJobTimeou
  */
 export async function downloadYouTube(
     url: string,
-    contentItemId: string
+    contentItemId: string,
+    signal?: AbortSignal
 ): Promise<DownloadResult> {
     await ensureTempDir();
     await assertAllowedYouTubeUrl(url);
@@ -267,7 +304,7 @@ export async function downloadYouTube(
     };
 
     try {
-        const { stdout } = await runYtDlp(buildArgs(true), url);
+        const { stdout } = await runYtDlp(buildArgs(true), url, { signal });
         return parseResult(stdout);
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -279,7 +316,7 @@ export async function downloadYouTube(
             contentItemId,
             error: message,
         });
-        const { stdout } = await runYtDlp(buildArgs(false), url);
+        const { stdout } = await runYtDlp(buildArgs(false), url, { signal });
         return parseResult(stdout);
     }
 }
@@ -289,7 +326,8 @@ export async function downloadYouTube(
  */
 export async function downloadYouTubeAudio(
     url: string,
-    contentItemId: string
+    contentItemId: string,
+    signal?: AbortSignal
 ): Promise<DownloadResult> {
     await ensureTempDir();
     await assertAllowedYouTubeUrl(url);
@@ -307,7 +345,7 @@ export async function downloadYouTubeAudio(
         url,
     ];
 
-    const { stdout } = await runYtDlp(args, url);
+    const { stdout } = await runYtDlp(args, url, { signal });
     try {
         const metadata = JSON.parse(stdout.trim().split('\n').pop() || '{}');
 

@@ -33,7 +33,7 @@ function tracingHeaders(requestId?: string): Record<string, string> {
 }
 
 export interface EmbedResult {
-    /** Single text embedding vector (384-dim today, 1024-dim after Slice 0 / BGE-M3). */
+    /** Qwen3 dense text embedding vector (1024 dimensions in the current Wahb stack). */
     embedding: number[];
     /**
      * Whether Enrichment persisted the vector to CMS. `not_attempted` when no
@@ -120,26 +120,19 @@ export async function generateChaptersViaEnrichment(
  * Set `extractTags: true` to also pull topic tags + named entities via LLM.
  * Costs an additional LLM call; enable only for long-form content types
  * (ARTICLE/VIDEO/PODCAST) where the tags are worth the cost.
- *
- * Set `extractSparse: true` to populate BGE-M3's sparse (lexical-weights)
- * output alongside dense — required to participate in /v1/related hybrid
- * retrieval. Free in compute (same forward pass as dense); enable for the
- * same long-form cohort as tags.
  */
 export async function generateEmbeddingViaEnrichment(
     text: string,
     contentItemId?: string,
-    opts: { requestId?: string; extractTags?: boolean; extractSparse?: boolean } = {},
+    opts: { requestId?: string; extractTags?: boolean } = {},
 ): Promise<EmbedResult> {
     const body: {
         texts: string[];
         content_ids?: string[];
         extract_tags?: boolean;
-        extract_sparse?: boolean;
     } = { texts: [text] };
     if (contentItemId) body.content_ids = [contentItemId];
     if (opts.extractTags) body.extract_tags = true;
-    if (opts.extractSparse) body.extract_sparse = true;
 
     const response = await fetch(`${baseUrl()}/v1/embed`, {
         method: 'POST',

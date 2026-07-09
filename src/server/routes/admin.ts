@@ -15,10 +15,13 @@ import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.j
 import { resolveYoutubeChannel } from '../../fetchers/youtube.fetcher.js';
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
-import { getAllWorkers, syncRepeatableSweepers } from '../../workers/index.js';
-import { syncDiscoverySweeper } from '../../workers/discovery-sweep.worker.js';
-import { syncSourceGraphSweeper } from '../../workers/source-graph.worker.js';
-import { syncNewsCirculationSweeper } from '../../workers/news-circulation.worker.js';
+import {
+    getAllWorkers,
+    syncDiscoverySweeper,
+    syncNewsCirculationSweeper,
+    syncRepeatableSweepers,
+    syncSourceGraphSweeper,
+} from '../../workers/index.js';
 import { importYouTubeFeed, importYouTubeLinks } from '../../services/discovery/youtube-import.js';
 // quality-sweeper worker removed in Phase 7; re-encoding is now driven by
 // the storage sweeper (when archive_action='re_encode').
@@ -795,65 +798,65 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 ? [queueName]
                 : Object.values(QUEUE_NAMES);
 
+            let pausedWorkers: ReturnType<typeof getAllWorkers> = [];
+
             // Pause workers only if we're killing active jobs
             if (needsPause) {
-                const workers = getAllWorkers();
-                for (const worker of workers) {
+                pausedWorkers = getAllWorkers();
+                for (const worker of pausedWorkers) {
                     try { await worker.pause(); } catch (_) { /* already paused */ }
                 }
             }
 
-            for (const qName of queuesToPurge) {
-                const queue = getQueue(qName as any);
-                if (!queue) continue;
+            try {
+                for (const qName of queuesToPurge) {
+                    const queue = getQueue(qName as any);
+                    if (!queue) continue;
 
-                let removedCount = 0;
+                    let removedCount = 0;
 
-                if (statesToPurge.includes('failed')) {
-                    const r = await queue.clean(0, 0, 'failed');
-                    removedCount += r.length;
-                }
-                if (statesToPurge.includes('completed')) {
-                    const r = await queue.clean(0, 0, 'completed');
-                    removedCount += r.length;
-                }
-                if (statesToPurge.includes('waiting')) {
-                    const r = await queue.clean(0, 0, 'wait');
-                    removedCount += r.length;
-                    await queue.drain();
-                }
-                if (statesToPurge.includes('delayed')) {
-                    const r = await queue.clean(0, 0, 'delayed');
-                    removedCount += r.length;
-                }
-                if (statesToPurge.includes('active')) {
-                    const activeJobs = await queue.getActive();
-                    for (const job of activeJobs) {
-                        try {
-                            await job.moveToFailed(new Error('Purged by admin'), '0', true);
-                            await job.remove();
-                            removedCount++;
-                        } catch (_) { /* job may have finished */ }
+                    if (statesToPurge.includes('failed')) {
+                        const r = await queue.clean(0, 0, 'failed');
+                        removedCount += r.length;
                     }
+                    if (statesToPurge.includes('completed')) {
+                        const r = await queue.clean(0, 0, 'completed');
+                        removedCount += r.length;
+                    }
+                    if (statesToPurge.includes('waiting')) {
+                        const r = await queue.clean(0, 0, 'wait');
+                        removedCount += r.length;
+                        await queue.drain();
+                    }
+                    if (statesToPurge.includes('delayed')) {
+                        const r = await queue.clean(0, 0, 'delayed');
+                        removedCount += r.length;
+                    }
+                    if (statesToPurge.includes('active')) {
+                        const activeJobs = await queue.getActive();
+                        for (const job of activeJobs) {
+                            try {
+                                await job.moveToFailed(new Error('Purged by admin'), '0', true);
+                                await job.remove();
+                                removedCount++;
+                            } catch (_) { /* job may have finished */ }
+                        }
+                    }
+
+                    purged[qName] = removedCount;
+                    logger.info('Queue purged', { queue: qName, states: statesToPurge, removedCount });
                 }
 
-                purged[qName] = removedCount;
-                logger.info('Queue purged', { queue: qName, states: statesToPurge, removedCount });
-            }
-
-            // Resume workers if we paused them
-            if (needsPause) {
-                const workers = getAllWorkers();
-                for (const worker of workers) {
-                    try { worker.resume(); } catch (_) { /* ignore */ }
+                return reply.send({
+                    success: true,
+                    message: `Purged ${Object.keys(purged).length} queue(s) — states: ${statesToPurge.join(', ')}`,
+                    purged,
+                });
+            } finally {
+                if (needsPause) {
+                    await Promise.allSettled(pausedWorkers.map(worker => worker.resume()));
                 }
             }
-
-            return reply.send({
-                success: true,
-                message: `Purged ${Object.keys(purged).length} queue(s) — states: ${statesToPurge.join(', ')}`,
-                purged,
-            });
         }
     );
 

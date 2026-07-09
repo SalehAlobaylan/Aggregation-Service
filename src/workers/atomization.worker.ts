@@ -33,7 +33,7 @@ export const atomizationWorker = createWorker({
     queueName: QUEUE_NAMES.ATOMIZATION,
     concurrency: 1,
     timeoutMs: config.mediaJobTimeoutMs,
-    processor: async (job: Job<AtomizationJob>, jobLogger): Promise<void> => {
+    processor: async (job: Job<AtomizationJob>, jobLogger, signal): Promise<void> => {
         const { contentItemId } = job.data;
         jobLogger.info('Processing atomization job', { contentItemId, reason: job.data.reason });
 
@@ -102,7 +102,7 @@ export const atomizationWorker = createWorker({
                     const clipPath = join(config.mediaTempDir, `${contentItemId}_chapter_${i}.mp4`);
                     const startSec = chapter.start_ms / 1000;
                     const durationSec = Math.max(1, (chapter.end_ms - chapter.start_ms) / 1000);
-                    const cut = await cutMediaSegment(parentDownload.filePath, clipPath, startSec, durationSec);
+                    const cut = await cutMediaSegment(parentDownload.filePath, clipPath, startSec, durationSec, undefined, { signal });
                     tempFiles.push(clipPath);
 
                     currentPhase = 'renditions';
@@ -115,7 +115,7 @@ export const atomizationWorker = createWorker({
                     try {
                         const hlsDir = join(config.mediaTempDir, `${contentItemId}_chapter_${i}_hls`);
                         tempDirs.push(hlsDir);
-                        const hls = await createHlsVod(clipPath, hlsDir);
+                        const hls = await createHlsVod(clipPath, hlsDir, undefined, { signal });
                         const hlsUrl = await uploadHlsDirectory(hlsDir, `${contentItemId}/chapters/${i}`);
                         primaryUrl = hlsUrl || mp4Url;
                         primaryType = hlsUrl ? 'hls' : 'mp4';
@@ -137,7 +137,7 @@ export const atomizationWorker = createWorker({
                     let thumbUrl = input.item.thumbnail_url ?? undefined;
                     try {
                         const thumbPath = join(config.mediaTempDir, `${contentItemId}_chapter_${i}.jpg`);
-                        await extractThumbnail(clipPath, thumbPath, 1, 360);
+                        await extractThumbnail(clipPath, thumbPath, 1, 360, { signal });
                         tempFiles.push(thumbPath);
                         const thumbKey = getStorageKey(`${contentItemId}/chapters/${i}`, 'thumbnail', 'jpg');
                         thumbUrl = await uploadFile(thumbKey, thumbPath, 'image/jpeg');
