@@ -214,6 +214,22 @@ export const normalizeWorker = createWorker({
                 }
 
                 const moderation = evaluateModerationDecision(normalized, moderationConfig);
+
+				// Redundancy hygiene is advisory for near matches. Exact durable URL
+				// identity may reuse the existing idempotency skip; title/duration
+				// matches are recorded as a hint and continue through the pipeline.
+				if ((normalized.type === 'VIDEO' || normalized.type === 'PODCAST') && normalized.title) {
+					const precheck = await cmsClient.redundancyPrecheck([{
+						title: normalized.title,
+						duration_sec: typeof normalized.durationSec === 'number' ? normalized.durationSec : undefined,
+						source_url: normalized.originalUrl || undefined,
+					}]);
+					const verdict = precheck.candidates[0];
+					if (verdict?.verdict === 'exact_identity') { duplicates++; continue; }
+					if (verdict?.verdict === 'likely_duplicate') {
+						normalized.metadata = { ...normalized.metadata, redundancyHint: verdict };
+					}
+				}
                 normalized.metadata = {
                     ...normalized.metadata,
                     moderation: {

@@ -119,6 +119,9 @@ async function makeProtectedRequest<T>(
  * CMS API Client
  */
 export const cmsClient = {
+	async redundancyPrecheck(candidates: Array<{ title: string; duration_sec?: number; source_url?: string }>, requestId?: string): Promise<{ candidates: Array<{ verdict: 'clear' | 'exact_identity' | 'likely_duplicate'; existing_item_id?: string; confidence: number; reasons: string[] }> }> {
+		return makeProtectedRequest('POST', '/redundancy/precheck', { candidates }, requestId);
+	},
     /**
      * Ping CMS for health check
      * Uses a configurable path, defaults to /health
