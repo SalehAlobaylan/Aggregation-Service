@@ -30,9 +30,8 @@ function deriveStudioReviewCodes(chapter: AtomizationChapter, highConfThreshold:
     if (chapter.contains_sponsor_intro) codes.push('sponsor_intro');
     const reason = chapter.needs_review_reason ?? '';
     if (reason.includes('planner returned no usable chapters')) codes.push('planner_fallback');
-    const boundary = chapter.boundary_reason ?? '';
-    const mergedShort = boundary.includes('merged_short_chapter');
-    if (typeof chapter.confidence === 'number' && chapter.confidence < highConfThreshold && !mergedShort) codes.push('low_confidence');
+    const mergedShort = chapter.merged_short_provenance === true;
+    if (typeof chapter.confidence === 'number' && chapter.confidence < highConfThreshold) codes.push('low_confidence');
     if (mergedShort) codes.push('merged_short');
     if (reason.includes('cannot merge without exceeding hard max')) codes.push('short_unmergeable');
     if (reason.includes('below the 4:30 minimum feed duration')) codes.push('below_min');
@@ -237,6 +236,7 @@ function mergeChapterPair(a: AtomizationChapter, b: AtomizationChapter): Atomiza
         confidence: Math.min(first.confidence ?? 0.72, second.confidence ?? 0.72),
         context_label: first.context_label === second.context_label ? first.context_label : longer.context_label ?? first.context_label ?? second.context_label ?? null,
         boundary_reason: boundaryReasons.join('; '),
+        merged_short_provenance: true,
         standalone_score: Math.min(first.standalone_score ?? first.confidence ?? 0.72, second.standalone_score ?? second.confidence ?? 0.72),
         contains_sponsor_intro: Boolean(first.contains_sponsor_intro || second.contains_sponsor_intro),
         needs_review_reason: reviewReasons.length > 0 ? reviewReasons.join('; ') : null,

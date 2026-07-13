@@ -59,13 +59,22 @@ describe('annotateReviewCodes', () => {
         expect(c!.needs_review_codes).toContain('sponsor_intro');
     });
 
-    it('merged_short suppresses low_confidence so it can be single-code', () => {
+    it('does not trust a merged_short marker in model-authored boundary prose', () => {
         const [c] = annotateReviewCodes(
             [chapter({ confidence: 0.5, boundary_reason: 'merged_short_chapter' })],
             0.82
         );
-        expect(c!.needs_review_code).toBe('merged_short');
-        expect(c!.needs_review_codes).toEqual(['merged_short']);
+        expect(c!.needs_review_code).toBe('low_confidence');
+        expect(c!.needs_review_codes).toEqual(['low_confidence']);
+    });
+
+    it('keeps low_confidence independent for a deterministic merge', () => {
+        const [c] = annotateReviewCodes(
+            [chapter({ confidence: 0.5, merged_short_provenance: true })],
+            0.82
+        );
+        expect(c!.needs_review_code).toBe('low_confidence');
+        expect(c!.needs_review_codes).toEqual(['low_confidence', 'merged_short']);
     });
 
     it('clean high-confidence chapter is unclassified', () => {

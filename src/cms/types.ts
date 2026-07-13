@@ -212,6 +212,9 @@ export interface AtomizationChapter {
     confidence?: number;
     context_label?: string | null;
     boundary_reason?: string | null;
+    // Set only by deterministic mergeChapterPair execution; LLM boundary prose
+    // is diagnostic data and never authorizes the merged_short review code.
+    merged_short_provenance?: boolean;
     standalone_score?: number;
     contains_sponsor_intro?: boolean;
     needs_review_reason?: string | null;
