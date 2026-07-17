@@ -9,7 +9,7 @@ import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
 import type { SourceType, ContentType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob, AtomizationSweepJob, AtomizationJob, AIJob } from '../../queues/schemas.js';
-import { verifyAdminAuth } from '../plugins/admin-auth.js';
+import { verifyAdminAuth, verifyAdminOrCMSAutomation } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
 import { resolveYoutubeChannel } from '../../fetchers/youtube.fetcher.js';
@@ -35,6 +35,7 @@ import {
 } from '../../storage/client.js';
 import { runSweepForTenant, reconcileStorage } from '../../services/storage.service.js';
 import type { StorageSweepJob } from '../../queues/schemas.js';
+import { safeFailureCode, safeFailureSummary, safeJobMetadata } from '../../observability/job-projection.js';
 
 interface TriggerBody {
     sourceType: SourceType;
@@ -64,11 +65,12 @@ interface QueueStatsResponse {
 interface JobResponse {
     id: string;
     name: string;
-    data: unknown;
+    metadata: ReturnType<typeof safeJobMetadata>;
     state: string;
-    progress: unknown;
+    progress?: number;
     attemptsMade: number;
-    failedReason?: string;
+	failedCode?: string;
+	failedSummary?: string;
     processedOn?: number;
     finishedOn?: number;
     timestamp: number;
@@ -407,7 +409,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      * Manually enqueue transcript-ready media parents for atomization.
      * POST /admin/atomization/sweep-now
      */
-    fastify.post('/admin/atomization/sweep-now', { preHandler: verifyAdminAuth }, async (_request, reply) => {
+    fastify.post('/admin/atomization/sweep-now', { preHandler: verifyAdminOrCMSAutomation }, async (_request, reply) => {
         const q = getQueue(QUEUE_NAMES.ATOMIZATION_SWEEP);
         if (!q) return reply.status(503).send({ success: false, message: 'atomization sweep queue unavailable' });
         const job = await q.add('manual-atomization-sweep', { trigger: 'manual', tenantId: 'default' } satisfies AtomizationSweepJob, { priority: 1 });
@@ -886,11 +888,12 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                     return reply.send({
                         id: job.id || id,
                         name: job.name,
-                        data: job.data,
+						metadata: safeJobMetadata(job.data),
                         state,
-                        progress: job.progress,
+						progress: typeof job.progress === 'number' ? job.progress : undefined,
                         attemptsMade: job.attemptsMade,
-                        failedReason: job.failedReason,
+						failedCode: job.failedReason ? safeFailureCode(job.failedReason) : undefined,
+						failedSummary: job.failedReason ? safeFailureSummary(job.failedReason) : undefined,
                         processedOn: job.processedOn,
                         finishedOn: job.finishedOn,
                         timestamp: job.timestamp,

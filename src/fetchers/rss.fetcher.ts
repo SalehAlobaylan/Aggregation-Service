@@ -65,7 +65,7 @@ function extractRssImage(entry: Record<string, unknown>): string | undefined {
 export const rssFetcher: Fetcher = {
     sourceType: 'RSS',
 
-    async fetch(config: SourceConfig, _cursor?: string): Promise<FetchResult> {
+    async fetch(config: SourceConfig, _cursor?: string, signal?: AbortSignal): Promise<FetchResult> {
         const items: RawFetchedItem[] = [];
         let skipped = 0;
         let errors = 0;
@@ -85,6 +85,7 @@ export const rssFetcher: Fetcher = {
             logger.info('Fetching RSS feed', { url: config.url, sourceId: config.id });
             const response = await safeFetch(config.url, {
                 timeoutMs: 15000,
+                signal,
                 rateLimit: false,
                 headers: {
                     'User-Agent': 'WahbBot/1.0 (Content Aggregation Service)',
@@ -109,7 +110,7 @@ export const rssFetcher: Fetcher = {
                     let content = entry.content || '';
 
                     // Attempt full article scrape for allowlisted domains
-                    const scraped = await scraperService.scrapeArticle(entry.link);
+                    const scraped = await scraperService.scrapeArticle(entry.link, { signal });
                     if (scraped) {
                         content = scraped.content;
                         excerpt = scraped.excerpt;

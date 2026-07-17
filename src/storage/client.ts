@@ -134,14 +134,15 @@ function isMissingObjectError(error: unknown): boolean {
 /**
  * Check if an object exists in storage
  */
-export async function objectExists(key: string, tier: StorageTier = 'primary'): Promise<boolean> {
+export async function objectExists(key: string, tier: StorageTier = 'primary', signal?: AbortSignal): Promise<boolean> {
     const { client, bucket } = bindingFor(tier);
     try {
         await client.send(
             new HeadObjectCommand({
                 Bucket: bucket,
                 Key: key,
-            })
+            }),
+            { abortSignal: signal },
         );
         return true;
     } catch (error) {
@@ -192,16 +193,20 @@ export async function uploadFile(
     key: string,
     filePath: string,
     contentType?: string,
-    tier: StorageTier = 'primary'
+    tier: StorageTier = 'primary',
+    signal?: AbortSignal,
 ): Promise<string> {
     const { client, bucket } = bindingFor(tier);
     const maxRetries = 3;
     let lastError: Error | null = null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        if (signal?.aborted) throw signal.reason;
         try {
             const fileStats = await stat(filePath);
             const fileStream = createReadStream(filePath);
+			const abortStream = () => fileStream.destroy(signal?.reason instanceof Error ? signal.reason : undefined);
+			signal?.addEventListener('abort', abortStream, { once: true });
 
             const mimeType = contentType || lookup(filePath) || 'application/octet-stream';
 
@@ -213,7 +218,11 @@ export async function uploadFile(
                 ContentLength: fileStats.size,
             };
 
-            await client.send(new PutObjectCommand(params));
+            try {
+                await client.send(new PutObjectCommand(params), { abortSignal: signal });
+            } finally {
+                signal?.removeEventListener('abort', abortStream);
+            }
 
             const publicUrl = getPublicUrl(key, tier);
 
@@ -234,8 +243,14 @@ export async function uploadFile(
                 error: lastError.message,
             });
 
-            if (attempt < maxRetries) {
-                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+            if (attempt < maxRetries && !signal?.aborted) {
+                await new Promise<void>((resolve, reject) => {
+                    const timer = setTimeout(resolve, Math.pow(2, attempt) * 1000);
+                    signal?.addEventListener('abort', () => {
+                        clearTimeout(timer);
+                        reject(signal.reason);
+                    }, { once: true });
+                });
             }
         }
     }

@@ -249,15 +249,16 @@ export const normalizeWorker = createWorker({
                     moderationApproved++;
                 }
 
-                // Check for duplicates
+                // The cache only avoids duplicate source work. Never let it
+                // suppress the deterministic downstream handoff: a prior
+                // attempt may have created the CMS row and crashed before
+                // queueing its required media/embedding stage.
                 const dedupResult = await dedupService.checkDedup(normalized.idempotencyKey);
                 if (dedupResult.isDuplicate) {
                     jobLogger.debug('Skipping duplicate', {
                         idempotencyKey: normalized.idempotencyKey,
                         existingId: dedupResult.existingId,
                     });
-                    duplicates++;
-                    continue;
                 }
 
                 // Upsert to CMS
@@ -272,8 +273,12 @@ export const normalizeWorker = createWorker({
                         type: normalized.type,
                         status: normalized.status,
                     });
+                } else {
+                    duplicates++;
+                    jobLogger.info('Repairing downstream handoff for existing content item', { contentItemId });
+                }
 
-                    // Routing decision based on content type and media kind
+                    // Routing decision based on content type and media kind.
                     const telegramMediaKind = (normalized.metadata as Record<string, unknown>)?.mediaKind as string | undefined;
 
                     // Items that need the full media pipeline (download → transcode → thumbnail → AI)
@@ -282,23 +287,18 @@ export const normalizeWorker = createWorker({
                         normalized.type === 'PODCAST' ||
                         (normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
 
-                    // Text-only Telegram posts: skip media pipeline, go straight to AI for embedding
-                    const isTextArticle =
-                        normalized.type === 'ARTICLE' &&
-                        sourceType === 'TELEGRAM' &&
-                        telegramMediaKind === 'text';
-
                     if (requiresMediaJob && normalized.status !== 'ARCHIVED') {
                         const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady);
                         const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
 
                         if (mediaReady && normalized.mediaUrl) {
                             const aiQueue = getQueue(QUEUE_NAMES.AI);
-                            if (aiQueue) {
-                                await aiQueue.add(
+                            if (!aiQueue) throw new Error('AI queue unavailable for required handoff');
+                            await aiQueue.add(
                                     `ai-manual-${normalized.type}-${contentItemId}`,
                                     {
                                         contentItemId,
+                                        tenantId,
                                         contentType: normalized.type,
                                         operations: ['transcript', 'embedding'],
                                         textContent: {
@@ -312,16 +312,14 @@ export const normalizeWorker = createWorker({
                                     { priority: 2, jobId: `ai-${contentItemId}` }
                                 );
 
-                                aiEnqueued++;
-                                jobLogger.debug('Enqueued AI job (manual media ready)', {
+                            aiEnqueued++;
+                            jobLogger.debug('Enqueued AI job (manual media ready)', {
                                     contentItemId,
                                     type: normalized.type,
-                                });
-                            }
+                            });
                         } else {
                             const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
-
-                            if (mediaQueue) {
+                            if (!mediaQueue) throw new Error('Media queue unavailable for required handoff');
                                 const downloadRef = (normalized.metadata as Record<string, unknown>)?.telegramDownloadRef as TelegramDownloadRef | undefined;
                                 const mediaJobId = `media-${contentItemId}`;
                                 const existingMediaJob = await mediaQueue.getJob(mediaJobId);
@@ -342,6 +340,7 @@ export const normalizeWorker = createWorker({
                                     `media-${normalized.type}-${contentItemId}`,
                                     {
                                         contentItemId,
+                                        tenantId,
                                         contentType: normalized.type,
                                         sourceType,
                                         sourceUrl,
@@ -358,13 +357,12 @@ export const normalizeWorker = createWorker({
 
                                 mediaEnqueued++;
                                 jobLogger.debug('Enqueued media job', { contentItemId, type: normalized.type });
-                            }
                         }
-                    } else if (isTextArticle && normalized.status !== 'ARCHIVED') {
-                        // Text posts: body_text is already available — generate embedding directly
+                    } else if (normalized.status !== 'ARCHIVED') {
+                        // Every non-media item requires an embedding before it can be READY.
                         const aiQueue = getQueue(QUEUE_NAMES.AI);
-                        if (aiQueue) {
-                            await aiQueue.add(
+                        if (!aiQueue) throw new Error('AI queue unavailable for required handoff');
+                        await aiQueue.add(
                                 `ai-text-article-${contentItemId}`,
                                 {
                                     contentItemId,
@@ -380,16 +378,12 @@ export const normalizeWorker = createWorker({
                                 { priority: 2, jobId: `ai-${contentItemId}` }
                             );
 
-                            aiEnqueued++;
-                            jobLogger.debug('Enqueued AI job for text article', {
+                        aiEnqueued++;
+                        jobLogger.debug('Enqueued AI job for text item', {
                                 contentItemId,
                                 type: normalized.type,
-                            });
-                        }
+                        });
                     }
-                } else {
-                    duplicates++;
-                }
             } catch (error) {
                 failed++;
                 jobLogger.error('Failed to process item', error, {

@@ -44,7 +44,7 @@ export class CircuitBreaker {
     /**
      * Execute a function with circuit breaker protection
      */
-    async execute<T>(fn: () => Promise<T>): Promise<T> {
+    async execute<T>(fn: () => Promise<T>, countFailure: (error: unknown) => boolean = () => true): Promise<T> {
         if (this.state === CircuitState.OPEN) {
             // Check if reset timeout has passed
             if (Date.now() - this.lastFailureTime >= this.config.resetTimeout) {
@@ -67,7 +67,9 @@ export class CircuitBreaker {
             this.onSuccess();
             return result;
         } catch (error) {
-            this.onFailure();
+            if (countFailure(error)) {
+                this.onFailure();
+            }
             throw error;
         }
     }

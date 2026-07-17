@@ -7,6 +7,7 @@ import { config } from '../config/index.js';
 import { logger, createLogger, type LogContext } from '../observability/logger.js';
 import { jobsTotal, jobDuration, retryCount, dlqSize } from '../observability/metrics.js';
 import { getQueue, QUEUE_NAMES, type DLQJob } from '../queues/index.js';
+import { safeFailureCode, safeFailureSummary, safeJobMetadata, safePayloadHash } from '../observability/job-projection.js';
 
 export interface WorkerConfig {
     queueName: string;
@@ -35,7 +36,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
             });
 
             const startTime = Date.now();
-            jobLogger.info(`Job started`, { name: job.name, data: job.data });
+            jobLogger.info(`Job started`, { name: job.name, ...safeJobMetadata(job.data) });
 
             try {
                 await runProcessorWithTimeout(processor, job, jobLogger, {
@@ -75,7 +76,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
             retryCount.labels(queueName, String(attemptsMade)).inc();
 
             logger.warn(`Job ${job.id} failed in queue ${queueName}`, {
-                error: error.message,
+                failureCode: safeFailureCode(error),
                 attemptsMade,
                 maxAttempts: job.opts.attempts,
             });
@@ -111,7 +112,15 @@ interface ProcessorTimeoutOptions {
     timeoutMs: number;
     queueName: string;
     jobId?: string;
+    cancellationGraceMs?: number;
 }
+
+const DEFAULT_CANCELLATION_GRACE_MS = 5_000;
+
+// Deliberately indirect only for the child-process test. Production uses an
+// immediate role exit: returning a failed BullMQ promise while the processor
+// still runs would permit a duplicate retry in this process.
+let terminateNonCooperativeRole: (code: number) => never = (code) => process.exit(code);
 
 function jobTimeoutError(timeoutMs: number, queueName: string, jobId?: string): Error {
     return new Error(`Job timed out after ${timeoutMs}ms in queue ${queueName} (jobId: ${jobId ?? 'unknown'})`);
@@ -129,21 +138,65 @@ export async function runProcessorWithTimeout(
 ): Promise<void> {
     const controller = new AbortController();
     const timeoutError = jobTimeoutError(options.timeoutMs, options.queueName, options.jobId);
+    const cancellationGraceMs = options.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS;
+    let timeoutWake: (() => void) | undefined;
+    const timeout = new Promise<'timed_out'>((resolve) => {
+        timeoutWake = () => resolve('timed_out');
+    });
     const timer = setTimeout(() => {
         controller.abort(timeoutError);
+        timeoutWake?.();
     }, options.timeoutMs);
     timer.unref();
 
     try {
-        await processor(job, jobLogger, controller.signal);
-        if (controller.signal.aborted) {
-            const reason = controller.signal.reason;
-            throw reason instanceof Error ? reason : timeoutError;
+        const operation = processor(job, jobLogger, controller.signal);
+        const outcome = await Promise.race([
+            operation.then(
+                () => ({ kind: 'completed' as const }),
+                (error: unknown) => ({ kind: 'failed' as const, error }),
+            ),
+            timeout,
+        ]);
+        if (outcome === 'timed_out') {
+            const afterAbort = await Promise.race([
+                operation.then(
+                    () => ({ kind: 'completed' as const }),
+                    (error: unknown) => ({ kind: 'failed' as const, error }),
+                ),
+                new Promise<'grace_expired'>((resolve) => setTimeout(() => resolve('grace_expired'), cancellationGraceMs)),
+            ]);
+            if (afterAbort === 'grace_expired') {
+                jobLogger.error('Processor ignored cancellation; terminating worker role', timeoutError, {
+                    cancellationGraceMs,
+                    queueName: options.queueName,
+                });
+                terminateNonCooperativeRole(1);
+            }
+            if (afterAbort.kind === 'failed') {
+                throw afterAbort.error;
+            }
+            // Even a cooperative processor that resolved after its deadline
+            // cannot report a successful timed-out job.
+            throw timeoutError;
+        }
+        if (outcome.kind === 'failed') {
+            throw outcome.error;
         }
     } finally {
         clearTimeout(timer);
     }
 }
+
+export const workerTestUtils = {
+    setRoleTerminator(terminator: (code: number) => never): () => void {
+        const previous = terminateNonCooperativeRole;
+        terminateNonCooperativeRole = terminator;
+        return () => {
+            terminateNonCooperativeRole = previous;
+        };
+    },
+};
 
 /**
  * Move a failed job to the dead letter queue
@@ -159,11 +212,14 @@ async function moveToDeadLetterQueue(
         return;
     }
 
-    const dlqJob: DLQJob = {
-        originalQueue,
-        originalJobId: job.id || 'unknown',
-        originalJobData: job.data,
-        failureReason,
+	const dlqJob: DLQJob = {
+		originalQueue,
+		originalJobId: job.id || 'unknown',
+		metadata: safeJobMetadata(job.data),
+		payloadHash: safePayloadHash(job.data),
+		schemaVersion: 1,
+		failureCode: safeFailureCode(failureReason),
+		failureSummary: safeFailureSummary(failureReason),
         failedAt: new Date().toISOString(),
         attemptsMade: job.attemptsMade,
     };
@@ -174,7 +230,7 @@ async function moveToDeadLetterQueue(
     logger.warn(`Job moved to DLQ`, {
         jobId: job.id,
         originalQueue,
-        failureReason,
+        failureCode: dlqJob.failureCode,
     });
 }
 

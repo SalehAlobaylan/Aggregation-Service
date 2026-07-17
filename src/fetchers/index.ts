@@ -42,7 +42,8 @@ export function getFetcher(sourceType: SourceType): Fetcher | undefined {
  */
 export async function fetchFromSource(
     config: SourceConfig,
-    cursor?: string
+    cursor?: string,
+    signal?: AbortSignal,
 ): Promise<FetchResult> {
     const fetcher = getFetcher(config.type);
 
@@ -69,7 +70,7 @@ export async function fetchFromSource(
         hasCursor: !!cursor,
     });
 
-    return fetcher.fetch(config, cursor);
+    return fetcher.fetch(config, cursor, signal);
 }
 
 /**

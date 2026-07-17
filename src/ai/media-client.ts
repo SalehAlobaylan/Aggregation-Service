@@ -37,6 +37,11 @@ function baseUrl(): string {
     return config.mediaBaseUrl.replace(/\/+$/, '');
 }
 
+function requestSignal(parentSignal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    return parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout;
+}
+
 function authHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
     if (config.mediaServiceToken) {
@@ -88,7 +93,7 @@ async function appendAudioFile(form: FormData, audioPath: string): Promise<void>
 export async function transcribeViaMedia(
     audioPath: string,
     contentItemId?: string,
-    opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string } = {},
+    opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string; signal?: AbortSignal } = {},
 ): Promise<TranscriptResult> {
     const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
 
@@ -112,7 +117,7 @@ export async function transcribeViaMedia(
             ...authHeaders(),
             ...tracingHeaders(requestId),
         },
-        signal: AbortSignal.timeout(TRANSCRIBE_TIMEOUT_MS),
+        signal: requestSignal(opts.signal, TRANSCRIBE_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -149,7 +154,7 @@ export async function transcribeViaMedia(
 export async function submitTranscribeJobViaMedia(
     audioPath: string,
     contentItemId?: string,
-    opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string } = {},
+    opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string; signal?: AbortSignal } = {},
 ): Promise<string> {
     const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
 
@@ -167,7 +172,7 @@ export async function submitTranscribeJobViaMedia(
             ...authHeaders(),
             ...tracingHeaders(requestId),
         },
-        signal: AbortSignal.timeout(60_000), // upload only — should be fast
+        signal: requestSignal(opts.signal, 60_000), // upload only — should be fast
     });
 
     if (!response.ok) {
@@ -198,7 +203,7 @@ export interface TranscribeJobStatus {
  */
 export async function getTranscribeJobStatusViaMedia(
     jobId: string,
-    opts: { requestId?: string } = {},
+    opts: { requestId?: string; signal?: AbortSignal } = {},
 ): Promise<TranscribeJobStatus> {
     const response = await fetch(`${baseUrl()}/v1/transcribe/jobs/${encodeURIComponent(jobId)}`, {
         method: 'GET',
@@ -206,7 +211,7 @@ export async function getTranscribeJobStatusViaMedia(
             ...authHeaders(),
             ...tracingHeaders(opts.requestId),
         },
-        signal: AbortSignal.timeout(10_000),
+        signal: requestSignal(opts.signal, 10_000),
     });
 
     if (response.status === 404) {
@@ -266,6 +271,7 @@ export async function transcribeAsyncViaMedia(
         transcriptionJobId?: string;
         pollIntervalMs?: number;
         maxWaitMs?: number;
+        signal?: AbortSignal;
     } = {},
 ): Promise<TranscriptResult> {
     const pollIntervalMs = opts.pollIntervalMs ?? 5_000;
@@ -276,9 +282,17 @@ export async function transcribeAsyncViaMedia(
 
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        if (opts.signal?.aborted) throw opts.signal.reason;
+        await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, pollIntervalMs);
+            opts.signal?.addEventListener('abort', () => {
+                clearTimeout(timer);
+                reject(opts.signal?.reason);
+            }, { once: true });
+        });
         const status = await getTranscribeJobStatusViaMedia(jobId, {
             requestId: opts.requestId,
+            signal: opts.signal,
         });
         if (status.status === 'completed' && status.result) {
             return status.result;
@@ -317,7 +331,7 @@ export interface ImageEmbedResult {
 export async function embedImageViaMedia(
     imageUrl: string,
     contentItemId?: string,
-    opts: { requestId?: string } = {},
+    opts: { requestId?: string; signal?: AbortSignal } = {},
 ): Promise<ImageEmbedResult> {
     const form = new FormData();
     form.append('url', imageUrl);
@@ -330,7 +344,7 @@ export async function embedImageViaMedia(
             ...authHeaders(),
             ...tracingHeaders(opts.requestId),
         },
-        signal: AbortSignal.timeout(EMBED_TIMEOUT_MS),
+        signal: requestSignal(opts.signal, EMBED_TIMEOUT_MS),
     });
 
     if (!response.ok) {

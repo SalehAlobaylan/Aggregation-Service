@@ -43,7 +43,7 @@ function parseDuration(duration?: string): number | undefined {
 export const podcastFetcher: Fetcher = {
     sourceType: 'PODCAST',
 
-    async fetch(config: SourceConfig, _cursor?: string): Promise<FetchResult> {
+    async fetch(config: SourceConfig, _cursor?: string, signal?: AbortSignal): Promise<FetchResult> {
         const items: RawFetchedItem[] = [];
         let skipped = 0;
         let errors = 0;
@@ -63,6 +63,7 @@ export const podcastFetcher: Fetcher = {
             logger.info('Fetching podcast feed', { url: config.url, sourceId: config.id });
             const response = await safeFetch(config.url, {
                 timeoutMs: 20000,
+                signal,
                 rateLimit: false,
                 headers: {
                     'User-Agent': 'WahbBot/1.0 (Podcast Aggregation)',

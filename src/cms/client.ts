@@ -56,6 +56,49 @@ const cmsCircuitBreaker = new CircuitBreaker({
     halfOpenRequests: 3,
 });
 
+const CMS_REQUEST_TIMEOUT_MS = 10_000;
+const CMS_MAX_SUCCESS_BODY_BYTES = 2 << 20;
+const CMS_MAX_ERROR_BODY_BYTES = 16 << 10;
+
+export class CMSRequestError extends Error {
+    constructor(
+        readonly status: number,
+        readonly retryable: boolean,
+    ) {
+        super(`CMS request failed with status ${status}`);
+        this.name = 'CMSRequestError';
+    }
+}
+
+async function readBoundedText(response: Response, limit: number): Promise<string> {
+    if (!response.body) return '';
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > limit) {
+                await reader.cancel();
+                throw new Error('CMS response exceeded maximum body size');
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+function countsAsCMSAvailabilityFailure(error: unknown): boolean {
+    if (error instanceof CMSRequestError) return error.retryable;
+    // Fetch transport and deadline errors indicate dependency availability;
+    // parser/validation errors and ordinary 4xx responses do not.
+    return error instanceof TypeError || (error instanceof Error && error.name === 'TimeoutError');
+}
+
 /**
  * Build request headers with auth and tracing
  */
@@ -75,7 +118,8 @@ async function makeRequest<T>(
     method: string,
     path: string,
     body?: unknown,
-    requestId?: string
+    requestId?: string,
+    parentSignal?: AbortSignal,
 ): Promise<T> {
     const url = `${config.cmsBaseUrl}${path}`;
     const reqId = requestId || uuidv4();
@@ -87,18 +131,28 @@ async function makeRequest<T>(
         method,
         headers: buildHeaders(reqId),
         body: body ? JSON.stringify(body) : undefined,
+        signal: parentSignal
+            ? AbortSignal.any([parentSignal, AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS)])
+            : AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {
-        const errorBody = await response.text();
+        // Drain only a small bounded prefix so keep-alive resources are not
+        // retained, but never return or log upstream-controlled error text.
+        await readBoundedText(response, CMS_MAX_ERROR_BODY_BYTES).catch(() => '');
         reqLogger.error(`CMS API error: ${response.status}`, undefined, {
             status: response.status,
-            body: errorBody,
         });
-        throw new Error(`CMS API error: ${response.status} - ${errorBody}`);
+        throw new CMSRequestError(response.status, response.status === 429 || response.status >= 500);
     }
 
-    const data = await response.json() as T;
+    const raw = await readBoundedText(response, CMS_MAX_SUCCESS_BODY_BYTES);
+    let data: T;
+    try {
+        data = JSON.parse(raw) as T;
+    } catch {
+        throw new Error('CMS returned invalid JSON');
+    }
     reqLogger.debug(`CMS API response received`);
     return data;
 }
@@ -110,9 +164,13 @@ async function makeProtectedRequest<T>(
     method: string,
     path: string,
     body?: unknown,
-    requestId?: string
+    requestId?: string,
+    parentSignal?: AbortSignal,
 ): Promise<T> {
-    return cmsCircuitBreaker.execute(() => makeRequest<T>(method, path, body, requestId));
+    return cmsCircuitBreaker.execute(
+        () => makeRequest<T>(method, path, body, requestId, parentSignal),
+        countsAsCMSAvailabilityFailure,
+    );
 }
 
 /**
@@ -134,11 +192,17 @@ export const cmsClient = {
                 const response = await fetch(url, {
                     method: 'GET',
                     headers: buildHeaders(requestId),
+                    signal: AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS),
                 });
-                if (!response.ok) {
-                    throw new Error(`CMS ping failed: ${response.status}`);
+                try {
+                    if (!response.ok) {
+                        throw new CMSRequestError(response.status, response.status === 429 || response.status >= 500);
+                    }
+                    await readBoundedText(response, CMS_MAX_ERROR_BODY_BYTES);
+                } finally {
+                    response.body?.cancel().catch(() => undefined);
                 }
-            });
+            }, countsAsCMSAvailabilityFailure);
             return true;
         } catch (error) {
             logger.warn('CMS ping failed', { error });
@@ -268,8 +332,8 @@ export const cmsClient = {
         );
     },
 
-    async reportSourceRun(data: ReportSourceRunRequest, requestId?: string): Promise<void> {
-        await makeProtectedRequest('POST', '/circulation/source-runs', data, requestId);
+    async reportSourceRun(data: ReportSourceRunRequest, requestId?: string, parentSignal?: AbortSignal): Promise<void> {
+        await makeProtectedRequest('POST', '/circulation/source-runs', data, requestId, parentSignal);
     },
 
     /**
@@ -296,13 +360,15 @@ export const cmsClient = {
     async updateStatus(
         id: string,
         data: UpdateStatusRequest,
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<void> {
         await makeProtectedRequest<void>(
             'PATCH',
             `/content-items/${id}/status`,
             data,
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
@@ -313,13 +379,15 @@ export const cmsClient = {
     async updateArtifacts(
         id: string,
         data: UpdateArtifactsRequest,
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<void> {
         await makeProtectedRequest<void>(
             'PATCH',
             `/content-items/${id}/artifacts`,
             data,
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
@@ -350,26 +418,30 @@ export const cmsClient = {
     async requestStt(
         contentItemId: string,
         force = false,
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<RequestSttResponse> {
         return makeProtectedRequest<RequestSttResponse>(
             'POST',
             `/content-items/${contentItemId}/request-stt`,
             { force },
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
     async updateTranscriptionJob(
         transcriptionJobId: string,
         data: UpdateTranscriptionJobRequest,
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<void> {
         await makeProtectedRequest(
             'PATCH',
             `/transcription-jobs/${transcriptionJobId}`,
             data,
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
@@ -545,21 +617,23 @@ export const cmsClient = {
      * the prior pattern of deriving source key from `getStorageKey()` and
      * assuming primary tier.
      */
-    async getContentItem(id: string, requestId?: string): Promise<InternalContentItem> {
+    async getContentItem(id: string, requestId?: string, parentSignal?: AbortSignal): Promise<InternalContentItem> {
         return makeRequest<InternalContentItem>(
             'GET',
             `/content-items/${id}`,
             undefined,
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
-    async getAtomizationInput(id: string, requestId?: string): Promise<AtomizationInputResponse> {
+    async getAtomizationInput(id: string, requestId?: string, parentSignal?: AbortSignal): Promise<AtomizationInputResponse> {
         return makeRequest<AtomizationInputResponse>(
             'GET',
             `/content-items/${id}/atomization`,
             undefined,
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
@@ -589,39 +663,45 @@ export const cmsClient = {
     async saveAtomizationPlan(
         id: string,
         chapters: AtomizationChapter[],
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<{ chapters: unknown[] }> {
         return makeProtectedRequest<{ chapters: unknown[] }>(
             'POST',
             `/content-items/${id}/atomization/plan`,
             { chapters },
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
     async createAtomizedChildren(
         id: string,
         chapters: AtomizationChapter[],
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<{ children: AtomizedChildResponse[] }> {
         return makeProtectedRequest<{ children: AtomizedChildResponse[] }>(
             'POST',
             `/content-items/${id}/atomization/children`,
             { chapters },
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 
     async reportAtomizationRun(
         id: string,
         data: AtomizationRunReportRequest,
-        requestId?: string
+        requestId?: string,
+        parentSignal?: AbortSignal,
     ): Promise<AtomizationRunReportResponse> {
         return makeProtectedRequest<AtomizationRunReportResponse>(
             'POST',
             `/content-items/${id}/atomization/runs`,
             data,
-            requestId
+            requestId,
+            parentSignal,
         );
     },
 

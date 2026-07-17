@@ -108,6 +108,7 @@ export const mediaWorker = createWorker({
             sourceUrl,
             operations,
             downloadRef,
+            tenantId: queuedTenantId,
         } = job.data;
 
         jobLogger.info('Processing media job', {
@@ -121,13 +122,22 @@ export const mediaWorker = createWorker({
         const tempFiles: string[] = [];
 
         try {
+            // Resolve the item before work so a legacy queue payload cannot
+            // silently fall back to a global quality policy. The CMS tenant is
+            // authoritative even when a newer producer supplied tenantId.
+            const contentItem = await cmsClient.getContentItem(contentItemId, job.id, signal);
+            const tenantId = contentItem.tenant_id;
+            if (!tenantId || (queuedTenantId && queuedTenantId !== tenantId)) {
+                throw new Error('media job tenant does not match CMS content item');
+            }
+
             // 1. Set status to PROCESSING
-            await cmsClient.updateStatus(contentItemId, { status: 'PROCESSING' }, job.id);
+            await cmsClient.updateStatus(contentItemId, { status: 'PROCESSING' }, job.id, signal);
 
             // 2. Check if already processed (idempotent)
             const artifactExtension = inferArtifactExtension(contentType, sourceType, downloadRef);
             const processedKey = getStorageKey(contentItemId, 'processed', artifactExtension);
-            if (await objectExists(processedKey)) {
+            if (await objectExists(processedKey, 'primary', signal)) {
                 jobLogger.info('Content already processed, skipping', { contentItemId });
 
                 // A previous attempt may have uploaded the object and then
@@ -135,7 +145,7 @@ export const mediaWorker = createWorker({
                 // write before enqueueing AI so the feed has playback metadata.
                 const publicUrl = getPublicUrl(processedKey);
                 await repairExistingArtifacts(contentItemId, processedKey, publicUrl, job.id);
-                await enqueueAIJob(job, contentItemId, contentType, undefined, publicUrl);
+                await enqueueAIJob(job, contentItemId, contentType, publicUrl);
                 return;
             }
 
@@ -149,13 +159,13 @@ export const mediaWorker = createWorker({
                 if (!downloadRef) {
                     throw new Error('Missing Telegram downloadRef for media job');
                 }
-                downloadResult = await downloadTelegram(downloadRef, contentItemId);
+                downloadResult = await downloadTelegram(downloadRef, contentItemId, signal);
             } else if (isYouTube) {
                 downloadResult = await downloadYouTube(sourceUrl, contentItemId, signal);
             } else {
                 // Podcast enclosure or direct URL
                 const extension = contentType === 'PODCAST' ? 'mp3' : 'mp4';
-                downloadResult = await downloadHttp(sourceUrl, contentItemId, extension);
+                downloadResult = await downloadHttp(sourceUrl, contentItemId, extension, signal);
             }
 
             tempFiles.push(downloadResult.filePath);
@@ -168,13 +178,9 @@ export const mediaWorker = createWorker({
             const mediaInfo = await getMediaInfo(downloadResult.filePath);
             jobLogger.debug('Media info', { ...mediaInfo });
 
-            // 5. Resolve the ingest profile for this (tenant, source_type).
-            // We don't have a tenant_id on MediaJob today (items are tenant-
-            // scoped via CMS but the worker job doesn't carry it). Pass the
-            // source_type only — CMS will pick the most-specific match
-            // available (typically global+source or global+global).
+            // 5. Resolve the ingest profile for the authoritative tenant.
             const { profile: ingestProfile, profileId: ingestProfileId, rawProfile } =
-                await resolveIngestProfile(undefined, sourceType);
+                await resolveIngestProfile(tenantId, sourceType);
 
             // 5a. Pre-flight: enforce profile constraints (allowed MIME types,
             // max input size, max input duration). Fail-fast before any
@@ -198,7 +204,7 @@ export const mediaWorker = createWorker({
                 await cmsClient.updateStatus(contentItemId, {
                     status: 'FAILED',
                     failure_reason: preflightFailure,
-                }, job.id);
+                }, job.id, signal);
                 return; // stop here — no S3 writes, no AI enqueue
             }
 
@@ -255,7 +261,7 @@ export const mediaWorker = createWorker({
 
                 // Upload thumbnail
                 const thumbKey = getStorageKey(contentItemId, 'thumbnail', 'jpg');
-                thumbnailUrl = await uploadFile(thumbKey, thumbnailPath, 'image/jpeg');
+                thumbnailUrl = await uploadFile(thumbKey, thumbnailPath, 'image/jpeg', 'primary', signal);
                 try {
                     thumbnailBytes = (await stat(thumbnailPath)).size;
                 } catch {
@@ -276,7 +282,7 @@ export const mediaWorker = createWorker({
             const containerProcessedKey = isImageArtifact
                 ? processedKey
                 : getStorageKey(contentItemId, 'processed', outExt);
-            const mediaUrl = await uploadFile(containerProcessedKey, processedPath, processedMimeType);
+            const mediaUrl = await uploadFile(containerProcessedKey, processedPath, processedMimeType, 'primary', signal);
             jobLogger.info('Processed media uploaded', { mediaUrl });
 
             let processedBytes = 0;
@@ -328,7 +334,7 @@ export const mediaWorker = createWorker({
                 media_suitability_confidence: suitability.confidence,
                 media_suitability_reasons: suitability.reasons,
                 metadata: Object.keys(downloadMeta).length > 0 ? downloadMeta : undefined,
-            }, job.id);
+            }, job.id, signal);
 
             jobLogger.info('CMS artifacts updated', {
                 contentItemId,
@@ -380,7 +386,6 @@ export const mediaWorker = createWorker({
                 job,
                 contentItemId,
                 contentType,
-                isImageArtifact ? undefined : processedPath,
                 mediaUrl,
                 captionState,
                 captionText,
@@ -400,7 +405,8 @@ export const mediaWorker = createWorker({
                         status: 'FAILED',
                         failure_reason: error instanceof Error ? error.message : 'Unknown error',
                     },
-                    job.id
+                    job.id,
+                    signal,
                 );
             } catch (statusError) {
                 jobLogger.error('Failed to update status', statusError);
@@ -423,7 +429,6 @@ async function enqueueAIJob(
     job: Job<MediaJob>,
     contentItemId: string,
     contentType: string,
-    mediaPath?: string,
     mediaUrl?: string,
     captionState: CaptionState = 'none',
     captionText?: string,
@@ -431,8 +436,7 @@ async function enqueueAIJob(
 ): Promise<void> {
     const aiQueue = getQueue(QUEUE_NAMES.AI);
     if (!aiQueue) {
-        job.log('AI queue not available, skipping AI job');
-        return;
+        throw new Error('AI queue unavailable for required handoff');
     }
 
     const operations = contentType === 'ARTICLE'
@@ -457,7 +461,6 @@ async function enqueueAIJob(
             contentType,
             operations,
             textContent: job.data.textContent ?? { title: '' },
-            mediaPath,
             mediaUrl,
             captionState,
             captionText,

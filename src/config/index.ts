@@ -23,7 +23,10 @@ const csvListSchema = z.string().transform((value) =>
 const configSchema = z.object({
     // Required - Core
     cmsBaseUrl: urlSchema.describe('CMS internal API base URL'),
-    cmsServiceToken: z.string().min(1, 'CMS service token is required'),
+    // Aggregation's own CMS principal credential. CMS_SERVICE_TOKEN is only a
+    // temporary local/rollout fallback; this token is authorized by CMS solely
+    // as the Aggregation machine principal.
+    cmsServiceToken: z.string().min(1, 'CMS Aggregation service token is required'),
     redisUrl: z.string().min(1, 'Redis URL is required'),
     jwtSecret: z.string().min(1, 'JWT secret is required for admin auth'),
     // Shared secret protecting internal service-to-service routes such as
@@ -32,6 +35,9 @@ const configSchema = z.object({
     // so dev stacks without it can still start; the route plugin refuses
     // requests at call-time when this is empty.
     internalServiceToken: z.string().default(''),
+    // CMS scheduler automation can invoke one explicitly registered operation.
+    // It is not a user/admin JWT and is never accepted on other admin routes.
+    cmsAutomationToken: z.string().default(''),
 
     // Required - Storage (S3-compatible) — primary/hot tier
     storageEndpoint: urlSchema.describe('S3-compatible storage endpoint'),
@@ -154,10 +160,11 @@ export type Config = z.infer<typeof configSchema>;
 function mapEnvToConfig(): Record<string, unknown> {
     return {
         cmsBaseUrl: process.env.CMS_BASE_URL,
-        cmsServiceToken: process.env.CMS_SERVICE_TOKEN,
+        cmsServiceToken: process.env.CMS_AGGREGATION_SERVICE_TOKEN || process.env.CMS_SERVICE_TOKEN,
         redisUrl: process.env.REDIS_URL,
         jwtSecret: process.env.JWT_SECRET,
-        internalServiceToken: process.env.INTERNAL_SERVICE_TOKEN,
+        internalServiceToken: process.env.AGGREGATION_CMS_SERVICE_TOKEN || process.env.INTERNAL_SERVICE_TOKEN,
+        cmsAutomationToken: process.env.AGGREGATION_AUTOMATION_TOKEN,
 
         storageEndpoint: process.env.STORAGE_ENDPOINT,
         storageBucket: process.env.STORAGE_BUCKET,

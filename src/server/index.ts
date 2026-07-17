@@ -83,8 +83,15 @@ async function registerMultipart(fastify: FastifyInstance): Promise<void> {
         const mod = await import(moduleName);
         await fastify.register(mod.default, {
             limits: {
-                fileSize: 50 * 1024 * 1024, // 50 MiB per file
+                // CMS permits up to 200 MiB for user audio. This is still
+                // enforced again while the internal route streams the file to
+                // disk: multipart metadata and Content-Length are advisory.
+                fileSize: 200 * 1024 * 1024,
                 files: 1,
+                fields: 3,
+                parts: 4,
+                fieldNameSize: 64,
+                fieldSize: 256,
             },
         });
     } catch (error) {

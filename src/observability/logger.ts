@@ -3,6 +3,7 @@
  */
 import pino from 'pino';
 import { config } from '../config/index.js';
+import { redactLogData, safeFailureCode, safeFailureSummary } from './job-projection.js';
 
 // Create base logger
 const baseLogger = pino({
@@ -40,22 +41,22 @@ class Logger {
     }
 
     debug(message: string, data?: Record<string, unknown>): void {
-        this.logger.debug(data || {}, message);
+        this.logger.debug(redactLogData(data || {}) as Record<string, unknown>, message);
     }
 
     info(message: string, data?: Record<string, unknown>): void {
-        this.logger.info(data || {}, message);
+        this.logger.info(redactLogData(data || {}) as Record<string, unknown>, message);
     }
 
     warn(message: string, data?: Record<string, unknown>): void {
-        this.logger.warn(data || {}, message);
+        this.logger.warn(redactLogData(data || {}) as Record<string, unknown>, message);
     }
 
     error(message: string, error?: Error | unknown, data?: Record<string, unknown>): void {
         const errorData = error instanceof Error
-            ? { error: { code: error.name, message: error.message, stack: error.stack } }
-            : { error };
-        this.logger.error({ ...errorData, ...data }, message);
+            ? { error: { code: safeFailureCode(error), message: safeFailureSummary(error) } }
+            : error === undefined ? {} : { error: { code: safeFailureCode(error), message: safeFailureSummary(error) } };
+        this.logger.error(redactLogData({ ...errorData, ...data }) as Record<string, unknown>, message);
     }
 }
 

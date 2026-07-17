@@ -370,8 +370,10 @@ export async function downloadYouTubeAudio(
 export async function downloadHttp(
     url: string,
     contentItemId: string,
-    expectedExtension?: string
+    expectedExtension?: string,
+    signal?: AbortSignal,
 ): Promise<DownloadResult> {
+    if (signal?.aborted) throw signal.reason;
     await ensureTempDir();
 
     // Determine extension from URL or use default
@@ -379,10 +381,11 @@ export async function downloadHttp(
     const ext = expectedExtension || basename(urlPath).split('.').pop() || 'mp3';
     const outputPath = getTempPath(contentItemId, ext);
 
-    logger.info('Starting HTTP download', { url, contentItemId, ext });
+    logger.debug('Starting HTTP download', { url, contentItemId, ext });
 
-    const { response } = await safeFetchResponse(url, {
+    const { response, close } = await safeFetchResponse(url, {
         timeoutMs: MEDIA_RESPONSE_TIMEOUT_MS,
+        signal,
         rateLimit: false,
         headers: {
             'User-Agent': 'WahbBot/1.0 (Media Download)',
@@ -390,64 +393,69 @@ export async function downloadHttp(
         },
     });
 
-    if (!response.ok) {
-        throw new Error(`HTTP download failed: ${response.status} ${response.statusText}`);
-    }
+    try {
+        if (!response.ok) {
+            throw new Error(`HTTP download failed: ${response.status} ${response.statusText}`);
+        }
 
     // Defense-in-depth: reject clearly-textual responses before saving. A 200 HTML
     // page (e.g. an article/tweet URL mistakenly enqueued as media) would otherwise
     // be written as .mp4 and fail ffprobe later with a cryptic "moov atom not found".
     // Stay permissive — allow audio/video, octet-stream, and missing/unknown types
     // (some CDNs mislabel mp3s); only reject obviously non-media content types.
-    const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    if (
-        contentType.startsWith('text/') ||
-        contentType.includes('html') ||
-        contentType.includes('json') ||
-        contentType.includes('xml')
-    ) {
-        throw new Error(`HTTP download returned non-media content-type: ${contentType}`);
+        const contentType = (response.headers.get('content-type') || '').toLowerCase();
+        if (
+            contentType.startsWith('text/') ||
+            contentType.includes('html') ||
+            contentType.includes('json') ||
+            contentType.includes('xml')
+        ) {
+            throw new Error(`HTTP download returned non-media content-type: ${contentType}`);
+        }
+
+        assertContentLengthWithinCap(response.headers.get('content-length'));
+
+        const fileStream = createWriteStream(outputPath);
+        let bytesWritten = 0;
+        const capCounter = new Transform({
+            transform(chunk, _encoding, callback) {
+                bytesWritten += chunk.length;
+                if (bytesWritten > MAX_MEDIA_DOWNLOAD_BYTES) {
+                    callback(
+                        new Error(
+                            `media download exceeds size cap during stream: > ${MAX_MEDIA_DOWNLOAD_BYTES} bytes`
+                        )
+                    );
+                    return;
+                }
+                callback(null, chunk);
+            },
+        });
+
+        try {
+            // @ts-expect-error - Undici fetch body is a Web ReadableStream.
+            await pipeline(response.body, capCounter, fileStream, { signal });
+        } catch (error) {
+            await cleanupTempFile(outputPath).catch(() => {});
+            throw error;
+        }
+
+        if (signal?.aborted) throw signal.reason;
+        const fileStats = await stat(outputPath);
+
+        logger.info('HTTP download complete', {
+            contentItemId,
+            size: fileStats.size,
+            ext,
+        });
+
+        return {
+            filePath: outputPath,
+            format: ext,
+        };
+    } finally {
+        await close();
     }
-
-    assertContentLengthWithinCap(response.headers.get('content-length'));
-
-    const fileStream = createWriteStream(outputPath);
-    let bytesWritten = 0;
-    const capCounter = new Transform({
-        transform(chunk, _encoding, callback) {
-            bytesWritten += chunk.length;
-            if (bytesWritten > MAX_MEDIA_DOWNLOAD_BYTES) {
-                callback(
-                    new Error(
-                        `media download exceeds size cap during stream: > ${MAX_MEDIA_DOWNLOAD_BYTES} bytes`
-                    )
-                );
-                return;
-            }
-            callback(null, chunk);
-        },
-    });
-
-    try {
-        // @ts-expect-error - Node.js fetch body is a ReadableStream
-        await pipeline(response.body, capCounter, fileStream);
-    } catch (error) {
-        await cleanupTempFile(outputPath).catch(() => {});
-        throw error;
-    }
-
-    const fileStats = await stat(outputPath);
-
-    logger.info('HTTP download complete', {
-        contentItemId,
-        size: fileStats.size,
-        ext,
-    });
-
-    return {
-        filePath: outputPath,
-        format: ext,
-    };
 }
 
 /**
@@ -455,8 +463,10 @@ export async function downloadHttp(
  */
 export async function downloadTelegram(
     downloadRef: TelegramDownloadRef,
-    contentItemId: string
+    contentItemId: string,
+    signal?: AbortSignal,
 ): Promise<DownloadResult> {
+    if (signal?.aborted) throw signal.reason;
     await ensureTempDir();
 
     if (!config.telegramApiId || !config.telegramApiHash || !config.telegramSessionString) {
@@ -481,6 +491,10 @@ export async function downloadTelegram(
     });
 
     const client = createTelegramClient();
+	const abortTelegram = () => {
+		void client.disconnect().catch(() => undefined);
+	};
+	signal?.addEventListener('abort', abortTelegram, { once: true });
 
     try {
         await client.connect();
@@ -536,6 +550,7 @@ export async function downloadTelegram(
     } catch (error) {
         throw wrapTelegramMediaDownloadError(error);
     } finally {
+		signal?.removeEventListener('abort', abortTelegram);
         await disconnectTelegramClient(client, {
             contentItemId,
             channel: normalizedChannel,

@@ -46,7 +46,8 @@ export const socialNormalizer: Normalizer = {
             idempotencyKey,
             type: contentType,
             source,
-            status: 'READY', // Social content is text-only, ready immediately
+            // Embedding write-back is the readiness gate for every text item.
+            status: 'PENDING',
 
             title: item.title.substring(0, 255), // Limit title length
             bodyText: item.content || null,

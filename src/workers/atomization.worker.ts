@@ -48,14 +48,15 @@ export const atomizationWorker = createWorker({
             const response = await cmsClient.reportAtomizationRun(
                 contentItemId,
                 { run_id: runId, status, phase, trigger: job.data.reason, ...extra },
-                job.id
+                job.id,
+                signal,
             );
             runId = response.run_id;
         };
 
         try {
             await report('running', 'planning');
-            const input = await cmsClient.getAtomizationInput(contentItemId, job.id);
+            const input = await cmsClient.getAtomizationInput(contentItemId, job.id, signal);
             if (!input.policy.chaptering_enabled) {
                 jobLogger.info('Atomization disabled by source policy', { contentItemId });
                 await report('completed', 'planning');
@@ -83,16 +84,17 @@ export const atomizationWorker = createWorker({
                 maxChapters: input.policy.max_chapters_per_parent,
                 minSec: minFeedUnitSeconds(input),
                 maxSec: input.policy.hard_max_chapter_minutes * 60,
+                signal,
             });
             const chapters = normalizeGeneratedChapters(generated, windows, input);
-            await cmsClient.saveAtomizationPlan(contentItemId, chapters, job.id);
+            await cmsClient.saveAtomizationPlan(contentItemId, chapters, job.id, signal);
             await report('running', 'cutting');
 
             const tempFiles: string[] = [];
             const tempDirs: string[] = [];
             try {
                 const parentMedia = await resolveParentMediaForAtomization(input, jobLogger);
-                const parentDownload = await downloadHttp(parentMedia.url, `${contentItemId}_atomize`, parentMedia.extension);
+                const parentDownload = await downloadHttp(parentMedia.url, `${contentItemId}_atomize`, parentMedia.extension, signal);
                 tempFiles.push(parentDownload.filePath);
                 const mediaInfo = await getMediaInfo(parentDownload.filePath);
 
@@ -107,7 +109,7 @@ export const atomizationWorker = createWorker({
 
                     currentPhase = 'renditions';
                     const mp4Key = getStorageKey(`${contentItemId}/chapters/${i}`, 'processed', 'mp4');
-                    const mp4Url = await uploadFile(mp4Key, clipPath, 'video/mp4');
+                    const mp4Url = await uploadFile(mp4Key, clipPath, 'video/mp4', 'primary', signal);
                     const renditions: MediaRendition[] = [{ type: 'mp4', url: mp4Url, mime_type: 'video/mp4', is_primary: false }];
 
                     let primaryUrl = mp4Url;
@@ -116,7 +118,7 @@ export const atomizationWorker = createWorker({
                         const hlsDir = join(config.mediaTempDir, `${contentItemId}_chapter_${i}_hls`);
                         tempDirs.push(hlsDir);
                         const hls = await createHlsVod(clipPath, hlsDir, undefined, { signal });
-                        const hlsUrl = await uploadHlsDirectory(hlsDir, `${contentItemId}/chapters/${i}`);
+                        const hlsUrl = await uploadHlsDirectory(hlsDir, `${contentItemId}/chapters/${i}`, signal);
                         primaryUrl = hlsUrl || mp4Url;
                         primaryType = hlsUrl ? 'hls' : 'mp4';
                         if (hlsUrl) {
@@ -140,7 +142,7 @@ export const atomizationWorker = createWorker({
                         await extractThumbnail(clipPath, thumbPath, 1, 360, { signal });
                         tempFiles.push(thumbPath);
                         const thumbKey = getStorageKey(`${contentItemId}/chapters/${i}`, 'thumbnail', 'jpg');
-                        thumbUrl = await uploadFile(thumbKey, thumbPath, 'image/jpeg');
+                        thumbUrl = await uploadFile(thumbKey, thumbPath, 'image/jpeg', 'primary', signal);
                     } catch (thumbError) {
                         jobLogger.warn('Chapter thumbnail failed; using parent thumbnail', {
                             contentItemId,
@@ -169,7 +171,7 @@ export const atomizationWorker = createWorker({
                     child_count: children.length,
                     review_count: countReviewChapters(children, input.policy.high_confidence_threshold),
                 });
-                const result = await cmsClient.createAtomizedChildren(contentItemId, children, job.id);
+                const result = await cmsClient.createAtomizedChildren(contentItemId, children, job.id, signal);
                 await enqueueChapterEmbeddingJobs(result.children, children, input);
                 const reviewCount = countReviewChapters(children, input.policy.high_confidence_threshold);
                 await report(reviewCount > 0 ? 'needs_review' : 'completed', 'embedding', {
@@ -384,7 +386,7 @@ async function refreshCmsParentMediaArtifact(
     }
 }
 
-async function uploadHlsDirectory(dir: string, keyPrefix: string): Promise<string | undefined> {
+async function uploadHlsDirectory(dir: string, keyPrefix: string, signal?: AbortSignal): Promise<string | undefined> {
     const files = await readdir(dir);
     let playlistUrl: string | undefined;
     const uploadable: Array<{ file: string; path: string; contentType: string }> = [];
@@ -402,7 +404,7 @@ async function uploadHlsDirectory(dir: string, keyPrefix: string): Promise<strin
         const batch = uploadable.slice(i, i + HLS_UPLOAD_CONCURRENCY);
         const urls = await Promise.all(batch.map(async item => {
             const key = `content/${keyPrefix}/hls/${item.file}`;
-            const url = await uploadFile(key, item.path, item.contentType);
+            const url = await uploadFile(key, item.path, item.contentType, 'primary', signal);
             return { file: item.file, url };
         }));
         for (const item of urls) {

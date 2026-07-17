@@ -11,7 +11,7 @@ import { cmsClient } from '../cms/client.js';
 
 export const fetchWorker = createWorker({
     queueName: QUEUE_NAMES.FETCH,
-    processor: async (job: Job<FetchJob>, jobLogger): Promise<void> => {
+    processor: async (job: Job<FetchJob>, jobLogger, signal): Promise<void> => {
         const { sourceId, sourceType, config, triggeredBy, triggeredAt } = job.data;
         const startedAt = new Date();
         const sourceSettings = (config.settings as Record<string, unknown>) || {};
@@ -45,18 +45,18 @@ export const fetchWorker = createWorker({
         // Fetch content from source
         let result: Awaited<ReturnType<typeof fetchFromSource>>;
         try {
-            result = await fetchFromSource(sourceConfig, config.cursor as string | undefined);
+            result = await fetchFromSource(sourceConfig, config.cursor as string | undefined, signal);
         } catch (error) {
             await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, 0, 1, {
                 sourceType,
                 error: error instanceof Error ? error.message : String(error),
-            });
+            }, signal);
             throw error;
         }
         await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
             sourceType,
             reason: result.metadata.reason,
-        });
+        }, signal);
 
         const remainingAllowed =
             typeof configuredMaxResults === 'number' && configuredMaxResults > 0
@@ -198,7 +198,8 @@ async function reportFetchRun(
     startedAt: Date,
     fetched: number,
     failed: number,
-    metadata: Record<string, unknown>
+    metadata: Record<string, unknown>,
+    signal?: AbortSignal,
 ): Promise<void> {
     if (!jobId || !isUuid(sourceId)) return;
     const finishedAt = new Date();
@@ -214,7 +215,7 @@ async function reportFetchRun(
             finished_at: finishedAt.toISOString(),
             duration_ms: finishedAt.getTime() - startedAt.getTime(),
             metadata,
-        }, jobId);
+        }, jobId, signal);
     } catch {
         // Telemetry must never fail ingestion.
     }

@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import type { Job } from 'bullmq';
 import { describe, expect, it, vi } from 'vitest';
 import { createLogger } from '../../src/observability/logger.js';
-import { runProcessorWithTimeout } from '../../src/workers/base-worker.js';
+import { runProcessorWithTimeout, workerTestUtils } from '../../src/workers/base-worker.js';
 import { transcoderTestUtils } from '../../src/media/transcoder.js';
 
 describe('worker timeout cancellation', () => {
@@ -53,5 +53,24 @@ describe('worker timeout cancellation', () => {
         await expect(failure).rejects.toBe(reason);
         expect(command.kill).toHaveBeenCalledWith('SIGKILL');
         expect(command.run).toHaveBeenCalledOnce();
+    });
+
+    it('terminates the worker role when a processor ignores cancellation', async () => {
+        const job = { id: 'job-stuck', name: 'test', data: {} } as unknown as Job;
+        const jobLogger = createLogger({ queue: 'test-queue', jobId: 'job-stuck' });
+        const roleExit = new Error('role termination requested');
+        const restore = workerTestUtils.setRoleTerminator(() => {
+            throw roleExit;
+        });
+        try {
+            await expect(runProcessorWithTimeout(
+                async () => new Promise<void>(() => {}),
+                job,
+                jobLogger,
+                { timeoutMs: 5, cancellationGraceMs: 5, queueName: 'test-queue', jobId: 'job-stuck' },
+            )).rejects.toBe(roleExit);
+        } finally {
+            restore();
+        }
     });
 });

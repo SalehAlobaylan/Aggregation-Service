@@ -58,6 +58,11 @@ export interface RawItem {
  */
 export interface MediaJob {
     contentItemId: string;
+    /**
+     * Authoritative CMS tenant. User-upload admission obtains this from CMS;
+     * legacy jobs may omit it and the worker resolves it before policy lookup.
+     */
+    tenantId?: string;
     contentType: ContentType;
     sourceType: SourceType;
     sourceUrl: string;
@@ -217,8 +222,11 @@ export interface NewsCirculationJob {
 export interface DLQJob {
     originalQueue: string;
     originalJobId: string;
-    originalJobData: unknown;
-    failureReason: string;
+    metadata: import('../observability/job-projection.js').SafeJobMetadata;
+    payloadHash: string;
+    schemaVersion: 1;
+    failureCode: string;
+    failureSummary: string;
     failedAt: string;
     attemptsMade: number;
 }

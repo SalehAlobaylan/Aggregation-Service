@@ -67,13 +67,17 @@ export const aiWorker = createWorker({
         try {
             // 1. Generate transcript if media path provided and transcript operation requested
             const wantsTranscript = operations.includes('transcript');
-            let resolvedMediaPath = mediaPath;
+            // Producer temp files are never a valid cross-job contract. Drain
+            // legacy path-bearing payloads by using their durable URL instead.
+            // A path-only legacy job will retry rather than read an arbitrary
+            // local file.
+            let resolvedMediaPath: string | undefined;
 
             if (wantsTranscript && !resolvedMediaPath && mediaUrl) {
                 try {
                     jobLogger.info('Downloading media for transcript', { mediaUrl });
                     const expectedExt = contentType === 'PODCAST' ? 'mp3' : 'mp4';
-                    const downloadResult = await downloadHttp(mediaUrl, `${contentItemId}_ai`, expectedExt);
+                    const downloadResult = await downloadHttp(mediaUrl, `${contentItemId}_ai`, expectedExt, signal);
                     resolvedMediaPath = downloadResult.filePath;
                     tempFiles.push(resolvedMediaPath);
                 } catch (downloadError) {
@@ -96,7 +100,7 @@ export const aiWorker = createWorker({
                 jobLogger.info('Human YouTube caption present — skipping STT', { contentItemId });
             } else if (wantsTranscript && resolvedMediaPath) {
                 try {
-                    const decision = await cmsClient.requestStt(contentItemId, forceStt, job.id);
+                    const decision = await cmsClient.requestStt(contentItemId, forceStt, job.id, signal);
                     sttAllowed = decision.triggered;
                     transcriptionJobId = decision.job_id;
                     if (!sttAllowed) {
@@ -149,12 +153,12 @@ export const aiWorker = createWorker({
                         ? await transcribeAsyncViaMedia(
                               audioPath,
                               contentItemId,
-                              { wordTimestamps: true, requestId: job.id, transcriptionJobId },
+                              { wordTimestamps: true, requestId: job.id, transcriptionJobId, signal },
                           )
                         : await transcribeViaMedia(
                               audioPath,
                               contentItemId,
-                              { wordTimestamps: true, requestId: job.id, transcriptionJobId },
+                              { wordTimestamps: true, requestId: job.id, transcriptionJobId, signal },
                           );
                     transcriptText = result.text;
 
@@ -240,6 +244,7 @@ export const aiWorker = createWorker({
                             {
                                 requestId: job.id,
                                 extractTags: wantsTagExtraction,
+                                signal,
                             },
                         );
 
@@ -275,7 +280,7 @@ export const aiWorker = createWorker({
                     const imgResult = await embedImageViaMedia(
                         heroImageUrl,
                         contentItemId,
-                        { requestId: job.id },
+                        { requestId: job.id, signal },
                     );
                     jobLogger.info('Image embedding generated and written by Media-Service', {
                         contentItemId,
@@ -309,7 +314,7 @@ export const aiWorker = createWorker({
             let shouldPublishEmbeddingPendingChild = false;
             let parentDurationSec: number | null | undefined;
             try {
-                const currentItem = await cmsClient.getContentItem(contentItemId, job.id);
+                const currentItem = await cmsClient.getContentItem(contentItemId, job.id, signal);
                 isAtomizedChild = !!currentItem.parent_content_item_id;
                 parentDurationSec = currentItem.duration_sec;
                 shouldPublishEmbeddingPendingChild =
@@ -325,7 +330,8 @@ export const aiWorker = createWorker({
                 shouldPublishEmbeddingPendingChild
                     ? { status: 'READY', feed_visibility: 'visible', chaptering_status: 'published' }
                     : { status: 'READY' },
-                job.id
+                job.id,
+                signal,
             );
 
             if ((contentType === 'VIDEO' || contentType === 'PODCAST') && !isAtomizedChild) {

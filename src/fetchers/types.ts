@@ -67,7 +67,7 @@ export interface SourceConfig {
  */
 export interface Fetcher {
     sourceType: SourceType;
-    fetch(config: SourceConfig, cursor?: string): Promise<FetchResult>;
+    fetch(config: SourceConfig, cursor?: string, signal?: AbortSignal): Promise<FetchResult>;
 }
 
 /**

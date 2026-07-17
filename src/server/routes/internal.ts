@@ -3,6 +3,12 @@
  * content into the same normalize → media → AI pipeline as ingested content.
  */
 import type { FastifyInstance } from 'fastify';
+import { createWriteStream } from 'fs';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 import {
     getQueue,
     QUEUE_NAMES,
@@ -13,15 +19,18 @@ import {
     type SourceGraphJob,
 } from '../../queues/index.js';
 import { enqueueRetryJob } from '../../queues/retry-routing.js';
-import { uploadBuffer, getStorageKey } from '../../storage/client.js';
+import { deleteObject, getStorageKey, objectExists, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
+import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
 
 interface UserContentResponse {
     success: boolean;
     contentItemId?: string;
     jobId?: string;
+    accepted?: boolean;
+    alreadyAccepted?: boolean;
     message?: string;
 }
 
@@ -48,22 +57,62 @@ interface InternalRetryResponse {
     errors: string[];
 }
 
-function extensionFromMime(mime: string | undefined, filename: string | undefined): string {
-    if (filename) {
-        const idx = filename.lastIndexOf('.');
-        if (idx > -1 && idx < filename.length - 1) {
-            return filename.slice(idx + 1).toLowerCase();
-        }
+const USER_CONTENT_MAX_BYTES = 200 * 1024 * 1024;
+const USER_CONTENT_MAX_CONCURRENT_ADMISSIONS = 2;
+const USER_CONTENT_PREFIX_BYTES = 64;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+let activeUserContentAdmissions = 0;
+
+type UserAudioFormat = { extension: 'mp3' | 'wav' | 'm4a'; mimeType: string };
+
+function detectUserAudioFormat(prefix: Buffer): UserAudioFormat | null {
+    if (prefix.length >= 3 && prefix.subarray(0, 3).toString('ascii') === 'ID3') {
+        return { extension: 'mp3', mimeType: 'audio/mpeg' };
     }
-    if (!mime) return 'bin';
-    const m = mime.toLowerCase();
-    if (m.includes('mpeg')) return 'mp3';
-    if (m.includes('mp4')) return 'm4a';
-    if (m.includes('aac')) return 'aac';
-    if (m.includes('wav')) return 'wav';
-    if (m.includes('ogg')) return 'ogg';
-    if (m.includes('webm')) return 'webm';
-    return 'bin';
+    if (prefix.length >= 2 && prefix[0] === 0xff && (prefix[1] & 0xe0) === 0xe0) {
+        return { extension: 'mp3', mimeType: 'audio/mpeg' };
+    }
+    if (prefix.length >= 12 && prefix.subarray(0, 4).toString('ascii') === 'RIFF' && prefix.subarray(8, 12).toString('ascii') === 'WAVE') {
+        return { extension: 'wav', mimeType: 'audio/wav' };
+    }
+    if (prefix.length >= 8 && prefix.subarray(4, 8).toString('ascii') === 'ftyp') {
+        return { extension: 'm4a', mimeType: 'audio/mp4' };
+    }
+    return null;
+}
+
+async function spoolUserAudio(file: NodeJS.ReadableStream): Promise<{ directory: string; path: string; byteCount: number; format: UserAudioFormat }> {
+    const directory = await mkdtemp(join(tmpdir(), 'wahb-user-content-'));
+    const path = join(directory, 'upload');
+    let byteCount = 0;
+    const prefix: Buffer[] = [];
+    let prefixLength = 0;
+    const counter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+            byteCount += chunk.length;
+            if (byteCount > USER_CONTENT_MAX_BYTES) {
+                callback(new Error('user content exceeds byte limit'));
+                return;
+            }
+            if (prefixLength < USER_CONTENT_PREFIX_BYTES) {
+                const remaining = USER_CONTENT_PREFIX_BYTES - prefixLength;
+                const copied = chunk.subarray(0, remaining);
+                prefix.push(copied);
+                prefixLength += copied.length;
+            }
+            callback(null, chunk);
+        },
+    });
+    try {
+        await pipeline(file, counter, createWriteStream(path, { flags: 'wx' }));
+        if (byteCount === 0) throw new Error('user content is empty');
+        const format = detectUserAudioFormat(Buffer.concat(prefix, prefixLength));
+        if (!format) throw new Error('user content is not an allowed audio container');
+        return { directory, path, byteCount, format };
+    } catch (error) {
+        await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+    }
 }
 
 export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
@@ -241,6 +290,12 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
     fastify.post<{ Reply: UserContentResponse }>(
         '/internal/jobs/user-content',
         async (request, reply) => {
+            if (activeUserContentAdmissions >= USER_CONTENT_MAX_CONCURRENT_ADMISSIONS) {
+                return reply.status(429).send({ success: false, message: 'user-content admission is busy' });
+            }
+            activeUserContentAdmissions++;
+            let spoolDirectory: string | undefined;
+            try {
             const parts = (request as unknown as { parts: () => AsyncIterableIterator<unknown> }).parts;
             if (typeof parts !== 'function') {
                 return reply.status(500).send({
@@ -250,46 +305,48 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
             }
 
             let contentItemId = '';
-            let contentType: ContentType = 'PODCAST';
-            // Future use — multi-tenant routing for the job logger.
-            // We accept and log tenant_id but don't yet branch on it.
-            let tenantId = 'default';
-            let audioBuffer: Buffer | null = null;
-            let audioFilename: string | undefined;
-            let audioMime: string | undefined;
+            let contentType: ContentType | undefined;
+            let claimedTenantId = '';
+            let audio: { directory: string; path: string; byteCount: number; format: UserAudioFormat } | undefined;
+            const seenFields = new Set<string>();
 
             try {
                 const iter = parts() as AsyncIterableIterator<{
                     type: 'field' | 'file';
                     fieldname: string;
                     value?: string;
-                    filename?: string;
-                    mimetype?: string;
-                    toBuffer?: () => Promise<Buffer>;
+                    file?: NodeJS.ReadableStream;
                 }>;
                 for await (const part of iter) {
                     if (part.type === 'field') {
+                        if (!['content_item_id', 'content_type', 'tenant_id'].includes(part.fieldname) || seenFields.has(part.fieldname)) {
+                            throw new Error('unexpected or duplicate multipart field');
+                        }
+                        seenFields.add(part.fieldname);
                         if (part.fieldname === 'content_item_id') contentItemId = String(part.value ?? '').trim();
                         else if (part.fieldname === 'content_type') {
                             const v = String(part.value ?? '').toUpperCase().trim();
-                            if (v === 'PODCAST' || v === 'VIDEO' || v === 'ARTICLE') contentType = v;
+                            if (v !== 'PODCAST' && v !== 'VIDEO') throw new Error('invalid content type');
+                            contentType = v;
                         }
-                        else if (part.fieldname === 'tenant_id') tenantId = String(part.value ?? 'default').trim() || 'default';
-                    } else if (part.type === 'file' && part.fieldname === 'audio_file' && part.toBuffer) {
-                        audioBuffer = await part.toBuffer();
-                        audioFilename = part.filename;
-                        audioMime = part.mimetype;
+                        else claimedTenantId = String(part.value ?? '').trim();
+                    } else {
+                        if (part.fieldname !== 'audio_file' || audio || !part.file) {
+                            throw new Error('unexpected or duplicate multipart file');
+                        }
+                        audio = await spoolUserAudio(part.file);
+                        spoolDirectory = audio.directory;
                     }
                 }
-            } catch (err) {
-                logger.error('Failed to parse user-content multipart', { error: err });
+            } catch {
+                logger.warn('User-content multipart admission rejected');
                 return reply.status(400).send({
                     success: false,
                     message: 'invalid multipart payload',
                 });
             }
 
-            if (!contentItemId || !audioBuffer || audioBuffer.length === 0) {
+            if (!CANONICAL_UUID.test(contentItemId) || !contentType || !claimedTenantId || !audio) {
                 return reply.status(400).send({
                     success: false,
                     message: 'content_item_id and audio_file are required',
@@ -304,42 +361,64 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
                 });
             }
 
+            let item;
+            try {
+                item = await cmsClient.getContentItem(contentItemId);
+            } catch {
+                return reply.status(404).send({ success: false, message: 'content item was not found' });
+            }
+            if (
+                item.tenant_id !== claimedTenantId ||
+                item.type !== contentType ||
+                (item.status && item.status !== 'PENDING')
+            ) {
+                return reply.status(409).send({ success: false, message: 'content item is not eligible for upload' });
+            }
+
+            let ingest;
+            try {
+                ingest = await resolveIngestProfile(item.tenant_id, 'UPLOAD');
+            } catch {
+                return reply.status(503).send({ success: false, message: 'tenant media policy is unavailable' });
+            }
+            const preflightFailure = preflightCheck({
+                mimeType: audio.format.mimeType,
+                sizeBytes: audio.byteCount,
+            }, ingest.rawProfile);
+            if (preflightFailure) {
+                return reply.status(415).send({ success: false, message: 'upload does not satisfy media policy' });
+            }
+
             const jobId = `user-content-${contentItemId}`;
             const existing = await mediaQueue.getJob(jobId);
             if (existing) {
                 const state = await existing.getState();
-                if (state === 'failed' || state === 'completed') {
-                    await existing.remove();
-                } else {
-                    logger.info('User-submitted audio already queued', {
-                        contentItemId,
-                        tenantId,
-                        jobId: existing.id ?? jobId,
-                        state,
-                    });
+                if (state !== 'failed') {
+                    logger.info('User-content job already accepted', { contentItemId, tenantId: item.tenant_id, jobId: existing.id ?? jobId, state });
                     return reply.status(202).send({
                         success: true,
                         contentItemId,
                         jobId: existing.id ?? jobId,
+                        accepted: true,
+                        alreadyAccepted: true,
                     });
                 }
+                return reply.status(409).send({ success: false, contentItemId, jobId: existing.id ?? jobId, message: 'existing upload job requires explicit retry' });
             }
 
-            const ext = extensionFromMime(audioMime, audioFilename);
-            const sourceKey = getStorageKey(contentItemId, 'original', ext);
+            const sourceKey = getStorageKey(contentItemId, 'original', audio.format.extension);
+            let objectCreatedByThisAttempt = false;
             let sourceUrl: string;
             try {
-                sourceUrl = await uploadBuffer(
+                const existedBeforeUpload = await objectExists(sourceKey);
+                sourceUrl = await uploadFile(
                     sourceKey,
-                    audioBuffer,
-                    audioMime || 'application/octet-stream'
+                    audio.path,
+                    audio.format.mimeType,
                 );
+                objectCreatedByThisAttempt = !existedBeforeUpload;
             } catch (err) {
-                logger.error('Failed to upload user audio to storage', {
-                    contentItemId,
-                    tenantId,
-                    error: err,
-                });
+                logger.warn('User-content storage upload failed', { contentItemId, tenantId: item.tenant_id });
                 return reply.status(502).send({
                     success: false,
                     message: 'failed to upload audio to storage',
@@ -348,20 +427,34 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 
             const mediaJob: MediaJob = {
                 contentItemId,
+                tenantId: item.tenant_id,
                 contentType,
                 sourceType: 'UPLOAD',
                 sourceUrl,
                 operations: ['download', 'transcode', 'thumbnail'],
             };
-            const job = await mediaQueue.add('user-content', mediaJob, {
-                priority: 2,
-                jobId,
-            });
+            let job;
+            try {
+                job = await mediaQueue.add('user-content', mediaJob, { priority: 2, jobId });
+            } catch {
+                // Queue add can be ambiguous. Re-read the deterministic job
+                // before compensating so an accepted upload never loses its
+                // object. Only delete an object this request created.
+                const accepted = await mediaQueue.getJob(jobId).catch(() => undefined);
+                if (accepted) {
+                    return reply.status(202).send({ success: true, contentItemId, jobId: accepted.id ?? jobId, accepted: true, alreadyAccepted: true });
+                }
+                if (objectCreatedByThisAttempt) {
+                    await deleteObject(sourceKey).catch(() => undefined);
+                }
+                return reply.status(503).send({ success: false, message: 'failed to accept upload for processing' });
+            }
 
             logger.info('User-submitted audio enqueued', {
                 contentItemId,
-                tenantId,
-                sourceUrl,
+                tenantId: item.tenant_id,
+                bytes: audio.byteCount,
+                mediaClass: audio.format.extension,
                 jobId: job.id,
             });
 
@@ -369,7 +462,12 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
                 success: true,
                 contentItemId,
                 jobId: job.id,
+                accepted: true,
             });
+            } finally {
+                activeUserContentAdmissions--;
+                if (spoolDirectory) await rm(spoolDirectory, { recursive: true, force: true }).catch(() => undefined);
+            }
         }
     );
 }

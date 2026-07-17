@@ -115,6 +115,16 @@ describe('Circuit Breaker', () => {
         });
     });
 
+    describe('Failure classification', () => {
+        it('does not open for terminal failures when the caller classifies them as non-availability errors', async () => {
+            const terminalFailure = async () => { throw new Error('CMS returned 403'); };
+            for (let i = 0; i < 3; i++) {
+                await circuitBreaker.execute(terminalFailure, () => false).catch(() => { });
+            }
+            expect(circuitBreaker.getState()).toBe(CircuitState.CLOSED);
+        });
+    });
+
     describe('isAllowingRequests', () => {
         it('should allow requests when closed', () => {
             expect(circuitBreaker.isAllowingRequests()).toBe(true);

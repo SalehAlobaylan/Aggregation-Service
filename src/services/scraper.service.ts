@@ -27,9 +27,10 @@ export async function scrapeArticle(
     options: {
         timeout?: number;
         forceAllowlist?: boolean;
+        signal?: AbortSignal;
     } = {}
 ): Promise<ScrapedArticle | null> {
-    const { timeout = 10000, forceAllowlist = true } = options;
+    const { timeout = 10000, forceAllowlist = true, signal } = options;
 
     // Check allowlist
     if (forceAllowlist) {
@@ -43,6 +44,7 @@ export async function scrapeArticle(
     try {
         const response = await safeFetch(url, {
             timeoutMs: timeout,
+            signal,
             rateLimit: false,
             headers: {
                 'User-Agent': 'WahbBot/1.0 (Content Aggregation Service)',

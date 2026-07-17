@@ -7,7 +7,7 @@ vi.mock('../../src/services/rate-limiter.js', () => ({
     },
 }));
 
-import { assertPublicUrl, SSRFError } from '../../src/utils/safe-fetch.js';
+import { assertPublicUrl, safeFetchTestUtils, SSRFError } from '../../src/utils/safe-fetch.js';
 
 describe('assertPublicUrl (SSRF guard)', () => {
     it('rejects loopback', async () => {
@@ -40,5 +40,24 @@ describe('assertPublicUrl (SSRF guard)', () => {
 
     it('allows a public IP literal', async () => {
         await expect(assertPublicUrl('https://1.1.1.1/')).resolves.toBeUndefined();
+    });
+
+    it('binds the validated address while retaining the origin hostname for TLS', () => {
+        const bound = safeFetchTestUtils.bindConnectionOptions(
+            { hostname: 'public.example', host: 'public.example', servername: 'public.example' },
+            'public.example',
+            '93.184.216.34',
+        );
+        expect(bound.hostname).toBe('93.184.216.34');
+        expect(bound.host).toBe('93.184.216.34');
+        expect(bound.servername).toBe('public.example');
+    });
+
+    it('does not expose URL credentials in an SSRF error', async () => {
+        const secret = 'signed-query-secret';
+        await expect(assertPublicUrl(`https://user:${secret}@example.com/`)).rejects.toMatchObject({
+            name: 'Error',
+            message: 'URL credentials are not allowed',
+        });
     });
 });

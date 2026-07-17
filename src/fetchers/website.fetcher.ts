@@ -47,9 +47,10 @@ function toAbsoluteUrl(baseUrl: string, maybeRelativeUrl: string): string | null
     }
 }
 
-async function fetchWebsiteHtml(url: string, timeoutMs = 15000): Promise<string> {
+async function fetchWebsiteHtml(url: string, timeoutMs = 15000, signal?: AbortSignal): Promise<string> {
     const response = await safeFetch(url, {
         timeoutMs,
+        signal,
         rateLimit: false,
         headers: {
             'User-Agent': 'WahbBot/1.0 (Website Fetcher)',
@@ -67,7 +68,7 @@ async function fetchWebsiteHtml(url: string, timeoutMs = 15000): Promise<string>
 export const websiteFetcher: Fetcher = {
     sourceType: 'WEBSITE',
 
-    async fetch(config: SourceConfig, _cursor?: string): Promise<FetchResult> {
+    async fetch(config: SourceConfig, _cursor?: string, signal?: AbortSignal): Promise<FetchResult> {
         const typedConfig = config as WebsiteSourceConfig;
         const sourceUrl = (typedConfig.settings.url as string) || config.url;
         const selectors = buildSelectors(typedConfig);
@@ -92,7 +93,7 @@ export const websiteFetcher: Fetcher = {
 
         try {
             logger.info('Fetching website source', { sourceId: config.id, url: sourceUrl });
-            const html = await fetchWebsiteHtml(sourceUrl);
+            const html = await fetchWebsiteHtml(sourceUrl, 15000, signal);
             const $ = cheerio.load(html);
             const seenUrls = new Set<string>();
 

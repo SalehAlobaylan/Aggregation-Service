@@ -20,6 +20,7 @@ import type { AIJob, MediaJob } from './schemas.js';
 
 export interface RetryItem {
     id: string;
+    tenant_id?: string;
     type: string;
     source: string;
     original_url: string;
@@ -93,6 +94,7 @@ export async function enqueueRetryJob(
         `${opts.namePrefix}-${item.source}-${item.id}`,
         {
             contentItemId: item.id,
+            tenantId: item.tenant_id,
             contentType: item.type as MediaJob['contentType'],
             sourceType: item.source as MediaJob['sourceType'],
             sourceUrl: item.original_url,

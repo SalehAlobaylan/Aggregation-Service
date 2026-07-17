@@ -28,7 +28,9 @@ const mocks = vi.hoisted(() => {
         getQueue: vi.fn(),
         updateStatus: vi.fn(),
         updateArtifacts: vi.fn(),
+        getContentItem: vi.fn(),
         reportSourceRun: vi.fn(),
+        redundancyPrecheck: vi.fn(),
         downloadYouTube: vi.fn(),
         downloadHttp: vi.fn(),
         downloadTelegram: vi.fn(),
@@ -70,7 +72,9 @@ vi.mock('../../src/cms/client.js', () => ({
     cmsClient: {
         updateStatus: mocks.updateStatus,
         updateArtifacts: mocks.updateArtifacts,
+        getContentItem: mocks.getContentItem,
         reportSourceRun: mocks.reportSourceRun,
+        redundancyPrecheck: mocks.redundancyPrecheck,
     },
 }));
 
@@ -199,6 +203,7 @@ describe('media worker characterization', () => {
         mocks.objectExists.mockResolvedValue(true);
         mocks.updateStatus.mockResolvedValue(undefined);
         mocks.updateArtifacts.mockResolvedValue(undefined);
+        mocks.getContentItem.mockResolvedValue({ tenant_id: 'default' });
         mocks.containerMime.mockReturnValue('video/mp4');
     });
 
@@ -226,7 +231,7 @@ describe('media worker characterization', () => {
             logger()
         );
 
-        expect(mocks.updateStatus).toHaveBeenCalledWith('content-1', { status: 'PROCESSING' }, 'media-job-1');
+        expect(mocks.updateStatus).toHaveBeenCalledWith('content-1', { status: 'PROCESSING' }, 'media-job-1', undefined);
         expect(mocks.updateArtifacts).toHaveBeenCalledWith(
             'content-1',
             expect.objectContaining({
@@ -291,6 +296,7 @@ describe('normalize worker characterization', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mocks.checkDedup.mockResolvedValue({ isDuplicate: false });
+        mocks.redundancyPrecheck.mockResolvedValue({ candidates: [{ verdict: 'clear', confidence: 1, reasons: [] }] });
         mocks.upsertContentItem.mockResolvedValue({ contentItemId: 'content-1', created: true });
         mocks.reportSourceRun.mockResolvedValue(undefined);
     });

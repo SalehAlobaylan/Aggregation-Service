@@ -20,6 +20,11 @@ function baseUrl(): string {
     return config.enrichmentBaseUrl.replace(/\/+$/, '');
 }
 
+function requestSignal(parentSignal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    return parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout;
+}
+
 function authHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
     if (config.enrichmentServiceToken) {
@@ -78,6 +83,7 @@ export async function generateChaptersViaEnrichment(
         maxChapters?: number;
         minSec?: number;
         maxSec?: number;
+        signal?: AbortSignal;
     } = {},
 ): Promise<GeneratedChapterPlan[]> {
     const response = await fetch(`${baseUrl()}/v1/chapters/generate`, {
@@ -96,7 +102,7 @@ export async function generateChaptersViaEnrichment(
             ...authHeaders(),
             ...tracingHeaders(opts.requestId),
         },
-        signal: AbortSignal.timeout(CHAPTERS_TIMEOUT_MS),
+        signal: requestSignal(opts.signal, CHAPTERS_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -124,7 +130,7 @@ export async function generateChaptersViaEnrichment(
 export async function generateEmbeddingViaEnrichment(
     text: string,
     contentItemId?: string,
-    opts: { requestId?: string; extractTags?: boolean } = {},
+    opts: { requestId?: string; extractTags?: boolean; signal?: AbortSignal } = {},
 ): Promise<EmbedResult> {
     const body: {
         texts: string[];
@@ -142,7 +148,7 @@ export async function generateEmbeddingViaEnrichment(
             ...authHeaders(),
             ...tracingHeaders(opts.requestId),
         },
-        signal: AbortSignal.timeout(EMBED_TIMEOUT_MS),
+        signal: requestSignal(opts.signal, EMBED_TIMEOUT_MS),
     });
 
     if (!response.ok) {

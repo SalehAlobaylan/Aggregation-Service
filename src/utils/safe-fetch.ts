@@ -12,6 +12,7 @@
  */
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import { Agent, buildConnector, fetch as undiciFetch, type Response as UndiciResponse } from 'undici';
 import { rateLimiter } from '../services/rate-limiter.js';
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5 MB
@@ -25,6 +26,8 @@ export class RateLimitedError extends Error {}
 
 export interface SafeFetchOptions {
     timeoutMs?: number;
+    /** Parent operation cancellation; never replaced by the per-request budget. */
+    signal?: AbortSignal;
     headers?: Record<string, string>;
     method?: 'GET' | 'HEAD';
     /** Set false to skip the per-host rate limiter (default: enabled). */
@@ -40,8 +43,15 @@ export interface SafeFetchResult {
 }
 
 export interface SafeFetchResponseResult {
-    response: Response;
+    response: UndiciResponse;
     url: string;
+    signal: AbortSignal;
+    close: () => Promise<void>;
+}
+
+interface ApprovedTarget {
+    url: URL;
+    addresses: string[];
 }
 
 function isPrivateIPv4(ip: string): boolean {
@@ -81,54 +91,105 @@ function ipBlocked(ip: string): boolean {
  * to a third-party fetcher.
  */
 export async function assertPublicUrl(rawUrl: string): Promise<void> {
+    await resolveApprovedTarget(rawUrl);
+}
+
+async function resolveApprovedTarget(rawUrl: string): Promise<ApprovedTarget> {
     let u: URL;
     try {
         u = new URL(rawUrl);
     } catch {
-        throw new SSRFError(`invalid URL: ${rawUrl}`);
+        throw new SSRFError('invalid URL');
     }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        throw new SSRFError(`blocked scheme: ${u.protocol}`);
+        throw new SSRFError('blocked URL scheme');
+    }
+    if (u.username || u.password) {
+        throw new SSRFError('URL credentials are not allowed');
     }
     const host = u.hostname;
     if (net.isIP(host)) {
-        if (ipBlocked(host)) throw new SSRFError(`blocked address: ${host}`);
-        return;
+        if (ipBlocked(host)) throw new SSRFError('blocked address');
+        return { url: u, addresses: [host] };
     }
     let addrs: { address: string }[];
     try {
         addrs = await dns.lookup(host, { all: true });
     } catch {
-        throw new SSRFError(`DNS resolution failed: ${host}`);
+        throw new SSRFError('DNS resolution failed');
     }
     if (addrs.length === 0) {
-        throw new SSRFError(`no addresses for host: ${host}`);
+        throw new SSRFError('DNS resolution returned no addresses');
     }
     for (const a of addrs) {
         if (ipBlocked(a.address)) {
-            throw new SSRFError(`blocked address for ${host}: ${a.address}`);
+            throw new SSRFError('DNS resolution included a blocked address');
         }
     }
+    return { url: u, addresses: addrs.map(({ address }) => address) };
 }
 
-async function readCapped(resp: Response, maxBytes: number): Promise<string> {
+function createBoundDispatcher(target: ApprovedTarget): Agent {
+    const connector = buildConnector({ timeout: DEFAULT_TIMEOUT_MS });
+    let nextAddress = 0;
+    return new Agent({
+        // Connect to one of the addresses validated for this exact hop. The
+        // original hostname remains the HTTP Host and TLS SNI/certificate name.
+        connect(options, callback) {
+            const address = target.addresses[nextAddress++ % target.addresses.length]!;
+            connector(bindConnectionOptions(options, target.url.hostname, address), callback);
+        },
+    });
+}
+
+function bindConnectionOptions<T extends { hostname: string; host?: string; servername?: string }>(
+    options: T,
+    hostname: string,
+    address: string,
+): T {
+    return {
+        ...options,
+        hostname: address,
+        host: address,
+        servername: hostname,
+    };
+}
+
+// Narrow pure hooks for adversarial unit tests. They expose no override path
+// in production; the real dispatcher always receives resolver-approved IPs.
+export const safeFetchTestUtils = {
+    bindConnectionOptions,
+};
+
+async function closeResponseAndDispatcher(response: UndiciResponse, dispatcher: Agent): Promise<void> {
+    await response.body?.cancel().catch(() => undefined);
+    await dispatcher.close().catch(async () => dispatcher.destroy());
+}
+
+async function readCapped(resp: UndiciResponse, maxBytes: number, signal: AbortSignal): Promise<string> {
     if (!resp.body) {
+        if (signal.aborted) throw signal.reason;
         return resp.text();
     }
     const reader = resp.body.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-            total += value.length;
-            if (total > maxBytes) {
-                await reader.cancel();
-                throw new Error('response exceeds max size');
+    try {
+        for (;;) {
+            if (signal.aborted) throw signal.reason;
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+                total += value.length;
+                if (total > maxBytes) {
+                    await reader.cancel();
+                    throw new Error('response exceeds max size');
+                }
+                chunks.push(value);
             }
-            chunks.push(value);
         }
+    } finally {
+        reader.releaseLock();
     }
     return Buffer.concat(chunks).toString('utf-8');
 }
@@ -136,10 +197,13 @@ async function readCapped(resp: Response, maxBytes: number): Promise<string> {
 export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions = {}): Promise<SafeFetchResponseResult> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     let currentUrl = rawUrl;
+    const requestTimeout = AbortSignal.timeout(timeoutMs);
+    const signal = opts.signal ? AbortSignal.any([opts.signal, requestTimeout]) : requestTimeout;
 
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-        await assertPublicUrl(currentUrl); // re-checked every hop
-        const u = new URL(currentUrl);
+        if (signal.aborted) throw signal.reason;
+        const target = await resolveApprovedTarget(currentUrl); // re-resolve and bind every hop
+        const u = target.url;
 
         if (opts.rateLimit !== false) {
             const rl = await rateLimiter.consumeRateLimit('RSS', u.hostname);
@@ -148,28 +212,30 @@ export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions =
             }
         }
 
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        let resp: Response;
+        const dispatcher = createBoundDispatcher(target);
+        let resp: UndiciResponse;
         try {
-            resp = await fetch(u.toString(), {
+            resp = await undiciFetch(u.toString(), {
                 method: opts.method ?? 'GET',
                 redirect: 'manual',
-                signal: controller.signal,
+                signal,
+                dispatcher,
                 headers: {
                     'User-Agent': USER_AGENT,
                     Accept: ACCEPT,
                     ...(opts.headers ?? {}),
                 },
             });
-        } finally {
-            clearTimeout(timer);
+        } catch (error) {
+            await dispatcher.destroy();
+            throw error;
         }
 
         if (resp.status >= 300 && resp.status < 400) {
             const location = resp.headers.get('location');
             if (location) {
                 currentUrl = new URL(location, u).toString();
+                await closeResponseAndDispatcher(resp, dispatcher);
                 continue;
             }
         }
@@ -177,6 +243,8 @@ export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions =
         return {
             response: resp,
             url: u.toString(),
+            signal,
+            close: () => closeResponseAndDispatcher(resp, dispatcher),
         };
     }
 
@@ -184,13 +252,17 @@ export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions =
 }
 
 export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Promise<SafeFetchResult> {
-    const { response: resp, url } = await safeFetchResponse(rawUrl, opts);
-    const body = await readCapped(resp, MAX_BYTES);
-    return {
-        ok: resp.ok,
-        status: resp.status,
-        url,
-        body,
-        contentType: resp.headers.get('content-type') ?? '',
-    };
+    const { response: resp, url, signal, close } = await safeFetchResponse(rawUrl, opts);
+    try {
+        const body = await readCapped(resp, MAX_BYTES, signal);
+        return {
+            ok: resp.ok,
+            status: resp.status,
+            url,
+            body,
+            contentType: resp.headers.get('content-type') ?? '',
+        };
+    } finally {
+        await close();
+    }
 }

@@ -113,7 +113,8 @@ async function buildServer(): Promise<FastifyInstance> {
     vi.resetModules();
 
     process.env.CMS_BASE_URL = 'http://localhost:8080/internal';
-    process.env.CMS_SERVICE_TOKEN = 'test-token';
+    process.env.CMS_AGGREGATION_SERVICE_TOKEN = 'test-token';
+    process.env.CMS_SERVICE_TOKEN = '';
     process.env.REDIS_URL = 'redis://localhost:6379';
     process.env.STORAGE_ENDPOINT = 'http://localhost:9000';
     process.env.STORAGE_BUCKET = 'test-bucket';
@@ -127,6 +128,7 @@ async function buildServer(): Promise<FastifyInstance> {
     process.env.ADMIN_JWT_AUDIENCE = 'platform-console';
     process.env.ADMIN_ALLOWED_ROLES = 'admin,manager';
     process.env.PLATFORM_CONSOLE_ORIGINS = 'http://localhost:3005';
+    process.env.AGGREGATION_AUTOMATION_TOKEN = 'cms-automation-token';
 
     const { createServer, registerRoutes } = await import('../../src/server/index.js');
     const fastify = createServer();
@@ -235,6 +237,23 @@ describe('Admin auth and route protections', () => {
 
         expect(adminResponse.statusCode).toBe(200);
         expect(managerResponse.statusCode).toBe(200);
+        await server.close();
+    });
+
+    it('accepts the CMS automation credential only on the atomization sweep endpoint', async () => {
+        const server = await buildServer();
+        const allowed = await server.inject({
+            method: 'POST',
+            url: '/admin/atomization/sweep-now',
+            headers: { authorization: 'Bearer cms-automation-token' },
+        });
+        const denied = await server.inject({
+            method: 'GET',
+            url: '/admin/queues',
+            headers: { authorization: 'Bearer cms-automation-token' },
+        });
+        expect(allowed.statusCode).toBe(200);
+        expect(denied.statusCode).toBe(401);
         await server.close();
     });
 

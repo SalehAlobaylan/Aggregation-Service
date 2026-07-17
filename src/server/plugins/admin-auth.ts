@@ -92,3 +92,19 @@ export async function verifyAdminAuth(request: FastifyRequest, reply: FastifyRep
         return;
     }
 }
+
+// verifyAdminOrCMSAutomation keeps scheduled CMS automation out of the human
+// JWT trust domain. The bearer is accepted only by the exact route that opts
+// into this pre-handler; it cannot be replayed on ordinary /admin endpoints.
+export async function verifyAdminOrCMSAutomation(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const expectedToken = config.cmsAutomationToken;
+    const authHeader = request.headers.authorization;
+    if (expectedToken && authHeader?.startsWith('Bearer ')) {
+        const presented = Buffer.from(authHeader.slice(7).trim());
+        const expected = Buffer.from(expectedToken);
+        if (presented.length === expected.length && timingSafeEqual(presented, expected)) {
+            return;
+        }
+    }
+    await verifyAdminAuth(request, reply);
+}

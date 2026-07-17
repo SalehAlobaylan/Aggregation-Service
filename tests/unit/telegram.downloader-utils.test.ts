@@ -1,4 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+const { safeFetchResponseMock } = vi.hoisted(() => ({
+    safeFetchResponseMock: vi.fn(),
+}));
+
+vi.mock('../../src/utils/safe-fetch.js', () => ({
+    assertPublicUrl: vi.fn(),
+    safeFetchResponse: safeFetchResponseMock,
+}));
+
 import { downloaderTestUtils, downloadHttp } from '../../src/media/downloader.js';
 
 describe('downloaderTestUtils', () => {
@@ -50,19 +60,16 @@ describe('downloaderTestUtils', () => {
 });
 
 describe('downloadHttp content-type guard', () => {
-    afterEach(() => {
-        vi.unstubAllGlobals();
-    });
-
     it('rejects an HTML response before writing a garbage media file', async () => {
-        const fetchMock = vi.fn().mockResolvedValue({
-            ok: true,
-            status: 200,
-            statusText: 'OK',
-            headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
-            body: {},
+        safeFetchResponseMock.mockResolvedValueOnce({
+            response: {
+                ok: true,
+                status: 200,
+                statusText: 'OK',
+                headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+            },
+            close: vi.fn().mockResolvedValue(undefined),
         });
-        vi.stubGlobal('fetch', fetchMock);
 
         await expect(
             downloadHttp('https://sa.investing.com/news/article-93CH-3283147', 'c1', 'mp4')

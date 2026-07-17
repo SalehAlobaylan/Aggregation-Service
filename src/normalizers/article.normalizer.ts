@@ -32,7 +32,9 @@ export const articleNormalizer: Normalizer = {
             idempotencyKey,
             type: 'ARTICLE',
             source: item.sourceType === 'WEBSITE' ? 'WEBSITE' : 'RSS',
-            status: 'READY', // Articles are ready once we have text
+            // The AI worker owns the READY transition after it persists the
+            // required embedding; text availability alone is not publishable.
+            status: 'PENDING',
 
             title: item.title,
             bodyText: item.content || null,
