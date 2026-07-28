@@ -9,6 +9,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
+import { createHash } from 'crypto';
 import {
     getQueue,
     QUEUE_NAMES,
@@ -19,7 +20,7 @@ import {
     type SourceGraphJob,
 } from '../../queues/index.js';
 import { enqueueRetryJob } from '../../queues/retry-routing.js';
-import { deleteObject, getStorageKey, objectExists, uploadFile } from '../../storage/client.js';
+import { deleteObject, getStorageKey, objectExists, readObjectBuffer, uploadBuffer, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
@@ -61,7 +62,13 @@ const USER_CONTENT_MAX_BYTES = 200 * 1024 * 1024;
 const USER_CONTENT_MAX_CONCURRENT_ADMISSIONS = 2;
 const USER_CONTENT_PREFIX_BYTES = 64;
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RECOVERY_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024;
+const RECOVERY_ARTIFACT_PREFIX = /^system\/recovery\/[a-z0-9_-]{1,64}\/[0-9a-f-]{36}\/[a-f0-9]{64}\.json\.gz$/;
 let activeUserContentAdmissions = 0;
+
+function validRecoveryArtifactRef(key: string, checksum: string): boolean {
+	return RECOVERY_ARTIFACT_PREFIX.test(key) && /^[a-f0-9]{64}$/.test(checksum) && key.endsWith(`/${checksum}.json.gz`);
+}
 
 type UserAudioFormat = { extension: 'mp3' | 'wav' | 'm4a'; mimeType: string };
 
@@ -135,6 +142,60 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
         }
         return reply.send({ data });
     });
+
+	// Recovery artifacts are a deliberately narrow object-store capability for
+	// CMS Retention. The request supplies neither a bucket nor arbitrary key;
+	// only reserved, content-addressed system/recovery objects are accepted.
+	fastify.post<{ Body: { key?: string; sha256?: string; payload_base64?: string } }>(
+		'/internal/recovery-artifacts',
+		{ bodyLimit: 48 * 1024 * 1024 },
+		async (request, reply) => {
+			const key = String(request.body?.key ?? '');
+			const checksum = String(request.body?.sha256 ?? '').toLowerCase();
+			const encoded = String(request.body?.payload_base64 ?? '');
+			if (!validRecoveryArtifactRef(key, checksum) || encoded.length === 0) {
+				return reply.status(400).send({ message: 'invalid recovery artifact request' });
+			}
+			let body: Buffer;
+			try { body = Buffer.from(encoded, 'base64'); } catch { return reply.status(400).send({ message: 'invalid recovery artifact payload' }); }
+			if (body.length === 0 || body.length > RECOVERY_ARTIFACT_MAX_BYTES || createHash('sha256').update(body).digest('hex') !== checksum) {
+				return reply.status(400).send({ message: 'recovery artifact checksum or size rejected' });
+			}
+			try {
+				if (await objectExists(key)) {
+					const existing = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
+					if (createHash('sha256').update(existing).digest('hex') !== checksum) return reply.status(409).send({ message: 'recovery key already has different content' });
+				} else {
+					await uploadBuffer(key, body, 'application/gzip');
+				}
+				const readback = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
+				if (createHash('sha256').update(readback).digest('hex') !== checksum) return reply.status(502).send({ message: 'recovery artifact readback mismatch' });
+				return reply.send({ data: { key, sha256: checksum, bytes: body.length, verified: true } });
+			} catch (error) {
+				logger.warn('Recovery artifact operation failed', { key, error: error instanceof Error ? error.message : 'unknown' });
+				return reply.status(502).send({ message: 'recovery artifact storage unavailable' });
+			}
+		},
+	);
+
+	fastify.post<{ Body: { key?: string; sha256?: string } }>('/internal/recovery-artifacts/verify', async (request, reply) => {
+		const key = String(request.body?.key ?? ''); const checksum = String(request.body?.sha256 ?? '').toLowerCase();
+		if (!validRecoveryArtifactRef(key, checksum)) return reply.status(400).send({ message: 'invalid recovery artifact reference' });
+		try {
+			const body = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
+			const verified = createHash('sha256').update(body).digest('hex') === checksum;
+			return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.length, verified } });
+		} catch { return reply.status(502).send({ message: 'recovery artifact unavailable' }); }
+	});
+
+	fastify.delete<{ Body: { key?: string } }>('/internal/recovery-artifacts', async (request, reply) => {
+		const key = String(request.body?.key ?? '');
+		if (!RECOVERY_ARTIFACT_PREFIX.test(key)) return reply.status(400).send({ message: 'invalid recovery artifact reference' });
+		try {
+			await deleteObject(key);
+			return reply.send({ data: { key, deleted: true } });
+		} catch { return reply.status(502).send({ message: 'recovery artifact deletion unavailable' }); }
+	});
 
     async function retryContentItems(
         status: 'PENDING' | 'FAILED',

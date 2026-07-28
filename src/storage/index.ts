@@ -8,4 +8,5 @@ export {
     objectExists,
     uploadFile,
     uploadBuffer,
+    readObjectBuffer,
 } from './client.js';

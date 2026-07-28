@@ -311,6 +311,22 @@ export async function uploadBuffer(
     throw lastError || new Error('Upload failed after retries');
 }
 
+// Recovery artifacts are private system objects. Callers never receive a
+// public URL; CMS records only the opaque key/checksum in its ledger.
+export async function readObjectBuffer(key: string, maxBytes: number, tier: StorageTier = 'primary'): Promise<Buffer> {
+    const { client, bucket } = bindingFor(tier);
+    const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    if (!response.Body) throw new Error('storage object has no body');
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+        total += chunk.length;
+        if (total > maxBytes) throw new Error('storage object exceeds recovery artifact limit');
+        chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks, total);
+}
+
 /**
  * Upload a stream directly into S3. Used by moveObjectBetweenTiers so we don't
  * have to spool to disk first.
@@ -593,6 +609,7 @@ export const storageClient = {
     getObjectStream,
     uploadFile,
     uploadBuffer,
+	readObjectBuffer,
     uploadStream,
     listAllObjects,
     listContentObjects,
