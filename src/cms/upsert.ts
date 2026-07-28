@@ -21,7 +21,7 @@ const SOURCE_CACHE_TTL = 300; // 5 minutes
 export async function upsertContentItem(
   item: NormalizedItem,
   requestId?: string,
-): Promise<{ contentItemId: string; created: boolean }> {
+): Promise<{ contentItemId: string; created: boolean; retired: boolean }> {
   const redis = getRedisConnection();
   const cacheKey = `${SOURCE_CACHE_PREFIX}${item.idempotencyKey}`;
 
@@ -32,7 +32,7 @@ export async function upsertContentItem(
       idempotencyKey: item.idempotencyKey,
       cachedId,
     });
-    return { contentItemId: cachedId, created: false };
+    return { contentItemId: cachedId, created: false, retired: false };
   }
 
   // Build CMS request
@@ -63,6 +63,14 @@ export async function upsertContentItem(
 
     const contentItemId = response.id;
     const created = response.created !== false; // Assume created unless explicitly false
+	const retired = response.retired === true;
+	if (retired) {
+		logger.info("Content ingest suppressed by Retention tombstone", {
+			idempotencyKey: item.idempotencyKey,
+			contentItemId,
+		});
+		return { contentItemId, created: false, retired: true };
+	}
 
     // Cache the mapping
     await redis.setex(cacheKey, SOURCE_CACHE_TTL, contentItemId);
@@ -79,7 +87,7 @@ export async function upsertContentItem(
       created,
     });
 
-    return { contentItemId, created };
+    return { contentItemId, created, retired: false };
   } catch (error) {
     // Check if it's a duplicate error (409 Conflict)
     if (error instanceof Error && error.message.includes("409")) {
@@ -92,7 +100,7 @@ export async function upsertContentItem(
           idempotencyKey: item.idempotencyKey,
           existingId,
         });
-        return { contentItemId: existingId, created: false };
+        return { contentItemId: existingId, created: false, retired: false };
       }
     }
 

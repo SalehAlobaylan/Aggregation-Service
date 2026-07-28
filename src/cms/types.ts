@@ -124,6 +124,7 @@ export interface CreateContentItemResponse {
   id: string;
   status: ContentStatus;
   created: boolean; // true if newly created, false if already existed
+	retired?: boolean; // identity is a Retention tombstone; never enqueue downstream work
   created_at: string;
 }
 

@@ -262,7 +262,12 @@ export const normalizeWorker = createWorker({
                 }
 
                 // Upsert to CMS
-                const { contentItemId, created } = await upsertContentItem(normalized, job.id);
+                const { contentItemId, created, retired } = await upsertContentItem(normalized, job.id);
+				if (retired) {
+					duplicates++;
+					jobLogger.info('Skipping downstream work for retained News identity', { idempotencyKey: normalized.idempotencyKey });
+					continue;
+				}
 
                 if (created) {
                     processed++;
