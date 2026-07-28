@@ -1,5 +1,5 @@
 /**
- * YouTube contributor to the Source Intelligence Graph (For You / media).
+ * YouTube contributor to the Source Intelligence Graph (Pods / media).
  *
  * Reads channels via Enrichment's guest InnerTube reader (no API key, no quota —
  * the paid Data API stays reserved for post-approval ingestion). Seeds = your

@@ -1,5 +1,5 @@
 /**
- * Podcast contributor to the Source Intelligence Graph (For You / media).
+ * Podcast contributor to the Source Intelligence Graph (Pods / media).
  *
  * Seeds = your APPROVED podcast feeds. For each seed we fetch the feed, derive a
  * topical query from its title, and ask Apple's iTunes directory for adjacent

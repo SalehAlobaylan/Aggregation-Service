@@ -341,7 +341,7 @@ export const mediaWorker = createWorker({
         tempFiles.push(processedPath);
       } else {
         // Audio-only: still use the still-image MP4 wrapper because
-        // For You feed needs a video container. The audio side of the
+        // Pods feed needs a video container. The audio side of the
         // ingest profile (codec + bitrate) is honoured by audioToMp4.
         const outPath = join(
           config.mediaTempDir,

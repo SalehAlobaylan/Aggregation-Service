@@ -2,7 +2,7 @@
  * Telegram Fetcher
  * Fetches media and text messages from public Telegram channels.
  * Media types fetched are controlled by the source's media_types config:
- *   audio / voice / video / photo → For You feed (PODCAST / VIDEO / ARTICLE)
+ *   audio / voice / video / photo → Pods feed (PODCAST / VIDEO / ARTICLE)
  *   text                          → News feed (ARTICLE)
  */
 import { Api } from 'telegram';

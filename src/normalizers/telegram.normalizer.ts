@@ -1,8 +1,8 @@
 /**
  * Telegram Normalizer
  * Maps Telegram messages to canonical content types:
- *   audio / voice → PODCAST  (For You feed)
- *   video         → VIDEO    (For You feed)
+ *   audio / voice → PODCAST  (Pods feed)
+ *   video         → VIDEO    (Pods feed)
  *   photo         → ARTICLE  (News feed — photo + caption)
  *   text          → ARTICLE  (News feed — text-only post)
  */

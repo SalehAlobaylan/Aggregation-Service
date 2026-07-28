@@ -254,7 +254,7 @@ export function transcodeToMp4(
 }
 
 /**
- * Convert audio to MP4 with a static visual (for For You feed requirement)
+ * Convert audio to MP4 with a static visual (for Pods feed requirement)
  * Creates an MP4 container with audio + placeholder image.
  *
  * The audio side honours the supplied EncodeProfile (codec + bitrate) so an

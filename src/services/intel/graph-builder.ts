@@ -122,7 +122,7 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
         }
     }
 
-    // YouTube contributor (media / For You) — guest InnerTube watch-next graph.
+    // YouTube contributor (media / Pods) — guest InnerTube watch-next graph.
     // Seeds = approved channels; candidates carry yt: nodes + edges, isolated from
     // the news graph by category at promotion time (CMS). Free (no Data API quota).
     if (cfg.youtube_discovery_enabled) {
@@ -142,7 +142,7 @@ export async function buildSourceGraph(recencyDays = 30): Promise<{ candidates: 
         }
     }
 
-    // Podcast contributor (media / For You) — seed-relative iTunes adjacency.
+    // Podcast contributor (media / Pods) — seed-relative iTunes adjacency.
     // Seeds = approved podcast feeds; candidates carry their own pod: nodes and
     // edges, isolated from the news graph by category at promotion time (CMS).
     if (cfg.podcast_discovery_enabled) {
