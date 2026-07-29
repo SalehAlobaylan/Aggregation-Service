@@ -42,6 +42,7 @@ export interface NormalizedItem {
 
   // Timestamps
   publishedAt: Date | null;
+  recovery?: { runId: string; manifestHash: string };
 }
 
 /**

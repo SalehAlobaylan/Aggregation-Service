@@ -55,6 +55,8 @@ export async function upsertContentItem(
     topic_tags: item.topicTags,
     metadata: item.metadata,
     published_at: item.publishedAt?.toISOString() ?? null,
+    recovery_run_id: item.recovery?.runId,
+    recovery_manifest_hash: item.recovery?.manifestHash,
   };
 
   try {

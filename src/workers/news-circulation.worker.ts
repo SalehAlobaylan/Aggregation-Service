@@ -25,10 +25,21 @@ export const newsCirculationWorker = createWorker({
         const force = job.data.trigger === 'manual';
         // Batch size is a policy knob owned by CMS (source_claim_batch_size); pass 0
         // so CMS applies the configured batch instead of a hardcoded ceiling here.
-        const claimed = await cmsClient.claimCirculationSources(tenantId, 0, force, job.id);
+        const recovery = job.data.recovery;
+        const claimLimit = recovery ? Math.min(recovery.sourceIds.length, 200) : 0;
+        const claimed = await cmsClient.claimCirculationSources(tenantId, claimLimit, force, job.id, recovery);
 
         let enqueued = 0;
         for (const source of claimed.data ?? []) {
+            const recoverySettings = recovery ? {
+                recovery: {
+                    run_id: recovery.runId,
+                    manifest_hash: recovery.manifestHash,
+                    lane: recovery.lane,
+                    lookback_hours: recovery.lookbackHours,
+                    preserve_checkpoints: recovery.preserveCheckpoints,
+                },
+            } : {};
             const fetchJob: FetchJob = {
                 sourceId: source.id,
                 sourceType: source.type,
@@ -37,6 +48,7 @@ export const newsCirculationWorker = createWorker({
                     url: source.url,
                     settings: {
                         ...(source.settings ?? {}),
+                        ...recoverySettings,
                         circulation: {
                             tenantId,
                             sourceId: source.id,

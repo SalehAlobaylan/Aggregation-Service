@@ -214,6 +214,15 @@ export interface SourceGraphJob {
 export interface NewsCirculationJob {
     trigger: 'auto' | 'manual';
     tenantId?: string;
+    recovery?: {
+        runId: string;
+        manifestHash: string;
+        lane: 'news' | 'media';
+        sourceIds: string[];
+        lookbackHours: number;
+        maxItems: number;
+        preserveCheckpoints: true;
+    };
 }
 
 /**

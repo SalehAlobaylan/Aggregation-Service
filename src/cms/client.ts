@@ -324,11 +324,13 @@ export const cmsClient = {
         tenantId = 'default',
         limit = 20,
         force = false,
-        requestId?: string
+        requestId?: string,
+        recovery?: { runId: string; manifestHash: string; lane: 'news' | 'media'; sourceIds: string[]; lookbackHours: number; maxItems: number; preserveCheckpoints: true }
     ): Promise<ClaimCirculationSourcesResponse> {
+        const recoveryQuery = recovery ? `&recovery_lane=${recovery.lane}&recovery_run_id=${encodeURIComponent(recovery.runId)}&recovery_manifest_hash=${encodeURIComponent(recovery.manifestHash)}&recovery_source_ids=${encodeURIComponent(recovery.sourceIds.join(','))}&recovery_lookback_hours=${recovery.lookbackHours}&recovery_max_items=${recovery.maxItems}&preserve_checkpoints=true` : '';
         return makeProtectedRequest(
             'POST',
-            `/circulation/claim-sources?tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}&force=${force ? 'true' : 'false'}`,
+            `/circulation/claim-sources?tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}&force=${force ? 'true' : 'false'}${recoveryQuery}`,
             {},
             requestId
         );

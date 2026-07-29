@@ -20,7 +20,7 @@ import {
     type SourceGraphJob,
 } from '../../queues/index.js';
 import { enqueueRetryJob } from '../../queues/retry-routing.js';
-import { deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
+import { deleteContentObjects, deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
@@ -197,6 +197,47 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 			await deleteObject(key);
 			return reply.send({ data: { key, deleted: true } });
 		} catch { return reply.status(502).send({ message: 'recovery artifact deletion unavailable' }); }
+	});
+
+	fastify.post<{ Body: { run_id?: string; tenant_id?: string; lane?: 'news' | 'media'; source_ids?: string[]; lookback_hours?: number; max_items?: number; manifest_hash?: string; idempotency_key?: string; preserve_checkpoints?: boolean } }>('/internal/recovery/reseed', async (request, reply) => {
+		const body = request.body ?? {};
+		const lane = body.lane;
+		const sourceIds = Array.isArray(body.source_ids) ? body.source_ids.filter(value => CANONICAL_UUID.test(String(value))) : [];
+		const maxItems = Number(body.max_items ?? 0);
+		const lookbackHours = Number(body.lookback_hours ?? 0);
+		if (!body.run_id || !body.tenant_id || (lane !== 'news' && lane !== 'media') || sourceIds.length === 0 || sourceIds.length > 200 || !body.manifest_hash || !body.idempotency_key || body.preserve_checkpoints !== true || !Number.isInteger(maxItems) || maxItems < 1 || maxItems > 500 || !Number.isInteger(lookbackHours) || lookbackHours < 1 || lookbackHours > 72) {
+			return reply.status(400).send({ message: 'invalid bounded recovery reseed request' });
+		}
+		const queue = getQueue(QUEUE_NAMES.NEWS_CIRCULATION);
+		if (!queue) return reply.status(503).send({ message: 'recovery reseed queue unavailable' });
+		const job = await queue.add('recovery-reseed-' + lane, { trigger: 'manual', tenantId: body.tenant_id, recovery: { runId: body.run_id, manifestHash: body.manifest_hash, lane, sourceIds, lookbackHours, maxItems, preserveCheckpoints: true } } satisfies NewsCirculationJob, { priority: 1, jobId: body.idempotency_key });
+		return reply.send({ data: { queued: true, job_id: job.id ?? body.idempotency_key, lane, checkpoint_mode: 'preserve', lookback_hours: lookbackHours, max_items: maxItems } });
+	});
+
+	fastify.post<{ Body: { run_id?: string; tenant_id?: string; content_ids?: string[]; manifest_hash?: string; idempotency_key?: string } }>('/internal/recovery/purge-media', async (request, reply) => {
+		const body = request.body ?? {};
+		const ids = Array.isArray(body.content_ids) ? body.content_ids.filter(value => CANONICAL_UUID.test(String(value))) : [];
+		if (!body.run_id || !body.tenant_id || !body.manifest_hash || !body.idempotency_key || ids.length > 30 || ids.length === 0) return reply.status(400).send({ message: 'invalid bounded media purge request' });
+		let deletedCount = 0;
+		let freedBytes = 0;
+		const errors: string[] = [];
+		for (const id of ids) {
+			try {
+				const item = await cmsClient.getContentItem(id);
+				if (item.tenant_id !== body.tenant_id) { errors.push(`${id}: tenant mismatch`); continue; }
+				if ((item.type !== 'VIDEO' && item.type !== 'PODCAST') || item.status !== 'READY' || item.is_feed_unit !== true || item.feed_visibility !== 'visible') {
+					errors.push(`${id}: media manifest no longer matches a visible READY feed unit`);
+					continue;
+				}
+				const result = await deleteContentObjects(id);
+				deletedCount += result.deletedCount;
+				freedBytes += result.freedBytes;
+			} catch (error) {
+				errors.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (errors.length > 0) return reply.status(409).send({ message: 'media recovery purge was partial', deleted_count: deletedCount, freed_bytes: freedBytes, errors });
+		return reply.send({ data: { deleted_count: deletedCount, freed_bytes: freedBytes, errors: [] } });
 	});
 
 	// Retention can request one bounded Storage-owner run. This endpoint does

@@ -46,16 +46,18 @@ export const fetchWorker = createWorker({
         let result: Awaited<ReturnType<typeof fetchFromSource>>;
         try {
             result = await fetchFromSource(sourceConfig, config.cursor as string | undefined, signal);
-        } catch (error) {
-            await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, 0, 1, {
-                sourceType,
-                error: error instanceof Error ? error.message : String(error),
-            }, signal);
+		} catch (error) {
+			await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, 0, 1, {
+				sourceType,
+				recovery: sourceSettings.recovery,
+				error: error instanceof Error ? error.message : String(error),
+			}, signal);
             throw error;
         }
-        await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
-            sourceType,
-            reason: result.metadata.reason,
+		await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
+			sourceType,
+			recovery: sourceSettings.recovery,
+			reason: result.metadata.reason,
         }, signal);
 
         const remainingAllowed =
@@ -63,10 +65,19 @@ export const fetchWorker = createWorker({
                 ? Math.max(configuredMaxResults - fetchedSoFar, 0)
                 : undefined;
 
-        const itemsForThisRun =
+        let itemsForThisRun =
             typeof remainingAllowed === 'number'
                 ? result.items.slice(0, remainingAllowed)
                 : result.items;
+		const recovery = sourceSettings.recovery as { lookback_hours?: number; preserve_checkpoints?: boolean } | undefined;
+		if (recovery?.preserve_checkpoints === true && recovery.lookback_hours) {
+			const cutoff = Date.now() - Math.min(72, Math.max(1, recovery.lookback_hours)) * 60 * 60 * 1000;
+			itemsForThisRun = itemsForThisRun.filter(item => {
+				if (!item.publishedAt) return false;
+				const publishedAt = new Date(item.publishedAt).getTime();
+				return Number.isFinite(publishedAt) && publishedAt >= cutoff;
+			});
+		}
 
         const droppedByConfiguredCap = result.items.length - itemsForThisRun.length;
         if (droppedByConfiguredCap > 0) {

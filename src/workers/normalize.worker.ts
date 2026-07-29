@@ -200,6 +200,10 @@ export const normalizeWorker = createWorker({
                     failed++;
                     continue;
                 }
+				const recovery = (sourceSettings?.recovery ?? null) as { run_id?: string; manifest_hash?: string } | null;
+				if (recovery?.run_id && recovery.manifest_hash) {
+					normalized.recovery = { runId: recovery.run_id, manifestHash: recovery.manifest_hash };
+				}
 
                 const filterDecision = shouldSkipByFilters(normalized, item, sourceFilters);
                 if (filterDecision.skip) {

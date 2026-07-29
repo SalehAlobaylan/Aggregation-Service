@@ -118,6 +118,8 @@ export interface CreateContentItemRequest {
   metadata?: Record<string, unknown>;
 
   published_at?: string | null;
+  recovery_run_id?: string;
+  recovery_manifest_hash?: string;
 }
 
 export interface CreateContentItemResponse {
@@ -393,6 +395,7 @@ export interface InternalContentItem {
   tenant_id: string;
   status?: ContentStatus;
   type?: ContentType;
+  is_feed_unit?: boolean;
   title?: string | null;
   excerpt?: string | null;
   source_name?: string | null;
