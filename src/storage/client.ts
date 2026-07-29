@@ -311,6 +311,30 @@ export async function uploadBuffer(
     throw lastError || new Error('Upload failed after retries');
 }
 
+// Recovery artifacts are operator-only payloads. They use provider-managed
+// server-side encryption and callers verify the provider's HEAD response
+// before the CMS is allowed to ledger the artifact as recoverable.
+export async function uploadEncryptedRecoveryArtifact(
+    key: string,
+    buffer: Buffer,
+): Promise<void> {
+    const { client, bucket } = bindingFor('primary');
+    await client.send(new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: 'application/gzip',
+        ContentLength: buffer.length,
+        ServerSideEncryption: 'AES256',
+    }));
+}
+
+export async function recoveryArtifactEncryptionVerified(key: string): Promise<boolean> {
+    const { client, bucket } = bindingFor('primary');
+    const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return head.ServerSideEncryption === 'AES256' || head.ServerSideEncryption === 'aws:kms';
+}
+
 // Recovery artifacts are private system objects. Callers never receive a
 // public URL; CMS records only the opaque key/checksum in its ledger.
 export async function readObjectBuffer(key: string, maxBytes: number, tier: StorageTier = 'primary'): Promise<Buffer> {
@@ -609,6 +633,8 @@ export const storageClient = {
     getObjectStream,
     uploadFile,
     uploadBuffer,
+	uploadEncryptedRecoveryArtifact,
+	recoveryArtifactEncryptionVerified,
 	readObjectBuffer,
     uploadStream,
     listAllObjects,

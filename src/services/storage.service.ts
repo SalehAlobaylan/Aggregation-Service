@@ -34,6 +34,10 @@ export interface SweepOptions {
     maxBytes?: number;
     limit?: number;
     archiveAction?: 'move_to_cold' | 're_encode';
+    correlationId?: string;
+    ownerRequestId?: string;
+    idempotencyKey?: string;
+    manifestHash?: string;
 }
 
 /**
@@ -43,19 +47,23 @@ export interface SweepOptions {
  */
 export async function runSweepForTenant(
     policy: StoragePolicy,
-    trigger: 'auto' | 'manual' = 'auto',
+    trigger: 'auto' | 'manual' | 'retention' = 'auto',
     options: SweepOptions = {}
 ): Promise<SweepResult> {
     const tenantId = policy.tenant_id ?? 'default';
     const startedAt = new Date().toISOString();
+	// Every object mutation has one durable, per-run idempotency root. Owner
+	// calls supply their action key; legacy worker/admin runs receive a fresh
+	// run key and still cannot mutate without a prepared CMS saga.
+	const operationIdempotencyKey = options.idempotencyKey ?? `storage-${trigger}-${tenantId}-${startedAt}`;
 
-    if (!policy.enabled && trigger === 'auto') {
+    if (!policy.enabled) {
         return { tenantId, deletedCount: 0, freedBytes: 0, skipped: true, reason: 'policy disabled' };
     }
 
-    // Soft cap: auto sweeps respect the Class A budget so a runaway sweep can't
-    // blow through the free tier. Manual triggers bypass — operator override.
-    if (trigger === 'auto') {
+    // Every caller shares the policy and budget guard. The Retention bridge is
+    // not an escape hatch around Storage's own cost controls.
+    {
         try {
             const budget = await cmsClient.getStorageOpBudget(tenantId);
             if (budget.class_a_status === 'cap') {
@@ -73,9 +81,8 @@ export async function runSweepForTenant(
                 };
             }
         } catch (err) {
-            // CMS unreachable for budget check — let the sweep run rather than
-            // silently freezing. The budget is a soft guardrail, not a hard one.
-            logger.warn('Storage sweep: budget check failed, proceeding without cap', { err });
+            logger.warn('Storage sweep: budget check failed; skipping', { err });
+            return { tenantId, deletedCount: 0, freedBytes: 0, skipped: true, reason: 'budget_proof_unavailable' };
         }
     }
 
@@ -105,6 +112,10 @@ export async function runSweepForTenant(
                 deleted_count: 0,
                 freed_bytes: 0,
                 trigger,
+                correlation_id: options.correlationId,
+                owner_request_id: options.ownerRequestId,
+                idempotency_key: options.idempotencyKey,
+                manifest_hash: options.manifestHash,
             });
             return { tenantId, deletedCount: 0, freedBytes: 0, skipped: true, reason: 'under target' };
         }
@@ -113,7 +124,7 @@ export async function runSweepForTenant(
         // sweeps pass an explicit maxBytes/candidateIds set, so they never expand
         // to the general candidate pool.
         const requestedMaxBytes = options.maxBytes && options.maxBytes > 0 ? options.maxBytes : undefined;
-        const maxBytes = requestedMaxBytes ?? (trigger === 'manual' && overage <= 0 ? undefined : Math.max(overage, 0));
+        const maxBytes = requestedMaxBytes ?? (trigger !== 'auto' && overage <= 0 ? undefined : Math.max(overage, 0));
         const archiveAction = options.archiveAction ?? policy.archive_action;
         const limit = Math.max(1, Math.min(options.limit ?? (scoped ? scopedCandidateIds.length : 1000), 1000));
 
@@ -138,6 +149,10 @@ export async function runSweepForTenant(
                 deleted_count: 0,
                 freed_bytes: 0,
                 trigger,
+                correlation_id: options.correlationId,
+                owner_request_id: options.ownerRequestId,
+                idempotency_key: options.idempotencyKey,
+                manifest_hash: options.manifestHash,
             });
             return { tenantId, deletedCount: 0, freedBytes: 0, skipped: true, reason: 'no candidates' };
         }
@@ -298,6 +313,17 @@ export async function runSweepForTenant(
             const movedItems: MoveToColdItem[] = [];
             for (const candidate of candidates.data) {
                 try {
+					const saga = await cmsClient.startStorageOperationSaga({
+						tenant_id: tenantId,
+						content_item_id: candidate.id,
+						operation: 'move_to_cold',
+						idempotency_key: operationIdempotencyKey,
+						manifest_hash: options.manifestHash,
+						correlation_id: options.correlationId,
+						owner_request_id: options.ownerRequestId,
+						evidence: { old_size_bytes: candidate.file_size_bytes, old_media_url: candidate.media_url ?? null, from_tier: 'primary', to_tier: 'cold' },
+					});
+					if (!saga.created) throw new Error(`storage operation saga already exists in ${saga.state}; reconciliation required`);
                     const moveResult = await moveObjectBetweenTiers(
                         candidate.id,
                         'primary',
@@ -324,6 +350,15 @@ export async function runSweepForTenant(
                         }));
                         continue;
                     }
+					if (moveResult.errors.length > 0) {
+						throw new Error('object move was partial; CMS references were not changed');
+					}
+					await cmsClient.markStorageSagaObjectApplied(saga.id, {
+						moved_count: moveResult.movedCount,
+						bytes_moved: moveResult.bytesMoved,
+						new_primary_urls: moveResult.newPrimaryUrls,
+						errors: moveResult.errors,
+					});
                     // Track moves separately from deletes so the sweep-run row
                     // distinguishes the two actions.
                     movedToColdCount += moveResult.movedCount;
@@ -365,7 +400,7 @@ export async function runSweepForTenant(
 
             if (movedItems.length > 0) {
                 try {
-                    await cmsClient.moveItemsToCold({ items: movedItems });
+                    await cmsClient.moveItemsToCold({ items: movedItems, tenant_id: tenantId, idempotency_key: operationIdempotencyKey, manifest_hash: options.manifestHash, correlation_id: options.correlationId, owner_request_id: options.ownerRequestId });
                 } catch (err) {
                     logger.error('storage.sweep: failed to flag moved items in CMS', err, {
                         count: movedItems.length,
@@ -377,6 +412,17 @@ export async function runSweepForTenant(
             const archivedIds: string[] = [];
             for (const candidate of candidates.data) {
                 try {
+					const saga = await cmsClient.startStorageOperationSaga({
+						tenant_id: tenantId,
+						content_item_id: candidate.id,
+						operation: 'recoverable_delete',
+						idempotency_key: operationIdempotencyKey,
+						manifest_hash: options.manifestHash,
+						correlation_id: options.correlationId,
+						owner_request_id: options.ownerRequestId,
+						evidence: { old_size_bytes: candidate.file_size_bytes, old_media_url: candidate.media_url ?? null, artifacts },
+					});
+					if (!saga.created) throw new Error(`storage operation saga already exists in ${saga.state}; reconciliation required`);
                     const result = await deleteContentObjects(candidate.id, artifacts);
                     if (result.errors.length > 0) {
                         logger.warn('storage.sweep: partial delete errors', {
@@ -384,6 +430,14 @@ export async function runSweepForTenant(
                             errors: result.errors,
                         });
                     }
+                    if (result.errors.length > 0) {
+						throw new Error('object deletion was partial; CMS references were not changed');
+					}
+					await cmsClient.markStorageSagaObjectApplied(saga.id, {
+						deleted_count: result.deletedCount,
+						freed_bytes: result.freedBytes,
+						artifacts,
+					});
                     deletedCount += result.deletedCount;
                     freedBytes += result.freedBytes || candidate.file_size_bytes;
                     archivedIds.push(candidate.id);
@@ -415,6 +469,11 @@ export async function runSweepForTenant(
                     await cmsClient.archiveItems({
                         ids: archivedIds,
                         preserve_thumbnails: policy.preserve_thumbnails,
+						tenant_id: tenantId,
+						idempotency_key: operationIdempotencyKey,
+						manifest_hash: options.manifestHash,
+						correlation_id: options.correlationId,
+						owner_request_id: options.ownerRequestId,
                     });
                 } catch (err) {
                     logger.error('storage.sweep: failed to archive in CMS', err, {
@@ -440,6 +499,10 @@ export async function runSweepForTenant(
             freed_bytes: freedBytes,
             trigger,
             error: errorMessage,
+            correlation_id: options.correlationId,
+            owner_request_id: options.ownerRequestId,
+            idempotency_key: options.idempotencyKey,
+            manifest_hash: options.manifestHash,
         });
     } catch (err) {
         logger.error('storage.sweep: failed to record sweep run', err, { tenantId });

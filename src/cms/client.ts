@@ -27,6 +27,8 @@ import type {
     CreateSweepRunRequest,
     MoveToColdRequest,
     MoveToColdResponse,
+	StartStorageOperationSagaRequest,
+	StorageOperationSaga,
     QualityProfile,
     ResolveProfileResponse,
     UpdateContentItemQualityRequest,
@@ -592,6 +594,34 @@ export const cmsClient = {
             '/storage/move-to-cold',
             data,
             requestId
+        );
+    },
+
+    /** Durable intent before an object-store mutation. */
+    async startStorageOperationSaga(
+        data: StartStorageOperationSagaRequest,
+        requestId?: string,
+    ): Promise<StorageOperationSaga> {
+        const response = await makeProtectedRequest<{ data: StorageOperationSaga }>(
+            'POST',
+            '/storage/operation-sagas',
+            data,
+            requestId,
+        );
+        return response.data;
+    },
+
+    /** Provider-side confirmation before CMS references are committed. */
+    async markStorageSagaObjectApplied(
+        sagaId: string,
+        evidence: Record<string, unknown>,
+        requestId?: string,
+    ): Promise<void> {
+        await makeProtectedRequest(
+            'POST',
+            `/storage/operation-sagas/${encodeURIComponent(sagaId)}/object-applied`,
+            { evidence },
+            requestId,
         );
     },
 

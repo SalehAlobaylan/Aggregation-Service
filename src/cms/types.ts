@@ -646,6 +646,11 @@ export interface ListStorageCandidatesResponse {
 export interface ArchiveItemsRequest {
   ids: string[];
   preserve_thumbnails: boolean;
+  tenant_id: string;
+  idempotency_key?: string;
+  manifest_hash?: string;
+  correlation_id?: string;
+  owner_request_id?: string;
 }
 
 export interface ArchiveItemsResponse {
@@ -662,11 +667,33 @@ export interface MoveToColdItem {
 
 export interface MoveToColdRequest {
   items: MoveToColdItem[];
+  tenant_id: string;
+  idempotency_key?: string;
+  manifest_hash?: string;
+  correlation_id?: string;
+  owner_request_id?: string;
 }
 
 export interface MoveToColdResponse {
   updated_count: number;
   freed_bytes: number;
+}
+
+export interface StartStorageOperationSagaRequest {
+  tenant_id: string;
+  content_item_id: string;
+  operation: "recoverable_delete" | "move_to_cold";
+  idempotency_key: string;
+  manifest_hash?: string;
+  correlation_id?: string;
+  owner_request_id?: string;
+  evidence?: Record<string, unknown>;
+}
+
+export interface StorageOperationSaga {
+  id: string;
+  state: "prepared" | "object_applied" | "cms_committed" | string;
+	created: boolean;
 }
 
 export interface CreateSweepRunRequest {
@@ -679,6 +706,10 @@ export interface CreateSweepRunRequest {
   freed_bytes: number;
   trigger: string;
   error?: string;
+  correlation_id?: string;
+  owner_request_id?: string;
+  idempotency_key?: string;
+  manifest_hash?: string;
 }
 
 /**

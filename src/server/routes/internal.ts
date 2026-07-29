@@ -20,11 +20,12 @@ import {
     type SourceGraphJob,
 } from '../../queues/index.js';
 import { enqueueRetryJob } from '../../queues/retry-routing.js';
-import { deleteObject, getStorageKey, objectExists, readObjectBuffer, uploadBuffer, uploadFile } from '../../storage/client.js';
+import { deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
 import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
+import { runSweepForTenant } from '../../services/storage.service.js';
 
 interface UserContentResponse {
     success: boolean;
@@ -166,8 +167,9 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 					const existing = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
 					if (createHash('sha256').update(existing).digest('hex') !== checksum) return reply.status(409).send({ message: 'recovery key already has different content' });
 				} else {
-					await uploadBuffer(key, body, 'application/gzip');
+					await uploadEncryptedRecoveryArtifact(key, body);
 				}
+				if (!await recoveryArtifactEncryptionVerified(key)) return reply.status(409).send({ message: 'recovery artifact encryption could not be verified' });
 				const readback = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
 				if (createHash('sha256').update(readback).digest('hex') !== checksum) return reply.status(502).send({ message: 'recovery artifact readback mismatch' });
 				return reply.send({ data: { key, sha256: checksum, bytes: body.length, verified: true } });
@@ -183,7 +185,7 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		if (!validRecoveryArtifactRef(key, checksum)) return reply.status(400).send({ message: 'invalid recovery artifact reference' });
 		try {
 			const body = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
-			const verified = createHash('sha256').update(body).digest('hex') === checksum;
+			const verified = createHash('sha256').update(body).digest('hex') === checksum && await recoveryArtifactEncryptionVerified(key);
 			return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.length, verified } });
 		} catch { return reply.status(502).send({ message: 'recovery artifact unavailable' }); }
 	});
@@ -195,6 +197,31 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 			await deleteObject(key);
 			return reply.send({ data: { key, deleted: true } });
 		} catch { return reply.status(502).send({ message: 'recovery artifact deletion unavailable' }); }
+	});
+
+	// Retention can request one bounded Storage-owner run. This endpoint does
+	// not accept candidate IDs: Storage reloads its policy and selects/rechecks
+	// its own candidates through CMS, preserving its single ownership boundary.
+	fastify.post<{ Body: { tenant_id?: string; max_bytes?: number; idempotency_key?: string; manifest_hash?: string; correlation_id?: string; owner_request_id?: string } }>('/internal/retention/storage/sweep', async (request, reply) => {
+		const tenantId = String(request.body?.tenant_id ?? '').trim();
+		if (!tenantId || !String(request.body?.idempotency_key ?? '').trim()) return reply.status(400).send({ message: 'tenant_id and idempotency_key are required' });
+		try {
+			const policies = await cmsClient.listStoragePolicies();
+			const policy = policies.all.find(row => row.tenant_id === tenantId) ?? policies.global;
+			if (!policy) return reply.status(404).send({ message: 'storage policy not found' });
+			const result = await runSweepForTenant({ ...policy, tenant_id: tenantId }, 'retention', {
+				maxBytes: Math.max(0, Number(request.body?.max_bytes ?? 0)) || undefined,
+				archiveAction: policy.archive_action === 'move_to_cold' ? 'move_to_cold' : 're_encode',
+				idempotencyKey: String(request.body?.idempotency_key),
+				manifestHash: String(request.body?.manifest_hash ?? '') || undefined,
+				correlationId: String(request.body?.correlation_id ?? '') || undefined,
+				ownerRequestId: String(request.body?.owner_request_id ?? '') || undefined,
+			});
+			return reply.send({ data: result });
+		} catch (error) {
+			logger.warn('Retention Storage owner request failed', { error: error instanceof Error ? error.message : 'unknown' });
+			return reply.status(502).send({ message: 'storage owner unavailable' });
+		}
 	});
 
     async function retryContentItems(

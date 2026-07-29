@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
     recordStorageArtifactEvent: vi.fn(),
     createSweepRun: vi.fn(),
     archiveItems: vi.fn(),
+	startStorageOperationSaga: vi.fn(),
+	markStorageSagaObjectApplied: vi.fn(),
     resolveQualityProfile: vi.fn(),
     deleteContentObjects: vi.fn(),
     computeStorageUsage: vi.fn(),
@@ -24,6 +26,8 @@ vi.mock('../../src/cms/client.js', () => ({
         recordStorageArtifactEvent: mocks.recordStorageArtifactEvent,
         createSweepRun: mocks.createSweepRun,
         archiveItems: mocks.archiveItems,
+		startStorageOperationSaga: mocks.startStorageOperationSaga,
+		markStorageSagaObjectApplied: mocks.markStorageSagaObjectApplied,
         resolveQualityProfile: mocks.resolveQualityProfile,
     },
 }));
@@ -84,6 +88,8 @@ describe('runSweepForTenant delete safety', () => {
         mocks.recordStorageArtifactEvent.mockResolvedValue({ success: true });
         mocks.createSweepRun.mockResolvedValue({ success: true });
         mocks.archiveItems.mockResolvedValue({ updated_count: 1, freed_bytes: 123_456 });
+		mocks.startStorageOperationSaga.mockResolvedValue({ id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', state: 'prepared', created: true });
+		mocks.markStorageSagaObjectApplied.mockResolvedValue(undefined);
         mocks.resolveQualityProfile.mockResolvedValue({ profile: { id: 3 }, matched_on: 'global' });
         mocks.listStorageCandidates.mockResolvedValue({
             data: [{
@@ -140,6 +146,14 @@ describe('runSweepForTenant delete safety', () => {
             '11111111-2222-3333-4444-555555555555',
             ['processed', 'original']
         );
+		expect(mocks.startStorageOperationSaga).toHaveBeenCalledWith(expect.objectContaining({
+			content_item_id: '11111111-2222-3333-4444-555555555555',
+			operation: 'recoverable_delete',
+		}));
+		expect(mocks.markStorageSagaObjectApplied).toHaveBeenCalledWith(
+			'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+			expect.objectContaining({ deleted_count: 2 }),
+		);
         expect(result.deletedCount).toBe(2);
         expect(result.freedBytes).toBe(123_456);
     });
