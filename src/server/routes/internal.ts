@@ -20,7 +20,7 @@ import {
     type SourceGraphJob,
 } from '../../queues/index.js';
 import { enqueueRetryJob } from '../../queues/retry-routing.js';
-import { deleteContentObjects, deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
+import { deleteContentObjects, deleteContentObjectsExact, deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
@@ -199,53 +199,74 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		} catch { return reply.status(502).send({ message: 'recovery artifact deletion unavailable' }); }
 	});
 
-	fastify.post<{ Body: { run_id?: string; tenant_id?: string; lane?: 'news' | 'media'; source_ids?: string[]; lookback_hours?: number; max_items?: number; manifest_hash?: string; idempotency_key?: string; preserve_checkpoints?: boolean } }>('/internal/recovery/reseed', async (request, reply) => {
+	fastify.post<{ Body: { run_id?: string; tenant_id?: string; lane?: 'news' | 'media'; source_ids?: string[]; lookback_hours?: number; max_items?: number; manifest_hash?: string; idempotency_key?: string; preserve_checkpoints?: boolean; fencing_token?: string } }>('/internal/recovery/reseed', async (request, reply) => {
 		const body = request.body ?? {};
 		const lane = body.lane;
 		const sourceIds = Array.isArray(body.source_ids) ? body.source_ids.filter(value => CANONICAL_UUID.test(String(value))) : [];
 		const maxItems = Number(body.max_items ?? 0);
 		const lookbackHours = Number(body.lookback_hours ?? 0);
-		if (!body.run_id || !body.tenant_id || (lane !== 'news' && lane !== 'media') || sourceIds.length === 0 || sourceIds.length > 200 || !body.manifest_hash || !body.idempotency_key || body.preserve_checkpoints !== true || !Number.isInteger(maxItems) || maxItems < 1 || maxItems > 500 || !Number.isInteger(lookbackHours) || lookbackHours < 1 || lookbackHours > 72) {
+		if (!body.run_id || !body.tenant_id || (lane !== 'news' && lane !== 'media') || sourceIds.length === 0 || sourceIds.length > 200 || !body.manifest_hash || !body.idempotency_key || !body.fencing_token || !CANONICAL_UUID.test(String(body.fencing_token)) || body.preserve_checkpoints !== true || !Number.isInteger(maxItems) || maxItems < 1 || maxItems > 500 || !Number.isInteger(lookbackHours) || lookbackHours < 1 || lookbackHours > 72) {
 			return reply.status(400).send({ message: 'invalid bounded recovery reseed request' });
 		}
 		const queue = getQueue(QUEUE_NAMES.NEWS_CIRCULATION);
 		if (!queue) return reply.status(503).send({ message: 'recovery reseed queue unavailable' });
 		const job = await queue.add('recovery-reseed-' + lane, { trigger: 'manual', tenantId: body.tenant_id, recovery: { runId: body.run_id, manifestHash: body.manifest_hash, lane, sourceIds, lookbackHours, maxItems, preserveCheckpoints: true } } satisfies NewsCirculationJob, { priority: 1, jobId: body.idempotency_key });
-		return reply.send({ data: { queued: true, job_id: job.id ?? body.idempotency_key, lane, checkpoint_mode: 'preserve', lookback_hours: lookbackHours, max_items: maxItems } });
+		return reply.send({ data: { queued: true, job_id: job.id ?? body.idempotency_key, lane, checkpoint_mode: 'preserve', lookback_hours: lookbackHours, max_items: maxItems, fencing_token: body.fencing_token } });
 	});
 
-	fastify.post<{ Body: { run_id?: string; tenant_id?: string; content_ids?: string[]; manifest_hash?: string; idempotency_key?: string } }>('/internal/recovery/purge-media', async (request, reply) => {
+	fastify.post<{ Body: { run_id?: string; tenant_id?: string; content_ids?: string[]; saga_items?: Array<{ id?: string; provider_objects?: string[]; no_full_rollback?: boolean }>; manifest_hash?: string; idempotency_key?: string; item_idempotency_keys?: Record<string, string>; fencing_token?: string } }>('/internal/recovery/purge-media', async (request, reply) => {
 		const body = request.body ?? {};
 		const ids = Array.isArray(body.content_ids) ? body.content_ids.filter(value => CANONICAL_UUID.test(String(value))) : [];
-		if (!body.run_id || !body.tenant_id || !body.manifest_hash || !body.idempotency_key || ids.length > 30 || ids.length === 0) return reply.status(400).send({ message: 'invalid bounded media purge request' });
+		const sagaItems = Array.isArray(body.saga_items) ? body.saga_items : [];
+		const sagaIDs = sagaItems.map(item => String(item.id ?? '')).filter(value => CANONICAL_UUID.test(value));
+		const itemKeys = body.item_idempotency_keys ?? {};
+		if (!body.run_id || !body.tenant_id || !body.manifest_hash || !body.idempotency_key || !body.fencing_token || !CANONICAL_UUID.test(String(body.fencing_token)) || ids.length > 30 || ids.length === 0 || sagaItems.length !== ids.length || sagaIDs.some(id => !ids.includes(id)) || ids.some(id => !String(itemKeys[id] ?? '').trim())) return reply.status(400).send({ message: 'invalid exact media purge saga request' });
 		let deletedCount = 0;
 		let freedBytes = 0;
 		const errors: string[] = [];
+		const results: Array<{ id: string; deleted_count: number; freed_bytes: number; objects_absent: boolean; request_id: string; result_hash: string; error?: string }> = [];
 		for (const id of ids) {
+			const requestId = String(itemKeys[id]);
 			try {
 				const item = await cmsClient.getContentItem(id);
-				if (item.tenant_id !== body.tenant_id) { errors.push(`${id}: tenant mismatch`); continue; }
+				if (item.tenant_id !== body.tenant_id) { const error = 'tenant mismatch'; errors.push(`${id}: ${error}`); results.push({ id, deleted_count: 0, freed_bytes: 0, objects_absent: false, request_id: requestId, result_hash: createHash('sha256').update(`${body.manifest_hash}|${requestId}|${error}`).digest('hex'), error }); continue; }
 				if ((item.type !== 'VIDEO' && item.type !== 'PODCAST') || item.status !== 'READY' || item.is_feed_unit !== true || item.feed_visibility !== 'visible') {
-					errors.push(`${id}: media manifest no longer matches a visible READY feed unit`);
+					const error = 'media manifest no longer matches a visible READY feed unit';
+					errors.push(`${id}: ${error}`); results.push({ id, deleted_count: 0, freed_bytes: 0, objects_absent: false, request_id: requestId, result_hash: createHash('sha256').update(`${body.manifest_hash}|${requestId}|${error}`).digest('hex'), error });
 					continue;
 				}
-				const result = await deleteContentObjects(id);
+				const sagaItem = sagaItems.find(item => String(item.id) === id);
+				const objectRefs = Array.isArray(sagaItem?.provider_objects) ? sagaItem.provider_objects.map(value => String(value).trim()).filter(Boolean) : [];
+				if (objectRefs.length === 0 && sagaItem?.no_full_rollback !== true) {
+					const error = 'exact provider object map is required';
+					errors.push(`${id}: ${error}`); results.push({ id, deleted_count: 0, freed_bytes: 0, objects_absent: false, request_id: requestId, result_hash: createHash('sha256').update(`${body.manifest_hash}|${requestId}|${error}`).digest('hex'), error });
+					continue;
+				}
+				const result = objectRefs.length > 0 ? await deleteContentObjectsExact(id, objectRefs) : await deleteContentObjects(id);
 				deletedCount += result.deletedCount;
 				freedBytes += result.freedBytes;
+				const resultHash = createHash('sha256').update(`${body.manifest_hash}|${requestId}|${result.deletedCount}|${result.freedBytes}|${result.objectsAbsent}`).digest('hex');
+				results.push({ id, deleted_count: result.deletedCount, freed_bytes: result.freedBytes, objects_absent: result.objectsAbsent, request_id: requestId, result_hash: resultHash });
 			} catch (error) {
-				errors.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+				const message = error instanceof Error ? error.message : String(error);
+				errors.push(`${id}: ${message}`); results.push({ id, deleted_count: 0, freed_bytes: 0, objects_absent: false, request_id: requestId, result_hash: createHash('sha256').update(`${body.manifest_hash}|${requestId}|${message}`).digest('hex'), error: message });
 			}
 		}
-		if (errors.length > 0) return reply.status(409).send({ message: 'media recovery purge was partial', deleted_count: deletedCount, freed_bytes: freedBytes, errors });
-		return reply.send({ data: { deleted_count: deletedCount, freed_bytes: freedBytes, errors: [] } });
+		const resultRoot = createHash('sha256').update(results.map(row => row.result_hash).sort().join('|')).digest('hex');
+		if (errors.length > 0) return reply.status(409).send({ message: 'media recovery purge was partial', data: { deleted_count: deletedCount, freed_bytes: freedBytes, errors, results, result_root: resultRoot, fencing_token: body.fencing_token } });
+		return reply.send({ data: { deleted_count: deletedCount, freed_bytes: freedBytes, errors: [], results, result_root: resultRoot, fencing_token: body.fencing_token } });
 	});
 
 	// Retention can request one bounded Storage-owner run. This endpoint does
 	// not accept candidate IDs: Storage reloads its policy and selects/rechecks
 	// its own candidates through CMS, preserving its single ownership boundary.
-	fastify.post<{ Body: { tenant_id?: string; max_bytes?: number; idempotency_key?: string; manifest_hash?: string; correlation_id?: string; owner_request_id?: string } }>('/internal/retention/storage/sweep', async (request, reply) => {
+	fastify.post<{ Body: { tenant_id?: string; owner?: string; action_class?: string; allowed_action_classes?: string[]; max_bytes?: number; max_items?: number; max_actions?: number; expires_at?: string; idempotency_key?: string; manifest_hash?: string; correlation_id?: string; owner_request_id?: string } }>('/internal/retention/storage/sweep', async (request, reply) => {
 		const tenantId = String(request.body?.tenant_id ?? '').trim();
-		if (!tenantId || !String(request.body?.idempotency_key ?? '').trim()) return reply.status(400).send({ message: 'tenant_id and idempotency_key are required' });
+		const owner = String(request.body?.owner ?? '');
+		const actionClass = String(request.body?.action_class ?? '');
+		const allowedClasses = Array.isArray(request.body?.allowed_action_classes) ? request.body?.allowed_action_classes.map(String) : [];
+		const expiresAt = Date.parse(String(request.body?.expires_at ?? ''));
+		if (!tenantId || owner !== 'storage' || actionClass !== 'storage.request_bounded_run' || !allowedClasses.includes(actionClass) || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || !String(request.body?.idempotency_key ?? '').trim() || !String(request.body?.manifest_hash ?? '').trim()) return reply.status(400).send({ message: 'complete non-expired owner envelope is required' });
 		try {
 			const policies = await cmsClient.listStoragePolicies();
 			const policy = policies.all.find(row => row.tenant_id === tenantId) ?? policies.global;
@@ -258,7 +279,21 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 				correlationId: String(request.body?.correlation_id ?? '') || undefined,
 				ownerRequestId: String(request.body?.owner_request_id ?? '') || undefined,
 			});
-			return reply.send({ data: result });
+			const requestedMaxBytes = Number(request.body?.max_bytes ?? 0);
+			const actionCount = Number(result.deletedCount ?? 0) + Number(result.movedToColdCount ?? 0) + Number(result.reEncodedCount ?? 0);
+			const requestedMaxActions = Number(request.body?.max_actions ?? 0);
+			if (requestedMaxBytes > 0 && result.freedBytes > requestedMaxBytes) {
+				return reply.status(409).send({ message: 'storage owner exceeded the approved byte bound', freed_bytes: result.freedBytes, max_bytes: requestedMaxBytes });
+			}
+			if (requestedMaxActions > 0 && actionCount > requestedMaxActions) {
+				return reply.status(409).send({ message: 'storage owner exceeded the approved action bound', action_count: actionCount, max_actions: requestedMaxActions });
+			}
+			const requestedMaxItems = Number(request.body?.max_items ?? 0);
+			if (requestedMaxItems > 0 && actionCount > requestedMaxItems) {
+				return reply.status(409).send({ message: 'storage owner exceeded the approved item bound', action_count: actionCount, max_items: requestedMaxItems });
+			}
+			const resultHash = createHash('sha256').update(`${request.body?.manifest_hash}|${tenantId}|${result.deletedCount}|${result.freedBytes}|${actionCount}|${request.body?.owner_request_id ?? ''}`).digest('hex');
+			return reply.send({ data: { ...result, owner, action_class: actionClass, action_count: actionCount, request_hash: request.body?.manifest_hash, owner_request_id: request.body?.owner_request_id, result_hash: resultHash } });
 		} catch (error) {
 			logger.warn('Retention Storage owner request failed', { error: error instanceof Error ? error.message : 'unknown' });
 			return reply.status(502).send({ message: 'storage owner unavailable' });

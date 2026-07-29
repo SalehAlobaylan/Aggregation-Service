@@ -531,7 +531,7 @@ export async function deleteContentObjects(
     contentItemId: string,
     artifacts?: string[],
     tier: StorageTier = 'primary'
-): Promise<{ deletedCount: number; freedBytes: number; errors: string[] }> {
+): Promise<{ deletedCount: number; freedBytes: number; errors: string[]; objectsAbsent: boolean }> {
     const all = await listContentObjects(contentItemId, tier);
     let keys = all.map(o => o.Key!).filter(Boolean);
     if (artifacts && artifacts.length > 0) {
@@ -543,7 +543,57 @@ export async function deleteContentObjects(
             return setLike.has(artifactType);
         });
     }
-    return deleteObjectsByKeys(keys, tier);
+    const result = await deleteObjectsByKeys(keys, tier);
+    let objectsAbsent = !artifacts || artifacts.length === 0;
+    if (result.errors.length === 0 && objectsAbsent) {
+        try {
+            const remaining = await listContentObjects(contentItemId, tier);
+            objectsAbsent = remaining.length === 0;
+            if (!objectsAbsent) {
+                result.errors.push('provider readback found remaining content objects');
+            }
+        } catch (error) {
+            result.errors.push(`provider deletion readback failed: ${(error as Error).message}`);
+        }
+    }
+    return { ...result, objectsAbsent };
+}
+
+/**
+ * Delete only the provider objects frozen by a recovery saga. A URL reference
+ * may be either the configured public URL or the canonical storage key.
+ * Readback is strict: any unlisted object left under the content prefix makes
+ * the operation fail closed instead of allowing CMS metadata deletion.
+ */
+export async function deleteContentObjectsExact(
+    contentItemId: string,
+    references: string[],
+    tier: StorageTier = 'primary'
+): Promise<{ deletedCount: number; freedBytes: number; errors: string[]; objectsAbsent: boolean }> {
+    const all = await listContentObjects(contentItemId, tier);
+    const normalized = new Set(references.map(value => String(value).trim()).filter(Boolean));
+    const keys = all.map(object => object.Key ?? '').filter(Boolean);
+    const matched = keys.filter(key => normalized.has(key) || normalized.has(getPublicUrl(key, tier)));
+    const missing = [...normalized].filter(reference => !matched.some(key => key === reference || getPublicUrl(key, tier) === reference));
+    const result = await deleteObjectsByKeys(matched, tier);
+    let objectsAbsent = false;
+    if (result.errors.length === 0) {
+        try {
+            const remaining = await listContentObjects(contentItemId, tier);
+            objectsAbsent = remaining.length === 0;
+            if (!objectsAbsent) result.errors.push('provider readback found unlisted content objects');
+            // Missing frozen references are safe only when the complete
+            // content prefix is already empty. That is the idempotent retry
+            // case after a provider succeeded but the previous HTTP response
+            // was lost; any remaining object keeps the saga blocked.
+            if (missing.length > 0 && objectsAbsent === false) {
+                result.errors.push(`recovery object map references missing provider objects: ${missing.join(',')}`);
+            }
+        } catch (error) {
+            result.errors.push(`provider deletion readback failed: ${(error as Error).message}`);
+        }
+    }
+    return { ...result, objectsAbsent };
 }
 
 // -----------------------------------------------------------------------------
@@ -643,6 +693,7 @@ export const storageClient = {
     deleteObject,
     deleteObjectsByKeys,
     deleteContentObjects,
+    deleteContentObjectsExact,
     moveObjectBetweenTiers,
     isColdTierConfigured,
     s3Client,
