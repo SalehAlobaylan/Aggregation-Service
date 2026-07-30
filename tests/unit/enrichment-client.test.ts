@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { generateEmbeddingViaEnrichment } from '../../src/ai/enrichment-client.js';
+import {
+    EnrichmentRequestError,
+    generateEmbeddingViaEnrichment,
+} from '../../src/ai/enrichment-client.js';
 
 describe('generateEmbeddingViaEnrichment', () => {
     afterEach(() => {
@@ -31,5 +34,32 @@ describe('generateEmbeddingViaEnrichment', () => {
             extract_tags: true,
         });
         expect(body).not.toHaveProperty('extract_sparse');
+    });
+
+    it('preserves overload responses as retryable failures', async () => {
+        const fetchMock = vi.fn().mockResolvedValue({
+            ok: false,
+            status: 429,
+            statusText: 'Too Many Requests',
+            headers: { get: vi.fn().mockReturnValue('2') },
+            text: vi.fn().mockResolvedValue(JSON.stringify({
+                error: 'Workload is temporarily at capacity',
+                error_code: 'WORKLOAD_OVERLOADED',
+                retryable: true,
+                retry_after_seconds: 2,
+            })),
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const error = await generateEmbeddingViaEnrichment('hello', 'content-id')
+            .catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(EnrichmentRequestError);
+        expect(error).toMatchObject({
+            status: 429,
+            retryable: true,
+            retryAfterSeconds: 2,
+            errorCode: 'WORKLOAD_OVERLOADED',
+        });
     });
 });

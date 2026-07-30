@@ -20,7 +20,10 @@ import {
     embedImageViaMedia,
     type TranscriptResult,
 } from '../ai/media-client.js';
-import { generateEmbeddingViaEnrichment } from '../ai/enrichment-client.js';
+import {
+    generateEmbeddingViaEnrichment,
+    isRetryableEnrichmentError,
+} from '../ai/enrichment-client.js';
 import { buildEmbeddingText } from '../ai/embeddings.js';
 import { shouldAtomizeParent } from './atomization.helpers.js';
 
@@ -30,7 +33,9 @@ import { cleanupTempFile, downloadHttp } from '../media/downloader.js';
 
 export const aiWorker = createWorker({
     queueName: QUEUE_NAMES.AI,
-    concurrency: 3, // AI processing with moderate concurrency
+    // Match Enrichment's bounded embedding admission capacity. A larger local
+    // worker pool predictably creates 429s instead of increasing throughput.
+    concurrency: 2,
     processor: async (job: Job<AIJob>, jobLogger, signal): Promise<void> => {
         const {
             contentItemId,
@@ -63,6 +68,7 @@ export const aiWorker = createWorker({
         // `written` = Enrichment confirmed the CMS write-back.
         let embeddingAttempted = false;
         let embeddingWritten = false;
+        let embeddingFailure: unknown;
 
         try {
             // 1. Generate transcript if media path provided and transcript operation requested
@@ -262,6 +268,7 @@ export const aiWorker = createWorker({
                         jobLogger.warn('No text available for embedding', { contentItemId });
                     }
                 } catch (embeddingError) {
+                    embeddingFailure = embeddingError;
                     // Leave embeddingWritten=false. We DON'T re-throw here so
                     // best-effort secondary steps (image embed) still run, but
                     // the READY gate below will fail the job (→ BullMQ retry)
@@ -304,6 +311,9 @@ export const aiWorker = createWorker({
             // by the reconciliation sweep. (Transcript stays best-effort — it's
             // tracked separately by the admin "missing transcript" view.)
             if (embeddingAttempted && !embeddingWritten) {
+                if (embeddingFailure instanceof Error) {
+                    throw embeddingFailure;
+                }
                 throw new Error(
                     `Embedding not persisted for ${contentItemId} — refusing to mark READY`,
                 );
@@ -381,7 +391,10 @@ export const aiWorker = createWorker({
             // (still PROCESSING) keep the FAILED transition so genuine failures
             // stay visible.
             const isRepairJob = job.name?.startsWith('reconcile-embed') ?? false;
-            if (!isRepairJob) {
+            const maxAttempts = job.opts.attempts ?? 1;
+            const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
+            const shouldPersistFailure = !isRetryableEnrichmentError(error) || isFinalAttempt;
+            if (!isRepairJob && shouldPersistFailure) {
                 try {
                     await cmsClient.updateStatus(
                         contentItemId,

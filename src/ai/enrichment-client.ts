@@ -56,6 +56,30 @@ export interface EmbedResult {
     };
 }
 
+interface EnrichmentErrorPayload {
+    error?: string;
+    error_code?: string;
+    retryable?: boolean;
+    retry_after_seconds?: number;
+}
+
+export class EnrichmentRequestError extends Error {
+    constructor(
+        message: string,
+        readonly status: number,
+        readonly retryable: boolean,
+        readonly retryAfterSeconds?: number,
+        readonly errorCode?: string,
+    ) {
+        super(message);
+        this.name = 'EnrichmentRequestError';
+    }
+}
+
+export function isRetryableEnrichmentError(error: unknown): boolean {
+    return error instanceof EnrichmentRequestError && error.retryable;
+}
+
 export interface ChapterWindowPayload {
     index: number;
     start_sec: number;
@@ -153,8 +177,22 @@ export async function generateEmbeddingViaEnrichment(
 
     if (!response.ok) {
         const errorText = await response.text().catch(() => '');
-        throw new Error(
-            `Enrichment /v1/embed failed: ${response.status} ${response.statusText} - ${errorText}`,
+        let payload: EnrichmentErrorPayload = {};
+        try {
+            payload = JSON.parse(errorText) as EnrichmentErrorPayload;
+        } catch {
+            // Preserve the raw response below when upstream did not return JSON.
+        }
+        const retryable = payload.retryable === true || response.status === 429 || response.status >= 500;
+        const retryAfterHeader = Number(response.headers?.get?.('retry-after'));
+        const retryAfterSeconds = payload.retry_after_seconds
+            ?? (Number.isFinite(retryAfterHeader) && retryAfterHeader > 0 ? retryAfterHeader : undefined);
+        throw new EnrichmentRequestError(
+            `Enrichment /v1/embed failed: ${response.status} ${response.statusText} - ${payload.error ?? errorText}`,
+            response.status,
+            retryable,
+            retryAfterSeconds,
+            payload.error_code,
         );
     }
 
