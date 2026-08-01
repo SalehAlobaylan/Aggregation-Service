@@ -22,6 +22,7 @@ async function createWorkers(): Promise<Worker[]> {
         { discoverySweepWorker },
         { sourceGraphWorker },
         { newsCirculationWorker },
+        { mediaCirculationWorker },
     ] = await Promise.all([
         import('./fetch.worker.js'),
         import('./normalize.worker.js'),
@@ -36,6 +37,7 @@ async function createWorkers(): Promise<Worker[]> {
         import('./discovery-sweep.worker.js'),
         import('./source-graph.worker.js'),
         import('./news-circulation.worker.js'),
+        import('./media-circulation.worker.js'),
     ]);
 
     return [
@@ -52,6 +54,7 @@ async function createWorkers(): Promise<Worker[]> {
         discoverySweepWorker,
         sourceGraphWorker,
         newsCirculationWorker,
+        mediaCirculationWorker,
     ];
 }
 
@@ -101,6 +104,11 @@ export async function startWorkers(): Promise<void> {
         // Schedule News Circulation source claims (interval from CMS policy).
         syncNewsCirculationSweeper().catch(err => {
             logger.error('Failed to sync news circulation sweeper', err);
+        });
+        // Schedule CMS-governed Pods source claims. Due checks and limits stay
+        // in CMS; Aggregation only executes accepted handoffs.
+        syncMediaCirculationSweeper().catch(err => {
+            logger.error('Failed to sync media circulation sweeper', err);
         });
 
         const [
@@ -173,6 +181,11 @@ export async function syncSourceGraphSweeper(): Promise<void> {
 export async function syncNewsCirculationSweeper(): Promise<void> {
     const mod = await import('./news-circulation.worker.js');
     return mod.syncNewsCirculationSweeper();
+}
+
+export async function syncMediaCirculationSweeper(): Promise<void> {
+    const mod = await import('./media-circulation.worker.js');
+    return mod.syncMediaCirculationSweeper();
 }
 
 export { createWorker } from './base-worker.js';

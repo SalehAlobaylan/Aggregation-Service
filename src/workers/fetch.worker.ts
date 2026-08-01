@@ -12,10 +12,10 @@ import { cmsClient } from '../cms/client.js';
 export const fetchWorker = createWorker({
     queueName: QUEUE_NAMES.FETCH,
     processor: async (job: Job<FetchJob>, jobLogger, signal): Promise<void> => {
-        const { sourceId, sourceType, config, triggeredBy, triggeredAt } = job.data;
+        const { sourceId, sourceType, config, triggeredBy, triggeredAt, sourceRunRequestId, tenantId: jobTenantId, operatorPlanId, operatorStepId, idempotencyKey } = job.data;
         const startedAt = new Date();
         const sourceSettings = (config.settings as Record<string, unknown>) || {};
-        const tenantId = tenantFromSourceSettings(sourceSettings);
+        const tenantId = jobTenantId || tenantFromSourceSettings(sourceSettings);
 
         const configuredMaxResults = getPositiveInteger(
             sourceSettings.max_results,
@@ -47,14 +47,14 @@ export const fetchWorker = createWorker({
         try {
             result = await fetchFromSource(sourceConfig, config.cursor as string | undefined, signal);
 		} catch (error) {
-			await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, 0, 1, {
+			await reportFetchRun(tenantId, sourceId, sourceRunRequestId, job.id, triggeredBy, startedAt, 0, 1, {
 				sourceType,
 				recovery: sourceSettings.recovery,
 				error: error instanceof Error ? error.message : String(error),
 			}, signal);
             throw error;
         }
-		await reportFetchRun(tenantId, sourceId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
+		await reportFetchRun(tenantId, sourceId, sourceRunRequestId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
 			sourceType,
 			recovery: sourceSettings.recovery,
 			reason: result.metadata.reason,
@@ -124,6 +124,11 @@ export const fetchWorker = createWorker({
                         fetchJobId: job.id,
                         triggeredBy,
                         sourceSettings: sourceConfig.settings,
+						sourceRunRequestId,
+						tenantId,
+						operatorPlanId,
+						operatorStepId,
+						idempotencyKey,
                     },
                     {
                         priority: 2,
@@ -204,6 +209,7 @@ function tenantFromSourceSettings(settings: Record<string, unknown>): string {
 async function reportFetchRun(
     tenantId: string,
     sourceId: string,
+	sourceRunRequestId: string | undefined,
     jobId: string | undefined,
     triggeredBy: 'schedule' | 'manual',
     startedAt: Date,
@@ -218,6 +224,7 @@ async function reportFetchRun(
         await cmsClient.reportSourceRun({
             tenant_id: tenantId,
             source_id: sourceId,
+			source_run_request_id: sourceRunRequestId,
             job_id: jobId,
             triggered_by: triggeredBy,
             fetched,
@@ -225,7 +232,7 @@ async function reportFetchRun(
             started_at: startedAt.toISOString(),
             finished_at: finishedAt.toISOString(),
             duration_ms: finishedAt.getTime() - startedAt.getTime(),
-            metadata,
+			metadata: { ...metadata, stage: 'fetch' },
         }, jobId, signal);
     } catch {
         // Telemetry must never fail ingestion.

@@ -21,6 +21,7 @@ const SOURCE_CACHE_TTL = 300; // 5 minutes
 export async function upsertContentItem(
   item: NormalizedItem,
   requestId?: string,
+	lineage?: { tenantId: string; contentSourceId: string; sourceRunRequestId?: string; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string },
 ): Promise<{ contentItemId: string; created: boolean; retired: boolean }> {
   const redis = getRedisConnection();
   const cacheKey = `${SOURCE_CACHE_PREFIX}${item.idempotencyKey}`;
@@ -48,6 +49,9 @@ export async function upsertContentItem(
     author: item.author,
     source_name: item.sourceName,
     source_feed_url: item.sourceFeedUrl,
+		tenant_id: lineage?.tenantId,
+		content_source_id: lineage?.contentSourceId,
+		source_run_request_id: lineage?.sourceRunRequestId,
     media_url: item.mediaUrl,
     thumbnail_url: item.thumbnailUrl,
     original_url: item.originalUrl,

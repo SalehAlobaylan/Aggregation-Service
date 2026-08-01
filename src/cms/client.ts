@@ -40,6 +40,7 @@ import type {
     ListMissingEmbeddingResponse,
     NewsCirculationPolicy,
     ClaimCirculationSourcesResponse,
+    ClaimMediaCirculationSourcesResponse,
     ReportSourceRunRequest,
     AtomizationInputResponse,
     AtomizationChapter,
@@ -336,9 +337,26 @@ export const cmsClient = {
         );
     },
 
+    async claimMediaCirculationSources(
+        tenantId = 'default',
+        limit = 0,
+        requestId?: string,
+    ): Promise<ClaimMediaCirculationSourcesResponse> {
+        return makeProtectedRequest(
+            'POST',
+            `/circulation/claim-sources?lane=media&tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}`,
+            {},
+            requestId,
+        );
+    },
+
     async reportSourceRun(data: ReportSourceRunRequest, requestId?: string, parentSignal?: AbortSignal): Promise<void> {
         await makeProtectedRequest('POST', '/circulation/source-runs', data, requestId, parentSignal);
     },
+
+	async acceptSourceRunRequest(sourceRunRequestId: string, jobId: string, requestId?: string): Promise<void> {
+		await makeProtectedRequest('POST', `/source-run-requests/${encodeURIComponent(sourceRunRequestId)}/accepted`, { job_id: jobId }, requestId);
+	},
 
     /**
      * Update an existing content item

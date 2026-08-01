@@ -108,6 +108,9 @@ export interface CreateContentItemRequest {
   author?: string | null;
   source_name: string;
   source_feed_url?: string | null;
+	tenant_id?: string;
+	content_source_id?: string;
+	source_run_request_id?: string;
   original_url: string;
 
   media_url?: string | null;
@@ -799,6 +802,7 @@ export interface CirculationSourceClaim {
   url: string;
   fetch_interval_minutes: number;
   settings?: Record<string, unknown>;
+	source_run_request_id?: string;
 }
 
 export interface ClaimCirculationSourcesResponse {
@@ -806,9 +810,24 @@ export interface ClaimCirculationSourcesResponse {
   policy: NewsCirculationPolicy;
 }
 
+export interface MediaCirculationClaimPolicy {
+  tenant_id: string;
+  enabled: boolean;
+  source_min_interval_minutes: number;
+  source_max_interval_minutes: number;
+  max_intake_per_source_per_cycle: number;
+  max_intake_per_cycle: number;
+}
+
+export interface ClaimMediaCirculationSourcesResponse {
+  data: CirculationSourceClaim[];
+  policy: MediaCirculationClaimPolicy;
+}
+
 export interface ReportSourceRunRequest {
   tenant_id?: string;
   source_id: string;
+	source_run_request_id?: string;
   job_id: string;
   triggered_by: "schedule" | "manual";
   fetched?: number;

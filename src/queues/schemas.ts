@@ -33,6 +33,13 @@ export interface FetchJob {
     config: Record<string, unknown>;
     triggeredBy: 'schedule' | 'manual';
     triggeredAt: string;
+	/** CMS-owned source-run handoff UUID; absent for legacy/scheduled work. */
+	sourceRunRequestId?: string;
+	/** Authoritative CMS tenant propagated from the trigger, never inferred from a name. */
+	tenantId?: string;
+	operatorPlanId?: string;
+	operatorStepId?: string;
+	idempotencyKey?: string;
 }
 
 /**
@@ -45,6 +52,11 @@ export interface NormalizeJob {
     fetchJobId: string;
     triggeredBy?: 'schedule' | 'manual';
     sourceSettings?: Record<string, unknown>;
+	sourceRunRequestId?: string;
+	tenantId?: string;
+	operatorPlanId?: string;
+	operatorStepId?: string;
+	idempotencyKey?: string;
 }
 
 export interface RawItem {
@@ -225,6 +237,13 @@ export interface NewsCirculationJob {
     };
 }
 
+// Media Circulation Job — claims due, active Pods sources from CMS. CMS owns
+// cadence, selection, per-source result caps, and durable run lineage.
+export interface MediaCirculationJob {
+    trigger: 'auto' | 'manual';
+    tenantId?: string;
+}
+
 /**
  * DLQ Job - failed job moved to dead letter queue
  */
@@ -255,6 +274,7 @@ export const QUEUE_NAMES = {
     DISCOVERY_SWEEP: 'discovery-sweep-queue',
     SOURCE_GRAPH: 'source-graph-queue',
     NEWS_CIRCULATION: 'news-circulation-queue',
+    MEDIA_CIRCULATION: 'media-circulation-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 

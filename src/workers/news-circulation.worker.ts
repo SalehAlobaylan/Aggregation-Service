@@ -58,10 +58,15 @@ export const newsCirculationWorker = createWorker({
                 },
                 triggeredBy: job.data.trigger === 'manual' ? 'manual' : 'schedule',
                 triggeredAt: new Date().toISOString(),
+				sourceRunRequestId: source.source_run_request_id,
+				tenantId,
             };
-            await fetchQueue.add(`circulation-${source.type}-${source.id}-${Date.now()}`, fetchJob, {
+			const fetchJobRecord = await fetchQueue.add(`circulation-${source.type}-${source.id}-${Date.now()}`, fetchJob, {
                 priority: job.data.trigger === 'manual' ? 1 : 3,
             });
+			if (source.source_run_request_id && fetchJobRecord.id) {
+				await cmsClient.acceptSourceRunRequest(source.source_run_request_id, String(fetchJobRecord.id), job.id);
+			}
             enqueued++;
         }
 

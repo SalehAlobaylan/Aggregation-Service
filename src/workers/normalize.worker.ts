@@ -167,8 +167,8 @@ function evaluateModerationDecision(
 export const normalizeWorker = createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
-        const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings } = job.data;
-        const tenantId = tenantFromSourceSettings(sourceSettings);
+        const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings, sourceRunRequestId, tenantId: jobTenantId, operatorPlanId, operatorStepId, idempotencyKey } = job.data;
+        const tenantId = jobTenantId || tenantFromSourceSettings(sourceSettings);
         const sourceFilters = parseSourceFilters(sourceSettings);
         const moderationConfig = parseModerationConfig(sourceSettings);
 
@@ -266,7 +266,9 @@ export const normalizeWorker = createWorker({
                 }
 
                 // Upsert to CMS
-                const { contentItemId, created, retired } = await upsertContentItem(normalized, job.id);
+				const { contentItemId, created, retired } = await upsertContentItem(normalized, job.id, {
+					tenantId, contentSourceId: sourceId, sourceRunRequestId, operatorPlanId, operatorStepId, idempotencyKey,
+				});
 				if (retired) {
 					duplicates++;
 					jobLogger.info('Skipping downstream work for retained News identity', { idempotencyKey: normalized.idempotencyKey });
@@ -414,7 +416,7 @@ export const normalizeWorker = createWorker({
             mediaEnqueued,
             aiEnqueued,
         });
-        await reportNormalizeRun(tenantId, sourceId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
+        await reportNormalizeRun(tenantId, sourceId, sourceRunRequestId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
             sourceType,
             moderationApproved,
             moderationReview,
@@ -439,6 +441,7 @@ function tenantFromSourceSettings(settings?: Record<string, unknown>): string {
 async function reportNormalizeRun(
     tenantId: string,
     sourceId: string,
+	sourceRunRequestId: string | undefined,
     fetchJobId: string,
     triggeredBy: 'schedule' | 'manual',
     accepted: number,
@@ -452,6 +455,7 @@ async function reportNormalizeRun(
         await cmsClient.reportSourceRun({
             tenant_id: tenantId,
             source_id: sourceId,
+			source_run_request_id: sourceRunRequestId,
             job_id: fetchJobId,
             triggered_by: triggeredBy,
             accepted,
@@ -459,7 +463,7 @@ async function reportNormalizeRun(
             filtered,
             failed,
             finished_at: new Date().toISOString(),
-            metadata,
+			metadata: { ...metadata, stage: 'normalize' },
         }, fetchJobId);
     } catch {
         // Telemetry should never fail normalization.

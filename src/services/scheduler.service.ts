@@ -111,7 +111,7 @@ export async function unscheduleSource(sourceId: string, sourceType: SourceType)
 /**
  * Trigger an immediate poll for a source
  */
-export async function triggerPoll(config: SourceConfig): Promise<string | undefined> {
+export async function triggerPoll(config: SourceConfig, lineage?: { sourceRunRequestId?: string; tenantId?: string; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string }): Promise<string | undefined> {
     const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
     if (!fetchQueue) {
         logger.error('Fetch queue not initialized');
@@ -132,9 +132,18 @@ export async function triggerPoll(config: SourceConfig): Promise<string | undefi
             },
             triggeredBy: 'manual',
             triggeredAt: new Date().toISOString(),
+			sourceRunRequestId: lineage?.sourceRunRequestId,
+			tenantId: lineage?.tenantId,
+			operatorPlanId: lineage?.operatorPlanId,
+			operatorStepId: lineage?.operatorStepId,
+			idempotencyKey: lineage?.idempotencyKey,
         },
         {
             priority: 1, // High priority for manual triggers
+			// A registered Operator action is a one-step plan. Replays of the
+			// exact handoff therefore share one BullMQ job rather than enqueueing
+			// another source fetch. Legacy manual runs retain their current shape.
+			...(lineage?.idempotencyKey ? { jobId: lineage.idempotencyKey } : {}),
         }
     );
 
