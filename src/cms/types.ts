@@ -190,6 +190,9 @@ export interface UpdateArtifactsRequest {
   // Download-time signals merged into content_item.metadata jsonb (heatmap,
   // sponsor_segments, categories). Merged server-side — existing keys preserved.
   metadata?: Record<string, unknown>;
+  // CMS-issued item-version fence for an exact Pipeline repair. Normal
+  // ingestion must not synthesize this value.
+  expected_item_updated_at?: string;
 }
 
 export interface MediaRendition {

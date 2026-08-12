@@ -7,17 +7,18 @@
  * evidence or decides which source is eligible.
  */
 import { Job, Queue } from 'bullmq';
-import { getQueue, QUEUE_NAMES, type FetchJob, type MediaCirculationJob } from '../queues/index.js';
+import { getQueue, QUEUE_NAMES, type MediaCirculationJob } from '../queues/index.js';
 import { createWorker } from './base-worker.js';
-import { cmsClient } from '../cms/client.js';
 import { logger } from '../observability/logger.js';
 
 const REPEATABLE_NAME = 'media-circulation-repeatable';
-const DEFAULT_CLAIM_INTERVAL_MINUTES = 15;
 
 export const mediaCirculationWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA_CIRCULATION,
-    processor: async (job: Job<MediaCirculationJob>, jobLogger): Promise<void> => {
+	processor: async (job: Job<MediaCirculationJob>, jobLogger): Promise<void> => {
+		jobLogger.info('Legacy media circulation work rejected; CMS source-run admission owns all source work', { trigger: job.data.trigger });
+		return;
+		/* legacy read-compatible implementation retained below for contract history
         const tenantId = job.data.tenantId || 'default';
         const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
         if (!fetchQueue) {
@@ -56,12 +57,13 @@ export const mediaCirculationWorker = createWorker({
             enqueued++;
         }
 
-        jobLogger.info('Media circulation claimed sources', {
+		jobLogger.info('Media circulation claimed sources', {
             tenantId,
             claimed: claimed.data?.length ?? 0,
             enqueued,
-        });
-    },
+		});
+		*/
+	},
 });
 
 export async function syncMediaCirculationSweeper(): Promise<void> {
@@ -77,12 +79,5 @@ export async function syncMediaCirculationSweeper(): Promise<void> {
             .map((entry) => queue.removeRepeatableByKey(entry.key).catch(() => undefined)),
     );
 
-    await queue.add(
-        REPEATABLE_NAME,
-        { trigger: 'auto', tenantId: 'default' } satisfies MediaCirculationJob,
-        // This is a claim cadence, not a provider cadence. CMS enforces each
-        // source's effective interval transactionally before it returns work.
-        { repeat: { every: DEFAULT_CLAIM_INTERVAL_MINUTES * 60_000 }, jobId: REPEATABLE_NAME },
-    );
-    logger.info('media circulation: registered repeatable source claim', { intervalMinutes: DEFAULT_CLAIM_INTERVAL_MINUTES });
+	logger.info('media circulation: retired legacy repeatable in favor of CMS source-run dispatch');
 }

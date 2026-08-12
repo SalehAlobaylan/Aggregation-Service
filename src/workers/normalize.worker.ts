@@ -12,6 +12,9 @@ import { cmsClient } from '../cms/client.js';
 import { getQueue } from '../queues/index.js';
 import type { RawFetchedItem } from '../fetchers/types.js';
 import type { NormalizedItem } from '../normalizers/types.js';
+import { sourceRunExecutionEnvelopeSchema } from '../contracts/source-runs.js';
+import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
+import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 
 interface SourceFilters {
     include_keywords?: string[];
@@ -168,6 +171,19 @@ export const normalizeWorker = createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings, sourceRunRequestId, tenantId: jobTenantId, operatorPlanId, operatorStepId, idempotencyKey } = job.data;
+		const durableEnvelope = job.data.sourceRun ? sourceRunExecutionEnvelopeSchema.parse(job.data.sourceRun) : undefined;
+		const heartbeat = durableEnvelope ? startSourceRunLeaseHeartbeat(durableEnvelope, { requestId: job.id }) : undefined;
+		try {
+		if (durableEnvelope) {
+			if (sourceId !== durableEnvelope.contentSourceId || jobTenantId !== durableEnvelope.tenantId || sourceRunRequestId !== durableEnvelope.sourceRunRequestId || !job.data.sourceRunPageId || !job.data.sourceRunBatchId) {
+				throw new Error('CMS source-run normalize payload does not match its fenced envelope');
+			}
+			// The fenced begin CAS occurs before the first CMS upsert or downstream
+			// handoff. A crash after this point is verification work, never a
+			// blind replay of a batch with an uncertain consumer-visible effect.
+			await cmsClient.beginSourceRunUnit({ tenantId: durableEnvelope.tenantId, requestId: durableEnvelope.sourceRunRequestId, attemptId: durableEnvelope.sourceRunAttemptId, unitId: durableEnvelope.executionUnitId, unitJobId: durableEnvelope.unitJobId, attemptFenceToken: durableEnvelope.attemptFenceToken, executionLeaseToken: durableEnvelope.executionLeaseToken }, job.id);
+			await enqueueSourceRunReceipt(buildSourceRunReceipt({ envelope: durableEnvelope, stage: 'normalize', eventType: 'normalize_scheduled', outcome: 'no_change', sequence: 0, pageId: job.data.sourceRunPageId, batchId: job.data.sourceRunBatchId, payload: { item_count: rawItems?.length || 0 } }));
+		}
         const tenantId = jobTenantId || tenantFromSourceSettings(sourceSettings);
         const sourceFilters = parseSourceFilters(sourceSettings);
         const moderationConfig = parseModerationConfig(sourceSettings);
@@ -181,6 +197,10 @@ export const normalizeWorker = createWorker({
 
         let processed = 0;
         let duplicates = 0;
+		// This is the exact count of CMS rows that received this fenced
+		// execution-unit attribution. It intentionally includes repaired
+		// duplicates, unlike `processed`, which counts only newly created rows.
+		let cmsUpserted = 0;
         let filtered = 0;
         let failed = 0;
         let moderationApproved = 0;
@@ -191,12 +211,14 @@ export const normalizeWorker = createWorker({
 
         for (const rawItem of rawItems || []) {
             try {
+				heartbeat?.assertCurrent();
                 // Cast raw data back to RawFetchedItem
                 const item = rawItem.rawData as unknown as RawFetchedItem;
 
                 // Normalize the item
                 const normalized = normalizeItem(item);
                 if (!normalized) {
+					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'normalization_unsupported');
                     failed++;
                     continue;
                 }
@@ -207,6 +229,7 @@ export const normalizeWorker = createWorker({
 
                 const filterDecision = shouldSkipByFilters(normalized, item, sourceFilters);
                 if (filterDecision.skip) {
+					await recordObservationDisposition(job, rawItem, 'filtered', undefined, filterDecision.reason as 'include_keywords' | 'exclude_keywords' | 'min_engagement');
                     filtered++;
                     jobLogger.debug('Skipping item due to source filters', {
                         sourceId,
@@ -229,7 +252,11 @@ export const normalizeWorker = createWorker({
 						source_url: normalized.originalUrl || undefined,
 					}]);
 					const verdict = precheck.candidates[0];
-					if (verdict?.verdict === 'exact_identity') { duplicates++; continue; }
+					if (verdict?.verdict === 'exact_identity') {
+						await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'exact_duplicate');
+						duplicates++;
+						continue;
+					}
 					if (verdict?.verdict === 'likely_duplicate') {
 						normalized.metadata = { ...normalized.metadata, redundancyHint: verdict };
 					}
@@ -252,6 +279,18 @@ export const normalizeWorker = createWorker({
                 } else {
                     moderationApproved++;
                 }
+				if (durableEnvelope) {
+					// Consumer-side attribution is persisted with the CMS upsert so a
+					// later verifier can observe this exact batch without trusting a
+					// worker counter or queue acknowledgement.
+					normalized.metadata = {
+						...normalized.metadata,
+						source_run_execution_unit_id: durableEnvelope.executionUnitId,
+						source_run_attempt_id: durableEnvelope.sourceRunAttemptId,
+						source_run_page_id: job.data.sourceRunPageId,
+						source_run_batch_id: job.data.sourceRunBatchId,
+					};
+				}
 
                 // The cache only avoids duplicate source work. Never let it
                 // suppress the deterministic downstream handoff: a prior
@@ -269,6 +308,12 @@ export const normalizeWorker = createWorker({
 				const { contentItemId, created, retired } = await upsertContentItem(normalized, job.id, {
 					tenantId, contentSourceId: sourceId, sourceRunRequestId, operatorPlanId, operatorStepId, idempotencyKey,
 				});
+				if (contentItemId) cmsUpserted++;
+				if (moderation.decision === 'auto_rejected') {
+					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'moderation_rejected');
+				} else if (contentItemId) {
+					await recordObservationDisposition(job, rawItem, 'materialized', contentItemId);
+				}
 				if (retired) {
 					duplicates++;
 					jobLogger.info('Skipping downstream work for retained News identity', { idempotencyKey: normalized.idempotencyKey });
@@ -408,6 +453,7 @@ export const normalizeWorker = createWorker({
             sourceType,
             processed,
             duplicates,
+			cmsUpserted,
             filtered,
             failed,
             moderationApproved,
@@ -416,6 +462,20 @@ export const normalizeWorker = createWorker({
             mediaEnqueued,
             aiEnqueued,
         });
+		if (durableEnvelope) {
+			// A partial batch is terminally failed at the unit level so the CMS
+			// reducer can expose a truthful request-level partial outcome when
+			// sibling batches succeeded. The receipts retain exact counts.
+			if (!heartbeat) throw new Error('source-run heartbeat was not initialized');
+			heartbeat.assertCurrent();
+			await enqueueSourceRunReceipt(buildSourceRunReceipt({
+				envelope: durableEnvelope, stage: 'normalize', eventType: 'normalize_terminal',
+				outcome: failed > 0 ? 'provider_failed' : processed > 0 ? 'new_items' : 'no_change', sequence: 1,
+				pageId: job.data.sourceRunPageId, batchId: job.data.sourceRunBatchId,
+				payload: { processed, duplicates, cms_upserted: cmsUpserted, filtered, failed, moderation_approved: moderationApproved, moderation_review: moderationReview, moderation_rejected: moderationRejected, media_enqueued: mediaEnqueued, ai_enqueued: aiEnqueued },
+			}));
+			return;
+		}
         await reportNormalizeRun(tenantId, sourceId, sourceRunRequestId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
             sourceType,
             moderationApproved,
@@ -424,8 +484,27 @@ export const normalizeWorker = createWorker({
             mediaEnqueued,
             aiEnqueued,
         });
+		} finally {
+			heartbeat?.stop();
+		}
     },
 });
+
+async function recordObservationDisposition(
+	job: Job<NormalizeJob>, rawItem: { upstreamObservationId?: string }, disposition: 'materialized' | 'filtered',
+	contentItemId?: string,
+	filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate',
+): Promise<void> {
+	if (!rawItem.upstreamObservationId || !job.data.sourceRun) return;
+	const envelope = sourceRunExecutionEnvelopeSchema.parse(job.data.sourceRun);
+	await cmsClient.recordSourceRunUpstreamObservationDisposition({
+		tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId,
+		attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId,
+		unitJobId: envelope.unitJobId, attemptFenceToken: envelope.attemptFenceToken,
+		executionLeaseToken: envelope.executionLeaseToken, observationId: rawItem.upstreamObservationId,
+		disposition, contentItemId, filterClass,
+	}, job.id);
+}
 
 function tenantFromSourceSettings(settings?: Record<string, unknown>): string {
     const circulation = settings?.circulation;

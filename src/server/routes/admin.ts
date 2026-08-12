@@ -4,11 +4,10 @@
 import { FastifyInstance } from 'fastify';
 import { scheduler } from '../../services/scheduler.service.js';
 import { getQueue, QUEUE_NAMES } from '../../queues/index.js';
-import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
 import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
-import type { SourceType, ContentType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob, NewsCirculationJob, AtomizationSweepJob, AtomizationJob, AIJob } from '../../queues/schemas.js';
+import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob } from '../../queues/schemas.js';
 import { verifyAdminAuth, verifyAdminOrCMSAutomation } from '../plugins/admin-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
@@ -16,7 +15,6 @@ import { resolveYoutubeChannel } from '../../fetchers/youtube.fetcher.js';
 import { normalizeBatch } from '../../normalizers/index.js';
 import { cmsClient } from '../../cms/client.js';
 import {
-    getAllWorkers,
     syncDiscoverySweeper,
     syncNewsCirculationSweeper,
     syncRepeatableSweepers,
@@ -303,48 +301,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      * POST /admin/trigger
      */
     fastify.post<{ Body: TriggerBody; Reply: TriggerResponse }>(
-        '/admin/trigger',
-        { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { sourceType, url, name, settings, sourceId, sourceRunRequestId, tenantId, operatorPlanId, operatorStepId, idempotencyKey } = request.body;
-
-            if (!sourceType || !url) {
-                return reply.status(400).send({
-                    success: false,
-                    message: 'sourceType and url are required',
-                });
-            }
-
-            const isUuid = typeof sourceId === 'string'
-                && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sourceId);
-
-            try {
-				const jobId = await scheduler.triggerPoll({
-                    id: isUuid ? sourceId : `manual-${Date.now()}`,
-                    type: sourceType,
-                    name: name || url,
-                    url,
-                    enabled: true,
-                    pollIntervalMs: 0,
-                    settings: settings || {},
-				}, { sourceRunRequestId, tenantId, operatorPlanId, operatorStepId, idempotencyKey });
-
-                logger.info('Admin triggered poll', { sourceType, url, jobId });
-
-                return reply.send({
-                    success: true,
-                    jobId,
-                    message: `Poll triggered for ${sourceType} source`,
-                });
-            } catch (error) {
-                logger.error('Admin trigger failed', error);
-                return reply.status(500).send({
-                    success: false,
-                    message: error instanceof Error ? error.message : 'Unknown error',
-                });
-            }
-        }
-    );
+		'/admin/trigger', { preHandler: verifyAdminAuth }, async (_request, reply) =>
+			reply.status(410).send({ success: false, message: 'Legacy source admission is disabled; create a CMS durable source-run request.' }),
+	);
 
     /**
      * Re-sync the scheduled discovery sweep from CMS config (proxied by CMS when
@@ -382,10 +341,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      * Manually claim due news sources now. POST /admin/circulation/sweep-now
      */
     fastify.post('/admin/circulation/sweep-now', { preHandler: verifyAdminAuth }, async (_request, reply) => {
-        const q = getQueue(QUEUE_NAMES.NEWS_CIRCULATION);
-        if (!q) return reply.status(503).send({ success: false, message: 'news circulation queue unavailable' });
-        const job = await q.add('manual-news-circulation', { trigger: 'manual', tenantId: 'default' } satisfies NewsCirculationJob, { priority: 1 });
-        return reply.send({ success: true, jobId: job.id ?? undefined, message: 'News circulation source claim queued' });
+		return reply.status(410).send({ success: false, message: 'Legacy circulation admission is disabled; use CMS durable source-run admission.' });
     });
 
     /**
@@ -410,90 +366,15 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Source graph build queued' });
     });
 
-    /**
-     * Manually enqueue transcript-ready media parents for atomization.
-     * POST /admin/atomization/sweep-now
-     */
-    fastify.post('/admin/atomization/sweep-now', { preHandler: verifyAdminOrCMSAutomation }, async (_request, reply) => {
-        const q = getQueue(QUEUE_NAMES.ATOMIZATION_SWEEP);
-        if (!q) return reply.status(503).send({ success: false, message: 'atomization sweep queue unavailable' });
-        const job = await q.add('manual-atomization-sweep', { trigger: 'manual', tenantId: 'default' } satisfies AtomizationSweepJob, { priority: 1 });
-        return reply.send({ success: true, jobId: job.id ?? undefined, message: 'Atomization candidate sweep queued' });
-    });
+    // Legacy sweeps were global and default-tenant scoped. Atomization now
+    // receives only an exact CMS-created, fenced parent-work claim.
+    fastify.post('/admin/atomization/sweep-now', { preHandler: verifyAdminOrCMSAutomation }, async (_request, reply) =>
+        reply.status(410).send({ success: false, message: 'Legacy atomization sweep is disabled; use a CMS-approved exact-parent action.' })
+    );
 
-    fastify.post<{
-        Params: { id: string };
-        Body: {
-            contentItemId?: string;
-            reason?: 'manual' | 'reatomize';
-            hasTranscript?: boolean;
-            contentType?: string;
-            mediaUrl?: string;
-            thumbnailUrl?: string;
-            title?: string | null;
-            excerpt?: string | null;
-            bodyText?: string | null;
-        };
-    }>('/admin/atomization/parents/:id/atomize', { preHandler: verifyAdminAuth }, async (request, reply) => {
-        const contentItemId = request.body?.contentItemId || request.params.id;
-        const reason = request.body?.reason === 'reatomize' ? 'reatomize' : 'manual';
-        if (!contentItemId) {
-            return reply.status(400).send({ success: false, message: 'contentItemId is required' });
-        }
-
-        if (!request.body?.hasTranscript) {
-            const aiQueue = getQueue(QUEUE_NAMES.AI);
-            if (!aiQueue) return reply.status(503).send({ success: false, message: 'AI queue unavailable for transcript request' });
-            if (!request.body?.mediaUrl) return reply.status(400).send({ success: false, message: 'mediaUrl is required when transcript is missing' });
-            const jobId = `atomization-transcript-${contentItemId}`;
-            const existing = await aiQueue.getJob(jobId);
-            if (existing) {
-                const state = await existing.getState();
-                if (state === 'failed' || state === 'completed') {
-                    await existing.remove();
-                } else {
-                    return reply.send({ success: true, jobId, message: 'Transcript request already queued' });
-                }
-            }
-            await aiQueue.add(
-                `atomization-transcript-${contentItemId}`,
-                {
-                    contentItemId,
-                    contentType: (request.body.contentType || 'PODCAST') as ContentType,
-                    operations: ['transcript'],
-                    textContent: {
-                        title: request.body.title ?? '',
-                        excerpt: request.body.excerpt ?? undefined,
-                        bodyText: request.body.bodyText ?? undefined,
-                    },
-                    mediaUrl: request.body.mediaUrl,
-                    heroImageUrl: request.body.thumbnailUrl ?? undefined,
-                    forceStt: true,
-                } satisfies AIJob,
-                { priority: 1, jobId, removeOnComplete: { age: 3600, count: 200 }, removeOnFail: { age: 86400 } }
-            );
-            return reply.send({ success: true, jobId, message: 'Transcript request queued before atomization' });
-        }
-
-        const atomizationQueue = getQueue(QUEUE_NAMES.ATOMIZATION);
-        if (!atomizationQueue) return reply.status(503).send({ success: false, message: 'atomization queue unavailable' });
-        const jobId = `${reason === 'reatomize' ? 'reatomize' : 'atomize'}-${contentItemId}`;
-        const existing = await atomizationQueue.getJob(jobId);
-        if (existing) {
-            const state = await existing.getState();
-            if (state === 'failed' || state === 'completed') {
-                await existing.remove();
-            } else {
-                return reply.send({ success: true, jobId, message: 'Atomization already queued' });
-            }
-        }
-        const job = await atomizationQueue.add(
-            jobId,
-            { contentItemId, reason } satisfies AtomizationJob,
-            { priority: 1, jobId, removeOnComplete: { age: 3600, count: 200 }, removeOnFail: { age: 86400 } }
-        );
-        return reply.send({ success: true, jobId: job.id ?? jobId, message: reason === 'reatomize' ? 'Re-atomization queued' : 'Atomization queued' });
-    });
+    fastify.post('/admin/atomization/parents/:id/atomize', { preHandler: verifyAdminAuth }, async (_request, reply) =>
+        reply.status(410).send({ success: false, message: 'Direct atomization is disabled; use a CMS-approved exact-parent action.' })
+    );
 
     /**
      * Trigger a one-off source-discovery sweep for a profile (proxied from CMS).
@@ -589,111 +470,27 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
      * POST /admin/trigger/rss
      */
     fastify.post<{ Body: { feedUrl: string; name?: string }; Reply: TriggerResponse }>(
-        '/admin/trigger/rss',
-        { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { feedUrl, name } = request.body;
-
-            if (!feedUrl) {
-                return reply.status(400).send({
-                    success: false,
-                    message: 'feedUrl is required',
-                });
-            }
-
-            const jobId = await scheduler.triggerPoll({
-                id: `rss-${Date.now()}`,
-                type: 'RSS',
-                name: name || feedUrl,
-                url: feedUrl,
-                enabled: true,
-                pollIntervalMs: 0,
-                settings: {},
-            });
-
-            return reply.send({
-                success: true,
-                jobId,
-                message: 'RSS poll triggered',
-            });
-        }
-    );
+		'/admin/trigger/rss', { preHandler: verifyAdminAuth }, async (_request, reply) =>
+			reply.status(410).send({ success: false, message: 'Legacy source admission is disabled; create a CMS durable source-run request.' }),
+	);
 
     /**
      * Trigger YouTube poll
      * POST /admin/trigger/youtube
      */
-    fastify.post<{
-        Body: { channelId?: string; playlistId?: string; name?: string };
-        Reply: TriggerResponse
-    }>(
-        '/admin/trigger/youtube',
-        { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { channelId, playlistId, name } = request.body;
-
-            if (!channelId && !playlistId) {
-                return reply.status(400).send({
-                    success: false,
-                    message: 'channelId or playlistId is required',
-                });
-            }
-
-            const jobId = await scheduler.triggerPoll({
-                id: `yt-${channelId || playlistId}-${Date.now()}`,
-                type: 'YOUTUBE',
-                name: name || channelId || playlistId || 'Unknown',
-                url: channelId || playlistId || '',
-                enabled: true,
-                pollIntervalMs: 0,
-                settings: { channelId, playlistId },
-            });
-
-            return reply.send({
-                success: true,
-                jobId,
-                message: 'YouTube poll triggered',
-            });
-        }
-    );
+    fastify.post<{ Body: { channelId?: string; playlistId?: string; name?: string }; Reply: TriggerResponse }>(
+		'/admin/trigger/youtube', { preHandler: verifyAdminAuth }, async (_request, reply) =>
+			reply.status(410).send({ success: false, message: 'Legacy source admission is disabled; create a CMS durable source-run request.' }),
+	);
 
     /**
      * Trigger Reddit poll
      * POST /admin/trigger/reddit
      */
-    fastify.post<{
-        Body: { subreddit: string; sortBy?: string; minScore?: number };
-        Reply: TriggerResponse
-    }>(
-        '/admin/trigger/reddit',
-        { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { subreddit, sortBy, minScore } = request.body;
-
-            if (!subreddit) {
-                return reply.status(400).send({
-                    success: false,
-                    message: 'subreddit is required',
-                });
-            }
-
-            const jobId = await scheduler.triggerPoll({
-                id: `reddit-${subreddit}-${Date.now()}`,
-                type: 'REDDIT',
-                name: `r/${subreddit}`,
-                url: subreddit,
-                enabled: true,
-                pollIntervalMs: 0,
-                settings: { subreddit, sortBy: sortBy || 'hot', minScore: minScore || 10 },
-            });
-
-            return reply.send({
-                success: true,
-                jobId,
-                message: 'Reddit poll triggered',
-            });
-        }
-    );
+    fastify.post<{ Body: { subreddit: string; sortBy?: string; minScore?: number }; Reply: TriggerResponse }>(
+		'/admin/trigger/reddit', { preHandler: verifyAdminAuth }, async (_request, reply) =>
+			reply.status(410).send({ success: false, message: 'Legacy source admission is disabled; create a CMS durable source-run request.' }),
+	);
 
     /**
      * Self-restart
@@ -779,92 +576,11 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         }
     );
 
-    /**
-     * Purge all jobs from a queue or all queues
-     * POST /admin/queues/purge
-     *
-     * This removes ALL jobs: waiting, delayed, failed, completed AND active.
-     * Workers are paused during the purge so in-progress jobs are killed.
-     */
-    fastify.post<{ Body: { queue?: string; states?: string[]; includeFailed?: boolean } }>(
-        '/admin/queues/purge',
-        { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { queue: queueName, states, includeFailed = true } = request.body || {};
-            const purged: Record<string, number> = {};
-
-            // If states array is provided, use it; otherwise fall back to legacy includeFailed behavior
-            const allStates = ['waiting', 'delayed', 'active', 'completed', 'failed'];
-            const statesToPurge = states && states.length > 0
-                ? states.filter(s => allStates.includes(s))
-                : [...(includeFailed ? allStates : allStates.filter(s => s !== 'failed'))];
-
-            const needsPause = statesToPurge.includes('active');
-
-            const queuesToPurge = queueName
-                ? [queueName]
-                : Object.values(QUEUE_NAMES);
-
-            let pausedWorkers: ReturnType<typeof getAllWorkers> = [];
-
-            // Pause workers only if we're killing active jobs
-            if (needsPause) {
-                pausedWorkers = getAllWorkers();
-                for (const worker of pausedWorkers) {
-                    try { await worker.pause(); } catch (_) { /* already paused */ }
-                }
-            }
-
-            try {
-                for (const qName of queuesToPurge) {
-                    const queue = getQueue(qName as any);
-                    if (!queue) continue;
-
-                    let removedCount = 0;
-
-                    if (statesToPurge.includes('failed')) {
-                        const r = await queue.clean(0, 0, 'failed');
-                        removedCount += r.length;
-                    }
-                    if (statesToPurge.includes('completed')) {
-                        const r = await queue.clean(0, 0, 'completed');
-                        removedCount += r.length;
-                    }
-                    if (statesToPurge.includes('waiting')) {
-                        const r = await queue.clean(0, 0, 'wait');
-                        removedCount += r.length;
-                        await queue.drain();
-                    }
-                    if (statesToPurge.includes('delayed')) {
-                        const r = await queue.clean(0, 0, 'delayed');
-                        removedCount += r.length;
-                    }
-                    if (statesToPurge.includes('active')) {
-                        const activeJobs = await queue.getActive();
-                        for (const job of activeJobs) {
-                            try {
-                                await job.moveToFailed(new Error('Purged by admin'), '0', true);
-                                await job.remove();
-                                removedCount++;
-                            } catch (_) { /* job may have finished */ }
-                        }
-                    }
-
-                    purged[qName] = removedCount;
-                    logger.info('Queue purged', { queue: qName, states: statesToPurge, removedCount });
-                }
-
-                return reply.send({
-                    success: true,
-                    message: `Purged ${Object.keys(purged).length} queue(s) — states: ${statesToPurge.join(', ')}`,
-                    purged,
-                });
-            } finally {
-                if (needsPause) {
-                    await Promise.allSettled(pausedWorkers.map(worker => worker.resume()));
-                }
-            }
-        }
+    // Queue purge is destructive infrastructure control and permanently
+    // manual-only. A dashboard/browser must not be able to discard durable
+    // source-run evidence or kill a fenced owner.
+    fastify.post('/admin/queues/purge', { preHandler: verifyAdminAuth }, async (_request, reply) =>
+        reply.status(410).send({ success: false, message: 'Queue purge is manual-only and unavailable through the API.' })
     );
 
     /**
@@ -1001,165 +717,18 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         }
     );
 
-    /**
-     * Requeue FAILED content items back into the media pipeline
-     * POST /admin/retry-failed
-     * Body: { ids?: string[], source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
-     *
-     * - Fetches FAILED items from CMS (filtered by source if provided)
-     * - Resets each item's status to PENDING
-     * - Enqueues a fresh media job for each item
-     * Returns the count of successfully requeued items.
-     */
+    // Retained only as explicit denial endpoints for old Console/bookmark
+    // callers. Exact stage recovery is admitted exclusively by CMS.
     fastify.post<{ Body: RetryFailedBody; Reply: RetryFailedResponse }>(
         '/admin/retry-failed',
         { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { source, ids, limit = 100 } = request.body ?? {};
-            const safeLimit = Math.max(1, Math.min(limit, 500));
-
-            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
-            if (!mediaQueue) {
-                return reply.status(503).send({
-                    success: false,
-                    message: 'Media queue is not available',
-                    requeued: 0,
-                    total: 0,
-                    errors: [],
-                });
-            }
-
-            let listResult;
-            try {
-                listResult = await cmsClient.listContentItems({
-                    status: 'FAILED',
-                    source: ids?.length ? undefined : source?.toUpperCase(),
-                    ids,
-                    limit: safeLimit,
-                });
-            } catch (err) {
-                logger.error('retry-failed: failed to list content items from CMS', err);
-                return reply.status(502).send({
-                    success: false,
-                    message: `Failed to fetch FAILED items from CMS: ${err instanceof Error ? err.message : String(err)}`,
-                    requeued: 0,
-                    total: 0,
-                    errors: [],
-                });
-            }
-
-            let requeued = 0;
-            const errors: string[] = [];
-
-            const aiQueue = getQueue(QUEUE_NAMES.AI);
-
-            for (const item of listResult.data) {
-                try {
-                    // Reset status so the item can progress again
-                    await cmsClient.updateStatus(item.id, { status: 'PENDING' });
-
-                    // Routes Telegram text posts to embedding instead of the media queue.
-                    await enqueueRetryJob(
-                        { media: mediaQueue, ai: aiQueue },
-                        item,
-                        { namePrefix: 'retry-media', priority: 3 },
-                    );
-
-                    requeued++;
-                    logger.info('retry-failed: requeued item', { contentItemId: item.id, source: item.source });
-                } catch (err) {
-                    const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
-                    errors.push(msg);
-                    logger.warn('retry-failed: failed to requeue item', { contentItemId: item.id, error: msg });
-                }
-            }
-
-            return reply.send({
-                success: true,
-                message: `Re-queued ${requeued} of ${listResult.data.length} FAILED items`,
-                requeued,
-                total: listResult.total,
-                errors,
-            });
-        }
+        async (_request, reply) => reply.status(410).send({ success: false, message: 'Legacy aggregate retry is disabled; use a CMS-approved exact-stage pipeline repair.', requeued: 0, total: 0, errors: [] })
     );
 
-    /**
-     * Enqueue media jobs for PENDING content items that were never processed.
-     * POST /admin/retry-pending
-     * Body: { ids?: string[], source?: "TELEGRAM"|"YOUTUBE"|..., limit?: number }
-     *
-     * Unlike retry-failed (which resets FAILED→PENDING), this targets items
-     * already in PENDING status whose media jobs were never enqueued or got lost.
-     */
     fastify.post<{ Body: RetryFailedBody; Reply: RetryFailedResponse }>(
         '/admin/retry-pending',
         { preHandler: verifyAdminAuth },
-        async (request, reply) => {
-            const { source, ids, limit = 200 } = request.body ?? {};
-            const safeLimit = Math.max(1, Math.min(limit, 500));
-
-            const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
-            if (!mediaQueue) {
-                return reply.status(503).send({
-                    success: false,
-                    message: 'Media queue is not available',
-                    requeued: 0,
-                    total: 0,
-                    errors: [],
-                });
-            }
-
-            let listResult;
-            try {
-                listResult = await cmsClient.listContentItems({
-                    status: 'PENDING',
-                    source: ids?.length ? undefined : source?.toUpperCase(),
-                    ids,
-                    limit: safeLimit,
-                });
-            } catch (err) {
-                logger.error('retry-pending: failed to list content items from CMS', err);
-                return reply.status(502).send({
-                    success: false,
-                    message: `Failed to fetch PENDING items from CMS: ${err instanceof Error ? err.message : String(err)}`,
-                    requeued: 0,
-                    total: 0,
-                    errors: [],
-                });
-            }
-
-            const aiQueue = getQueue(QUEUE_NAMES.AI);
-
-            let requeued = 0;
-            const errors: string[] = [];
-
-            for (const item of listResult.data) {
-                try {
-                    // Routes Telegram text posts to embedding instead of the media queue.
-                    await enqueueRetryJob(
-                        { media: mediaQueue, ai: aiQueue },
-                        item,
-                        { namePrefix: 'retry-pending', priority: 5 },
-                    );
-
-                    requeued++;
-                    logger.info('retry-pending: enqueued item', { contentItemId: item.id, source: item.source });
-                } catch (err) {
-                    const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
-                    errors.push(msg);
-                    logger.warn('retry-pending: failed to enqueue item', { contentItemId: item.id, error: msg });
-                }
-            }
-
-            return reply.send({
-                success: true,
-                message: `Enqueued ${requeued} of ${listResult.data.length} PENDING items for media processing`,
-                requeued,
-                total: listResult.total,
-                errors,
-            });
-        }
+        async (_request, reply) => reply.status(410).send({ success: false, message: 'Legacy aggregate retry is disabled; use a CMS-approved exact-stage pipeline repair.', requeued: 0, total: 0, errors: [] })
     );
 
     // -----------------------------------------------------------------

@@ -154,15 +154,29 @@ export async function generateChaptersViaEnrichment(
 export async function generateEmbeddingViaEnrichment(
     text: string,
     contentItemId?: string,
-    opts: { requestId?: string; extractTags?: boolean; signal?: AbortSignal } = {},
+    opts: {
+        requestId?: string;
+        extractTags?: boolean;
+        signal?: AbortSignal;
+        pipelineRepair?: {
+            repair_id: string;
+            attempt_id: string;
+            claim_token: string;
+            fence_token: string;
+            expected_item_version: string;
+            input_digest: string;
+        };
+    } = {},
 ): Promise<EmbedResult> {
     const body: {
         texts: string[];
         content_ids?: string[];
         extract_tags?: boolean;
+        pipeline_repair?: NonNullable<typeof opts.pipelineRepair>;
     } = { texts: [text] };
     if (contentItemId) body.content_ids = [contentItemId];
     if (opts.extractTags) body.extract_tags = true;
+    if (opts.pipelineRepair) body.pipeline_repair = opts.pipelineRepair;
 
     const response = await fetch(`${baseUrl()}/v1/embed`, {
         method: 'POST',

@@ -5,11 +5,12 @@
 import { FastifyInstance } from 'fastify';
 import { isRedisConnected } from '../../queues/redis.js';
 import { cmsClient } from '../../cms/client.js';
-import { CircuitState } from '../../cms/circuit-breaker.js';
 import { config } from '../../config/index.js';
 import { logger } from '../../observability/logger.js';
+import { getAllWorkers } from '../../workers/index.js';
+import { getWorkerLiveness, mandatoryWorkersHealthy } from '../../workers/worker-liveness.js';
 
-type DependencyStatus = 'connected' | 'disconnected' | 'reachable' | 'unreachable' | 'configured' | 'circuit_open';
+type DependencyStatus = 'connected' | 'disconnected' | 'reachable' | 'unreachable' | 'configured' | 'circuit_open' | 'healthy' | 'stale' | 'missing';
 
 interface ReadyResponse {
     status: 'ready' | 'not_ready';
@@ -17,7 +18,9 @@ interface ReadyResponse {
         redis: DependencyStatus;
         cms: DependencyStatus;
         storage: DependencyStatus;
+        workers: DependencyStatus;
     };
+    workers: ReturnType<typeof getWorkerLiveness>;
 }
 
 export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
@@ -26,22 +29,18 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
         const redisConnected = await isRedisConnected();
         const redisStatus: DependencyStatus = redisConnected ? 'connected' : 'disconnected';
 
-        // Check CMS circuit breaker state first: if OPEN, the breaker is
-        // actively rejecting calls — pinging would just trickle through and
-        // hide that we cannot write results back. Reporting not_ready here
-        // lets the orchestrator stop routing new work until CMS recovers.
-        const breakerState = cmsClient.getCircuitBreaker().getState();
+        // Liveness is independent from the operational request circuit. CMS
+        // consumes this endpoint as owner-worker evidence, so including the
+        // CMS circuit here would make each service wait for the other to
+        // become ready. Operational degradation remains visible through the
+        // circuit metrics and failed claim telemetry.
         let cmsStatus: DependencyStatus = 'unreachable';
-        if (breakerState === CircuitState.OPEN) {
-            cmsStatus = 'circuit_open';
-        } else {
-            try {
-                const cmsPing = await cmsClient.ping();
-                cmsStatus = cmsPing ? 'reachable' : 'unreachable';
-            } catch (error) {
-                logger.debug('CMS ping failed during readiness check', { error });
-                cmsStatus = 'unreachable';
-            }
+        try {
+            const cmsPing = await cmsClient.ping();
+            cmsStatus = cmsPing ? 'reachable' : 'unreachable';
+        } catch (error) {
+            logger.debug('CMS ping failed during readiness check', { error });
+            cmsStatus = 'unreachable';
         }
 
         // Check Storage - best effort
@@ -75,12 +74,14 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
             storageStatus = 'configured';
         }
 
-        // Determine overall status. Redis is the queue backbone; an OPEN
-        // CMS circuit breaker means write-backs would fail silently, so we
-        // also gate readiness on that. Transient unreachability (still
-        // CLOSED/HALF_OPEN) is tolerated.
-        const isReady =
-            redisStatus === 'connected' && cmsStatus !== 'circuit_open';
+        // Redis, CMS liveness and mandatory owner workers are required before
+        // this service can safely accept a new handoff.
+		const mandatoryWorkers = ['fetch-queue','normalize-queue','source-run-dispatch-queue','source-run-verification-queue','lifecycle-receipts-queue','pipeline-repair-queue','atomization-queue','atomization-sweep-queue'] as const;
+		const registeredWorkers = new Set(getAllWorkers().map((worker) => worker.name));
+        const workerLiveness = getWorkerLiveness();
+        const allRegistered = mandatoryWorkers.every((name) => registeredWorkers.has(name));
+        const workersStatus: DependencyStatus = !allRegistered ? 'missing' : mandatoryWorkersHealthy(mandatoryWorkers) ? 'healthy' : 'stale';
+		const isReady = redisStatus === 'connected' && cmsStatus === 'reachable' && workersStatus === 'healthy';
 
         return reply.send({
             status: isReady ? 'ready' : 'not_ready',
@@ -88,7 +89,9 @@ export async function readyRoutes(fastify: FastifyInstance): Promise<void> {
                 redis: redisStatus,
                 cms: cmsStatus,
                 storage: storageStatus,
+				workers: workersStatus,
             },
+            workers: workerLiveness,
         });
     });
 }

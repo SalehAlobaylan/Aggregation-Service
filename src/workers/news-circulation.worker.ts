@@ -6,16 +6,18 @@
  * telemetry drive CMS recommendations.
  */
 import { Job, Queue } from 'bullmq';
-import { getQueue, QUEUE_NAMES, type FetchJob, type NewsCirculationJob } from '../queues/index.js';
+import { getQueue, QUEUE_NAMES, type NewsCirculationJob } from '../queues/index.js';
 import { createWorker } from './base-worker.js';
-import { cmsClient } from '../cms/client.js';
 import { logger } from '../observability/logger.js';
 
 const REPEATABLE_NAME = 'news-circulation-repeatable';
 
 export const newsCirculationWorker = createWorker({
     queueName: QUEUE_NAMES.NEWS_CIRCULATION,
-    processor: async (job: Job<NewsCirculationJob>, jobLogger): Promise<void> => {
+	processor: async (job: Job<NewsCirculationJob>, jobLogger): Promise<void> => {
+		jobLogger.info('Legacy news circulation work rejected; CMS source-run admission owns all source work', { trigger: job.data.trigger });
+		return;
+		/* legacy read-compatible implementation retained below for contract history
         const tenantId = job.data.tenantId || 'default';
         const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
         if (!fetchQueue) {
@@ -70,12 +72,13 @@ export const newsCirculationWorker = createWorker({
             enqueued++;
         }
 
-        jobLogger.info('News circulation claimed sources', {
+		jobLogger.info('News circulation claimed sources', {
             tenantId,
             claimed: claimed.data?.length ?? 0,
             enqueued,
-        });
-    },
+		});
+		*/
+	},
 });
 
 export async function syncNewsCirculationSweeper(): Promise<void> {
@@ -92,22 +95,9 @@ export async function syncNewsCirculationSweeper(): Promise<void> {
             .map((entry) => queue.removeRepeatableByKey(entry.key).catch(() => undefined))
     );
 
-    let intervalMinutes = 15;
-    try {
-        const policy = await cmsClient.getCirculationPolicy('default');
-        intervalMinutes = Math.max(1, policy.source_claim_interval_minutes || 15);
-    } catch (error) {
-        logger.warn('news circulation: could not read CMS policy; using default interval', { error });
-    }
-
-    const every = intervalMinutes * 60_000;
-    await queue.add(
-        REPEATABLE_NAME,
-        { trigger: 'auto', tenantId: 'default' } satisfies NewsCirculationJob,
-        {
-            repeat: { every },
-            jobId: REPEATABLE_NAME,
-        }
-    );
-    logger.info('news circulation: registered repeatable source claim', { intervalMinutes });
+	// CMS source-run admission is now the only automatic due-work selector.
+	// Removing this legacy repeatable prevents duplicate source effects during
+	// the compatibility window; explicit legacy jobs remain non-durable and
+	// cannot acquire a source-run envelope.
+	logger.info('news circulation: retired legacy repeatable in favor of CMS source-run dispatch');
 }

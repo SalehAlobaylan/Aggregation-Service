@@ -240,7 +240,7 @@ describe('Admin auth and route protections', () => {
         await server.close();
     });
 
-    it('accepts the CMS automation credential only on the atomization sweep endpoint', async () => {
+    it('rejects the legacy atomization sweep even for the CMS automation credential', async () => {
         const server = await buildServer();
         const allowed = await server.inject({
             method: 'POST',
@@ -252,12 +252,28 @@ describe('Admin auth and route protections', () => {
             url: '/admin/queues',
             headers: { authorization: 'Bearer cms-automation-token' },
         });
-        expect(allowed.statusCode).toBe(200);
+        expect(allowed.statusCode).toBe(410);
         expect(denied.statusCode).toBe(401);
         await server.close();
     });
 
-    it('resumes paused workers when queue purge fails', async () => {
+    it('rejects browser-selected direct atomization targets', async () => {
+        const server = await buildServer();
+        const token = makeJwt(
+            { iss: 'cms-service', aud: 'platform-console', role: 'admin', exp: Math.floor(Date.now() / 1000) + 3600 },
+            'test-jwt-secret'
+        );
+        const response = await server.inject({
+            method: 'POST',
+            url: '/admin/atomization/parents/11111111-1111-4111-8111-111111111111/atomize',
+            headers: { authorization: `Bearer ${token}` },
+            payload: { contentItemId: '11111111-1111-4111-8111-111111111111' },
+        });
+        expect(response.statusCode).toBe(410);
+        await server.close();
+    });
+
+    it('rejects destructive queue purge without touching workers or queues', async () => {
         const server = await buildServer();
         const token = makeJwt(
             {
@@ -269,8 +285,6 @@ describe('Admin auth and route protections', () => {
             'test-jwt-secret'
         );
 
-        mocks.queueClean.mockRejectedValueOnce(new Error('clean failed'));
-
         const response = await server.inject({
             method: 'POST',
             url: '/admin/queues/purge',
@@ -281,11 +295,11 @@ describe('Admin auth and route protections', () => {
             },
         });
 
-        expect(response.statusCode).toBe(500);
-        expect(mocks.getAllWorkers).toHaveBeenCalled();
+        expect(response.statusCode).toBe(410);
+        expect(mocks.getAllWorkers).not.toHaveBeenCalled();
         for (const worker of mocks.workers) {
-            expect(worker.pause).toHaveBeenCalledTimes(1);
-            expect(worker.resume).toHaveBeenCalledTimes(1);
+            expect(worker.pause).not.toHaveBeenCalled();
+            expect(worker.resume).not.toHaveBeenCalled();
         }
 
         await server.close();

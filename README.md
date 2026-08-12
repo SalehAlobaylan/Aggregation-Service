@@ -119,8 +119,8 @@ npm run test:load    # synthetic producer
 
 # Operational scripts
 npm run telegram:auth   # authenticate a Telegram session string
-npm run retry-failed    # re-queue failed BullMQ jobs
-npm run retry-pending   # re-queue stuck PENDING items
+# retry-failed / retry-pending are disabled compatibility scripts. Exact
+# pipeline recovery is CMS-approved, tenant-fenced, and independently verified.
 npm run seed            # seed jobs
 npm run test:media      # exercise a media job
 npm run test:ai         # exercise an AI job
@@ -133,12 +133,11 @@ No public/consumer routes. Admin routes require an admin JWT (`verifyAdminAuth`)
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | GET | `/health` · `/ready` · `/metrics` | none | Liveness · readiness · Prometheus (queue depth, DLQ size) |
-| POST | `/admin/trigger`, `/admin/trigger/{rss,youtube,reddit}` | JWT | Trigger ingestion for a source |
+| POST | `/admin/trigger`, `/admin/trigger/{rss,youtube,reddit}` | JWT | Disabled legacy source-admission route (CMS source-run protocol only) |
 | POST | `/admin/discover` · `/admin/preview` | JWT | Feed discovery from a URL · fetch+normalize preview (no CMS write) |
 | POST | `/admin/discovery/{run,sweep-now,build-graph-now,resync-schedule}` | JWT | Discovery + source-graph control |
-| POST | `/admin/atomization/sweep-now` | JWT | Manually enqueue the atomization sweeper |
-| POST | `/admin/atomization/parents/:id/atomize` | JWT via CMS | Queue one CMS-validated parent for transcript-first atomization or direct atomization |
-| GET/POST | `/admin/queues*`, `/admin/jobs/:id`, `/admin/retry-failed`, `/admin/retry-pending` | JWT | Queue & job ops |
+| POST | `/admin/atomization/sweep-now`, `/admin/atomization/parents/:id/atomize` | JWT | Disabled legacy atomization routes; CMS-issued exact-parent claims only |
+| GET | `/admin/queues`, `/admin/queues/:name/stats`, `/admin/jobs/:id` | JWT | Read-only queue and job inspection |
 | GET/POST | `/admin/ratelimits*`, `/admin/scheduled`, `/admin/storage/*`, `/admin/quality/*`, `/admin/itunes/search`, `/admin/restart` | JWT | Rate-limit, schedule, storage, quality, ops |
 | POST | `/internal/jobs/user-content` | token | Inject user-submitted content into the pipeline |
 

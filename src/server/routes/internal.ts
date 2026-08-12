@@ -14,21 +14,17 @@ import {
     getQueue,
     QUEUE_NAMES,
     type ContentType,
-	type SourceType,
     type DiscoverySweepJob,
     type MediaJob,
     type NewsCirculationJob,
     type SourceGraphJob,
 } from '../../queues/index.js';
-import { enqueueRetryJob } from '../../queues/retry-routing.js';
 import { deleteContentObjects, deleteContentObjectsExact, deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
 import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
 import { runSweepForTenant } from '../../services/storage.service.js';
-import { triggerPoll } from '../../services/scheduler.service.js';
-import { getSupportedSourceTypes } from '../../fetchers/index.js';
 
 interface UserContentResponse {
     success: boolean;
@@ -69,23 +65,6 @@ const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]
 const RECOVERY_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024;
 const RECOVERY_ARTIFACT_PREFIX = /^system\/recovery\/[a-z0-9_-]{1,64}\/[0-9a-f-]{36}\/[a-f0-9]{64}\.json\.gz$/;
 let activeUserContentAdmissions = 0;
-
-type OperatorSourceRunBody = {
-	source_type?: string; url?: string; name?: string; settings?: Record<string, unknown>;
-	source_id?: string; source_run_request_id?: string; tenant_id?: string;
-	operator_plan_id?: string; operator_step_id?: string; idempotency_key?: string;
-};
-
-function validOperatorSourceRun(body: OperatorSourceRunBody): body is Required<Omit<OperatorSourceRunBody, 'settings'>> & { settings?: Record<string, unknown> } {
-	return typeof body.source_type === 'string' && getSupportedSourceTypes().includes(body.source_type as any)
-		&& typeof body.url === 'string' && body.url.length > 0 && body.url.length <= 2048
-		&& typeof body.name === 'string' && body.name.length > 0 && body.name.length <= 512
-		&& CANONICAL_UUID.test(String(body.source_id ?? '')) && CANONICAL_UUID.test(String(body.source_run_request_id ?? ''))
-		&& typeof body.tenant_id === 'string' && body.tenant_id.trim().length > 0 && body.tenant_id.length <= 64
-		&& CANONICAL_UUID.test(String(body.operator_plan_id ?? '')) && CANONICAL_UUID.test(String(body.operator_step_id ?? ''))
-		&& CANONICAL_UUID.test(String(body.idempotency_key ?? ''))
-		&& (body.settings === undefined || (typeof body.settings === 'object' && !Array.isArray(body.settings)));
-}
 
 function validRecoveryArtifactRef(key: string, checksum: string): boolean {
 	return RECOVERY_ARTIFACT_PREFIX.test(key) && /^[a-f0-9]{64}$/.test(checksum) && key.endsWith(`/${checksum}.json.gz`);
@@ -164,28 +143,6 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.send({ data });
     });
 
-	// This is the only Operator-to-Aggregation queue admission path. It accepts
-	// a CMS-derived source configuration and the durable plan/step lineage; it
-	// cannot impersonate an admin browser or execute an arbitrary queue job.
-	fastify.post<{ Body: OperatorSourceRunBody }>('/internal/operator/source-runs', async (request, reply) => {
-		const body = request.body ?? {};
-		if (!validOperatorSourceRun(body)) return reply.status(400).send({ message: 'invalid registered operator source-run handoff' });
-		try {
-			const jobId = await triggerPoll({
-				id: body.source_id, type: body.source_type as SourceType, name: body.name,
-				url: body.url, enabled: true, pollIntervalMs: 0, settings: body.settings ?? {},
-			}, {
-				sourceRunRequestId: body.source_run_request_id, tenantId: body.tenant_id,
-				operatorPlanId: body.operator_plan_id, operatorStepId: body.operator_step_id, idempotencyKey: body.idempotency_key,
-			});
-			if (!jobId) return reply.status(503).send({ message: 'source-run queue unavailable' });
-			return reply.send({ data: { job_id: jobId, source_run_request_id: body.source_run_request_id, operator_plan_id: body.operator_plan_id, operator_step_id: body.operator_step_id } });
-		} catch (error) {
-			logger.warn('Registered Operator source-run handoff failed', { sourceId: body.source_id, error: error instanceof Error ? error.message : 'unknown' });
-			return reply.status(502).send({ message: 'registered source-run handoff failed' });
-		}
-	});
-
 	// Recovery artifacts are a deliberately narrow object-store capability for
 	// CMS Retention. The request supplies neither a bucket nor arbitrary key;
 	// only reserved, content-addressed system/recovery objects are accepted.
@@ -242,6 +199,8 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 	});
 
 	fastify.post<{ Body: { run_id?: string; tenant_id?: string; lane?: 'news' | 'media'; source_ids?: string[]; lookback_hours?: number; max_items?: number; manifest_hash?: string; idempotency_key?: string; preserve_checkpoints?: boolean; fencing_token?: string } }>('/internal/recovery/reseed', async (request, reply) => {
+		return reply.status(410).send({ message: 'Legacy source reseed is disabled; use exact CMS durable recovery actions.' });
+		/* retained decoder below for audit/read compatibility
 		const body = request.body ?? {};
 		const lane = body.lane;
 		const sourceIds = Array.isArray(body.source_ids) ? body.source_ids.filter(value => CANONICAL_UUID.test(String(value))) : [];
@@ -254,6 +213,7 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		if (!queue) return reply.status(503).send({ message: 'recovery reseed queue unavailable' });
 		const job = await queue.add('recovery-reseed-' + lane, { trigger: 'manual', tenantId: body.tenant_id, recovery: { runId: body.run_id, manifestHash: body.manifest_hash, lane, sourceIds, lookbackHours, maxItems, preserveCheckpoints: true } } satisfies NewsCirculationJob, { priority: 1, jobId: body.idempotency_key });
 		return reply.send({ data: { queued: true, job_id: job.id ?? body.idempotency_key, lane, checkpoint_mode: 'preserve', lookback_hours: lookbackHours, max_items: maxItems, fencing_token: body.fencing_token } });
+		*/
 	});
 
 	fastify.post<{ Body: { run_id?: string; tenant_id?: string; content_ids?: string[]; saga_items?: Array<{ id?: string; provider_objects?: string[]; no_full_rollback?: boolean }>; manifest_hash?: string; idempotency_key?: string; item_idempotency_keys?: Record<string, string>; fencing_token?: string } }>('/internal/recovery/purge-media', async (request, reply) => {
@@ -342,117 +302,25 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		}
 	});
 
-    async function retryContentItems(
-        status: 'PENDING' | 'FAILED',
-        body: InternalRetryBody | undefined,
-        namePrefix: string,
-        priority: number,
-    ): Promise<{ statusCode: number; payload: InternalRetryResponse }> {
-        const { source, ids, limit = status === 'FAILED' ? 100 : 200 } = body ?? {};
-        const safeLimit = Math.max(1, Math.min(limit, 500));
-
-        const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
-        if (!mediaQueue) {
-            return {
-                statusCode: 503,
-                payload: {
-                    success: false,
-                    message: 'Media queue is not available',
-                    requeued: 0,
-                    total: 0,
-                    errors: [],
-                },
-            };
-        }
-
-        let listResult;
-        try {
-            listResult = await cmsClient.listContentItems({
-                status,
-                source: ids?.length ? undefined : source?.toUpperCase(),
-                ids,
-                limit: safeLimit,
-            });
-        } catch (err) {
-            logger.error(`internal ${namePrefix}: failed to list content items from CMS`, err);
-            return {
-                statusCode: 502,
-                payload: {
-                    success: false,
-                    message: `Failed to fetch ${status} items from CMS: ${err instanceof Error ? err.message : String(err)}`,
-                    requeued: 0,
-                    total: 0,
-                    errors: [],
-                },
-            };
-        }
-
-        const aiQueue = getQueue(QUEUE_NAMES.AI);
-        let requeued = 0;
-        const errors: string[] = [];
-
-        for (const item of listResult.data) {
-            try {
-                if (status === 'FAILED') {
-                    await cmsClient.updateStatus(item.id, { status: 'PENDING' });
-                }
-                await enqueueRetryJob(
-                    { media: mediaQueue, ai: aiQueue },
-                    item,
-                    { namePrefix, priority },
-                );
-                requeued++;
-                logger.info(`internal ${namePrefix}: requeued item`, { contentItemId: item.id, source: item.source });
-            } catch (err) {
-                const msg = `${item.id}: ${err instanceof Error ? err.message : String(err)}`;
-                errors.push(msg);
-                logger.warn(`internal ${namePrefix}: failed to requeue item`, { contentItemId: item.id, error: msg });
-            }
-        }
-
-        return {
-            statusCode: 200,
-            payload: {
-                success: true,
-                message: `Re-queued ${requeued} of ${listResult.data.length} ${status} items`,
-                requeued,
-                total: listResult.total,
-                errors,
-            },
-        };
-    }
-
     fastify.post<{ Body: InternalRetryBody; Reply: InternalRetryResponse }>(
         '/internal/retry-pending',
-        async (request, reply) => {
-            const result = await retryContentItems('PENDING', request.body, 'pipeline-autopilot-pending', 5);
-            return reply.status(result.statusCode).send(result.payload);
+        async (_request, reply) => {
+            return reply.status(410).send({ success: false, message: 'Legacy aggregate retry is disabled; use a CMS-approved exact-stage pipeline repair.', requeued: 0, total: 0, errors: [] });
         }
     );
 
     fastify.post<{ Body: InternalRetryBody; Reply: InternalRetryResponse }>(
         '/internal/retry-failed',
-        async (request, reply) => {
-            const result = await retryContentItems('FAILED', request.body, 'pipeline-autopilot-failed', 3);
-            return reply.status(result.statusCode).send(result.payload);
+        async (_request, reply) => {
+            return reply.status(410).send({ success: false, message: 'Legacy aggregate retry is disabled; use a CMS-approved exact-stage pipeline repair.', requeued: 0, total: 0, errors: [] });
         }
     );
 
     fastify.post<{ Body: { tenant_id?: string }; Reply: { success: boolean; jobId?: string; message?: string } }>(
-        '/internal/circulation/sweep-now',
-        async (request, reply) => {
-            const queue = getQueue(QUEUE_NAMES.NEWS_CIRCULATION);
-            if (!queue) {
-                return reply.status(503).send({ success: false, message: 'news circulation queue unavailable' });
-            }
-            const tenantId = request.body?.tenant_id || 'default';
-            const job = await queue.add(
-                'internal-news-circulation',
-                { trigger: 'manual', tenantId } satisfies NewsCirculationJob,
-                { priority: 1 }
-            );
-            return reply.send({ success: true, jobId: job.id ?? undefined, message: 'News circulation source claim queued' });
-        }
+		'/internal/circulation/sweep-now',
+		async (_request, reply) => {
+			return reply.status(410).send({ success: false, message: 'Legacy circulation admission is disabled; use CMS durable source-run admission.' });
+		}
     );
 
     fastify.post<{ Reply: { success: boolean; jobId?: string; message?: string } }>(

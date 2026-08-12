@@ -156,6 +156,16 @@ export const mediaWorker = createWorker({
       tenantId: queuedTenantId,
     } = job.data;
 
+    // The normal media worker is an all-stage ingest pipeline. It must never
+    // silently reinterpret a one-stage command as permission to run download,
+    // transcode, thumbnail, and AI handoff together; Pipeline repair owns
+    // those exact one-stage effects through pipeline-repair/v1 instead.
+    const requiredOperations: Array<'download' | 'transcode' | 'thumbnail'> = ['download', 'transcode', 'thumbnail'];
+    const fullPipeline = operations.length === requiredOperations.length && requiredOperations.every((operation) => operations.includes(operation));
+    if (!fullPipeline) {
+      throw new Error('media worker accepts only the canonical full ingest pipeline; use pipeline-repair/v1 for an exact stage');
+    }
+
     jobLogger.info("Processing media job", {
       contentItemId,
       contentType,

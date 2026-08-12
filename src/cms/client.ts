@@ -50,6 +50,20 @@ import type {
     ListAtomizationCandidatesResponse,
     AtomizationRepairResponse,
 } from './types.js';
+import {
+    sourceRunDispatchClaimSchema,
+    sourceRunReceiptSchema,
+	sourceRunAuthorizedUnitSchema,
+	sourceRunVerificationClaimSchema,
+	sourceRunVerificationObservationSchema,
+    sourceRunUnitLeaseSchema,
+    type SourceRunDispatchClaim,
+    type SourceRunReceipt,
+	type SourceRunAuthorizedUnit,
+    type SourceRunUnitLease,
+	type SourceRunVerificationClaim,
+} from '../contracts/source-runs.js';
+import { z } from 'zod';
 
 // Circuit breaker for CMS calls
 const cmsCircuitBreaker = new CircuitBreaker({
@@ -96,10 +110,25 @@ async function readBoundedText(response: Response, limit: number): Promise<strin
 }
 
 function countsAsCMSAvailabilityFailure(error: unknown): boolean {
-    if (error instanceof CMSRequestError) return error.retryable;
-    // Fetch transport and deadline errors indicate dependency availability;
-    // parser/validation errors and ordinary 4xx responses do not.
+    // Any completed HTTP response proves that CMS is reachable. Typed 4xx/5xx
+    // operational refusals are handled by the calling job and must not open a
+    // single global circuit that blocks unrelated claims, receipts and
+    // verification. Only transport/deadline failures represent availability.
+    if (error instanceof CMSRequestError) return false;
     return error instanceof TypeError || (error instanceof Error && error.name === 'TimeoutError');
+}
+
+function sourceRunReceiptRequestBody(valid: SourceRunReceipt): Record<string, unknown> {
+	return {
+		tenant_id: valid.tenantId, producer_event_key: valid.producerEventKey,
+		source_run_request_id: valid.sourceRunRequestId, source_run_attempt_id: valid.sourceRunAttemptId,
+		execution_unit_id: valid.executionUnitId, content_source_id: valid.contentSourceId,
+		unit_job_id: valid.unitJobId, attempt_fence_token: valid.attemptFenceToken,
+		execution_lease_token: valid.executionLeaseToken, execution_lease_expires_at: valid.executionLeaseExpiresAt, schema_version: valid.schemaVersion,
+		producer: valid.producer, stage: valid.stage, event_type: valid.eventType, outcome: valid.outcome,
+		sequence: valid.sequence, page_id: valid.pageId, batch_id: valid.batchId, final_page: valid.finalPage,
+		causation_id: valid.causationId, produced_at: valid.producedAt, payload: valid.payload, payload_digest: valid.payloadDigest,
+	};
 }
 
 /**
@@ -149,6 +178,11 @@ async function makeRequest<T>(
         throw new CMSRequestError(response.status, response.status === 429 || response.status >= 500);
     }
 
+    if (response.status === 204) {
+        response.body?.cancel().catch(() => undefined);
+        return undefined as T;
+    }
+
     const raw = await readBoundedText(response, CMS_MAX_SUCCESS_BODY_BYTES);
     let data: T;
     try {
@@ -180,33 +214,208 @@ async function makeProtectedRequest<T>(
  * CMS API Client
  */
 export const cmsClient = {
+	async claimAtomizationWork(requestId?: string): Promise<{id:string;attemptId:string;claimToken:string;fenceToken:string;deterministicJobId:string;inputFingerprint:string;parentContentItemId:string}|null> {
+		const raw=await makeProtectedRequest<unknown>('POST','/atomization-work/claim',{},requestId);if(raw===undefined||raw===null)return null;
+		const parsed=z.object({id:z.string().uuid(),attempt_id:z.string().uuid(),claim_token:z.string().uuid(),fence_token:z.string().uuid(),deterministic_job_id:z.string().min(1),input_fingerprint:z.string().regex(/^[a-f0-9]{64}$/),parent_content_item_id:z.string().uuid()}).strict().parse(raw);
+		return {id:parsed.id,attemptId:parsed.attempt_id,claimToken:parsed.claim_token,fenceToken:parsed.fence_token,deterministicJobId:parsed.deterministic_job_id,inputFingerprint:parsed.input_fingerprint,parentContentItemId:parsed.parent_content_item_id};
+	},
+	async beginAtomizationWork(input:{id:string;claimToken:string},requestId?:string):Promise<void>{await makeProtectedRequest('POST',`/atomization-work/${encodeURIComponent(input.id)}/begin`,{claim_token:input.claimToken},requestId);},
+	async heartbeatAtomizationWork(input:{id:string;claimToken:string},requestId?:string):Promise<void>{await makeProtectedRequest('POST',`/atomization-work/${encodeURIComponent(input.id)}/heartbeat`,{claim_token:input.claimToken},requestId);},
+	async checkpointAtomizationWork(input:{id:string;claimToken:string;phase:'plan_persisted'|'first_cut'|'uploads_complete'|'children_persisted'|'embedding_handoff'|'owner_complete';proof:Record<string,unknown>},requestId?:string):Promise<void>{await makeProtectedRequest('POST',`/atomization-work/${encodeURIComponent(input.id)}/checkpoint`,{claim_token:input.claimToken,phase:input.phase,proof:input.proof},requestId);},
+	async claimPipelineRepair(requestId?: string): Promise<{
+		id: string; attemptId: string; tenantId: string; claimToken: string; deterministicJobId: string; stage: 'media_download' | 'media_transcode' | 'media_thumbnail' | 'text_embedding'; contentItemId: string; itemVersion: string; sourceRunRequestId?: number; fenceToken: string; leaseExpiresAt: string; leaseEpoch: number; effectInputDigest: string;
+		content: { type: 'NEWS'|'ARTICLE'|'VIDEO'|'TWEET'|'COMMENT'|'PODCAST'; source: string; original_url?: string | null; media_url?: string | null; title?: string | null; excerpt?: string | null; body_text?: string | null; metadata?: Record<string, unknown> };
+	} | null> {
+		const raw = await makeProtectedRequest<unknown>('POST', '/pipeline-repairs/claim', {}, requestId);
+		if (raw === undefined || raw === null) return null;
+		const parsed = z.object({ id:z.string().uuid(), attempt_id:z.string().uuid(), tenant_id:z.string().min(1), claim_token:z.string().uuid(), deterministic_job_id:z.string().min(1), stage:z.enum(['media_download','media_transcode','media_thumbnail','text_embedding']), content_item_id:z.string().uuid(), item_version:z.string().datetime({offset:true}), source_run_request_id:z.number().int().positive().nullable().optional(), fence_token:z.string().uuid(), lease_expires_at:z.string().datetime({offset:true}), lease_epoch:z.number().int().positive(), effect_input_digest:z.string().regex(/^[a-f0-9]{64}$/), content:z.object({type:z.enum(['NEWS','ARTICLE','VIDEO','TWEET','COMMENT','PODCAST']),source:z.string().min(1),original_url:z.string().url().nullable().optional(),media_url:z.string().url().nullable().optional(),title:z.string().nullable().optional(),excerpt:z.string().nullable().optional(),body_text:z.string().nullable().optional(),metadata:z.record(z.string(),z.unknown()).optional()}).strict() }).strict().parse(raw);
+		return {id:parsed.id,attemptId:parsed.attempt_id,tenantId:parsed.tenant_id,claimToken:parsed.claim_token,deterministicJobId:parsed.deterministic_job_id,stage:parsed.stage,contentItemId:parsed.content_item_id,itemVersion:parsed.item_version,sourceRunRequestId:parsed.source_run_request_id ?? undefined,fenceToken:parsed.fence_token,leaseExpiresAt:parsed.lease_expires_at,leaseEpoch:parsed.lease_epoch,effectInputDigest:parsed.effect_input_digest,content:parsed.content};
+	},
+	async beginPipelineRepair(input:{repairId:string;claimToken:string},requestId?:string):Promise<void>{ await makeProtectedRequest('POST',`/pipeline-repairs/${encodeURIComponent(input.repairId)}/begin`,{claim_token:input.claimToken},requestId); },
+	async heartbeatPipelineRepair(input:{repairId:string;claimToken:string},requestId?:string):Promise<void>{ await makeProtectedRequest('POST',`/pipeline-repairs/${encodeURIComponent(input.repairId)}/heartbeat`,{claim_token:input.claimToken},requestId); },
+	async completePipelineRepair(input:{repairId:string;claimToken:string;producerEventId:string;outputDigest:string;output:Record<string,unknown>},requestId?:string):Promise<void>{ await makeProtectedRequest('POST',`/pipeline-repairs/${encodeURIComponent(input.repairId)}/terminal`,{claim_token:input.claimToken,producer_event_id:input.producerEventId,output_digest:input.outputDigest,output:input.output},requestId); },
+	async claimUnitAdoptionAction(requestId?: string): Promise<{ id: string; claimToken: string } | null> {
+		const raw = await makeProtectedRequest<unknown>('POST', '/media-supply-actions/unit-adoptions/claim', {}, requestId);
+		if (raw === undefined || raw === null) return null;
+		return z.object({ id: z.string().uuid(), claim_token: z.string().uuid() }).strict().transform((value) => ({ id: value.id, claimToken: value.claim_token })).parse(raw);
+	},
+
+	async prepareUnitAdoptionAction(input: { actionId: string; claimToken: string }, requestId?: string): Promise<SourceRunDispatchClaim> {
+		const raw = await makeProtectedRequest<unknown>('POST', `/media-supply-actions/unit-adoptions/${encodeURIComponent(input.actionId)}/prepare`, { claim_token: input.claimToken }, requestId);
+		return sourceRunDispatchClaimSchema.parse(raw);
+	},
+
+	async acknowledgeUnitAdoptionAction(input: { actionId: string; claimToken: string }, requestId?: string): Promise<void> {
+		const raw = await makeProtectedRequest<unknown>('POST', `/media-supply-actions/unit-adoptions/${encodeURIComponent(input.actionId)}/acknowledge`, { claim_token: input.claimToken }, requestId);
+		z.object({ ok: z.literal(true), state: z.literal('verifying') }).strict().parse(raw);
+	},
+	async claimReceiptRedeliveryAction(requestId?: string): Promise<{ id: string; claimToken: string } | null> {
+		const raw = await makeProtectedRequest<unknown>('POST', '/media-supply-actions/receipt-redeliveries/claim', {}, requestId);
+		if (raw === undefined || raw === null) return null;
+		return z.object({ id: z.string().uuid(), claim_token: z.string().uuid() }).strict().transform((value) => ({ id: value.id, claimToken: value.claim_token })).parse(raw);
+	},
+	async prepareReceiptRedeliveryAction(input: { actionId: string; claimToken: string }, requestId?: string): Promise<SourceRunReceipt> {
+		const raw = await makeProtectedRequest<unknown>('POST', `/media-supply-actions/receipt-redeliveries/${encodeURIComponent(input.actionId)}/prepare`, { claim_token: input.claimToken }, requestId);
+		return sourceRunReceiptSchema.parse(raw);
+	},
+	async completeReceiptRedeliveryAction(input: { actionId: string; claimToken: string }, requestId?: string): Promise<void> {
+		const raw = await makeProtectedRequest<unknown>('POST', `/media-supply-actions/receipt-redeliveries/${encodeURIComponent(input.actionId)}/complete`, { claim_token: input.claimToken }, requestId);
+		z.object({ ok: z.literal(true), state: z.literal('succeeded') }).strict().parse(raw);
+	},
+
+	async claimNextSourceRun(requestId?: string): Promise<SourceRunDispatchClaim | null> {
+		const raw = await makeProtectedRequest<unknown>('POST', '/source-runs/claim', {}, requestId);
+		if (raw === undefined || raw === null) return null;
+		return sourceRunDispatchClaimSchema.parse(raw);
+	},
+
+	async authorizeSourceRunUnit(input: {
+		tenantId: string;
+		requestId: string;
+		attemptId: string;
+		parentUnitId: string;
+		unitType: 'fetch_page' | 'normalize_batch';
+		unitKey: string;
+		pageId: string;
+		batchId?: string;
+	}, requestId?: string): Promise<SourceRunAuthorizedUnit> {
+		const raw = await makeProtectedRequest<unknown>(
+			'POST',
+			`/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units`,
+			{ tenant_id: input.tenantId, parent_unit_id: input.parentUnitId, unit_type: input.unitType, unit_key: input.unitKey, page_id: input.pageId, batch_id: input.batchId ?? '' },
+			requestId,
+		);
+		return sourceRunAuthorizedUnitSchema.parse(raw);
+	},
+
+	async acceptSourceRunUnit(input: {
+		tenantId: string;
+		requestId: string;
+		attemptId: string;
+		unitId: string;
+		unitJobId: string;
+		attemptFenceToken: string;
+	}, requestId?: string): Promise<SourceRunUnitLease> {
+		const raw = await makeProtectedRequest<unknown>(
+			'POST',
+			`/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/accepted`,
+			{ tenant_id: input.tenantId, unit_job_id: input.unitJobId, attempt_fence_token: input.attemptFenceToken },
+			requestId,
+		);
+		return sourceRunUnitLeaseSchema.parse(raw);
+	},
+
+	async beginSourceRunUnit(input: { tenantId: string; requestId: string; attemptId: string; unitId: string; unitJobId: string; attemptFenceToken: string; executionLeaseToken: string }, requestId?: string): Promise<void> {
+		await makeProtectedRequest('POST', `/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/begin`, { tenant_id: input.tenantId, unit_job_id: input.unitJobId, attempt_fence_token: input.attemptFenceToken, execution_lease_token: input.executionLeaseToken }, requestId);
+	},
+
+	async heartbeatSourceRunUnit(input: { tenantId: string; requestId: string; attemptId: string; unitId: string; unitJobId: string; attemptFenceToken: string; executionLeaseToken: string }, requestId?: string): Promise<{ executionLeaseExpiresAt: string }> {
+		const raw = await makeProtectedRequest<unknown>('POST', `/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/heartbeat`, { tenant_id: input.tenantId, unit_job_id: input.unitJobId, attempt_fence_token: input.attemptFenceToken, execution_lease_token: input.executionLeaseToken }, requestId);
+		const parsed = z.object({ ok: z.literal(true), execution_lease_expires_at: z.string().datetime({ offset: true }) }).strict().parse(raw);
+		return { executionLeaseExpiresAt: parsed.execution_lease_expires_at };
+	},
+
+	async freezeSourceRunPage(input: { tenantId: string; requestId: string; attemptId: string; unitId: string; declaredChildCount: number; declaredChildDigest: string }, requestId?: string): Promise<void> {
+		await makeProtectedRequest('POST', `/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/freeze`, { tenant_id: input.tenantId, declared_child_count: input.declaredChildCount, declared_child_digest: input.declaredChildDigest }, requestId);
+	},
+
+	async recordSourceRunUpstreamObservations(input: {
+		tenantId: string; requestId: string; attemptId: string; unitId: string;
+		unitJobId: string; attemptFenceToken: string; executionLeaseToken: string;
+		providerCapability: 'replayable_listing' | 'peek'; providerVersion: string;
+		providerPageId: string; providerCursor?: string;
+		items: Array<{ upstreamItemId: string; upstreamFingerprint: string }>;
+	}, requestId?: string): Promise<{ created: number }> {
+		const raw = await makeProtectedRequest<unknown>(
+			'POST',
+			`/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/upstream-observations`,
+			{
+				tenant_id: input.tenantId, unit_job_id: input.unitJobId,
+				attempt_fence_token: input.attemptFenceToken, execution_lease_token: input.executionLeaseToken,
+				provider_capability: input.providerCapability, provider_version: input.providerVersion,
+				provider_page_id: input.providerPageId, provider_cursor: input.providerCursor ?? '',
+				items: input.items.map((item) => ({ upstream_item_id: item.upstreamItemId, upstream_fingerprint: item.upstreamFingerprint })),
+			}, requestId,
+		);
+		return z.object({ ok: z.literal(true), created: z.number().int().nonnegative() }).strict().parse(raw);
+	},
+
+	async recordSourceRunUpstreamObservationDisposition(input: {
+		tenantId: string; requestId: string; attemptId: string; unitId: string;
+		unitJobId: string; attemptFenceToken: string; executionLeaseToken: string;
+		observationId: string; disposition: 'materialized' | 'filtered';
+		contentItemId?: string; filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate';
+	}, requestId?: string): Promise<{ created: boolean }> {
+		const raw = await makeProtectedRequest<unknown>(
+			'POST',
+			`/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/upstream-observations/${encodeURIComponent(input.observationId)}/disposition`,
+			{
+				tenant_id: input.tenantId, unit_job_id: input.unitJobId,
+				attempt_fence_token: input.attemptFenceToken, execution_lease_token: input.executionLeaseToken,
+				disposition: input.disposition, content_item_id: input.contentItemId ?? '', filter_class: input.filterClass ?? '',
+			}, requestId,
+		);
+		return z.object({ ok: z.literal(true), created: z.boolean() }).strict().parse(raw);
+	},
+
+	async sealSourceRunManifest(input: { tenantId: string; requestId: string }, requestId?: string): Promise<void> {
+		await makeProtectedRequest('POST', `/source-runs/${encodeURIComponent(input.requestId)}/seal`, { tenant_id: input.tenantId }, requestId);
+	},
+
+	async claimNextSourceRunVerification(requestId?: string): Promise<SourceRunVerificationClaim | null> {
+		const raw = await makeProtectedRequest<unknown>('POST', '/source-run-verification-tasks/claim-next', {}, requestId);
+		if (raw === undefined || raw === null) return null;
+		return sourceRunVerificationClaimSchema.parse(raw);
+	},
+
+	async observeSourceRunVerification(input: { tenantId: string; taskId: string; claimToken: string }, requestId?: string): Promise<{ verdict: 'present' | 'absent' | 'unknown'; evidenceSnapshot: string }> {
+		const raw = await makeProtectedRequest<unknown>('POST', `/source-run-verification-tasks/${encodeURIComponent(input.taskId)}/observe`, { tenant_id: input.tenantId, claim_token: input.claimToken }, requestId);
+		const parsed = sourceRunVerificationObservationSchema.parse(raw);
+		return { verdict: parsed.verdict, evidenceSnapshot: parsed.evidence_snapshot };
+	},
+
+	async deliverSourceRunReceipt(receipt: SourceRunReceipt, requestId?: string): Promise<void> {
+		const valid = sourceRunReceiptSchema.parse(receipt);
+		await makeProtectedRequest('POST', '/source-run-receipts', sourceRunReceiptRequestBody(valid), requestId);
+	},
+	async retainSourceRunReceipt(receipt: SourceRunReceipt, requestId?: string): Promise<void> {
+		const valid = sourceRunReceiptSchema.parse(receipt);
+		const raw = await makeProtectedRequest<unknown>('POST', '/source-run-receipts/retain', sourceRunReceiptRequestBody(valid), requestId);
+		z.object({ id: z.string().uuid(), duplicate: z.boolean(), state: z.literal('retained') }).strict().parse(raw);
+	},
+	async markSourceRunReceiptDelivered(receipt: SourceRunReceipt, requestId?: string): Promise<void> {
+		const valid = sourceRunReceiptSchema.parse(receipt);
+		const raw = await makeProtectedRequest<unknown>('POST', '/source-run-receipts/delivered', { tenant_id: valid.tenantId, producer_event_key: valid.producerEventKey }, requestId);
+		z.object({ id: z.string().uuid(), state: z.literal('delivered') }).strict().parse(raw);
+	},
 	async redundancyPrecheck(candidates: Array<{ title: string; duration_sec?: number; source_url?: string }>, requestId?: string): Promise<{ candidates: Array<{ verdict: 'clear' | 'exact_identity' | 'likely_duplicate'; existing_item_id?: string; confidence: number; reasons: string[] }> }> {
 		return makeProtectedRequest('POST', '/redundancy/precheck', { candidates }, requestId);
 	},
     /**
-     * Ping CMS for health check
-     * Uses a configurable path, defaults to /health
+     * Ping CMS for dependency liveness. This deliberately bypasses the
+     * operational request circuit: /ready must be able to distinguish a live
+     * CMS from a circuit opened by a typed operational refusal. Feeding the
+     * shared circuit back into owner readiness creates a CMS <-> Aggregation
+     * readiness deadlock.
      */
     async ping(requestId?: string): Promise<boolean> {
         try {
-            const pingPath = process.env['CMS_PING_PATH'] || '/health';
-            await cmsCircuitBreaker.execute(async () => {
-                const url = `${config.cmsBaseUrl.replace('/internal', '')}${pingPath}`;
-                const response = await fetch(url, {
-                    method: 'GET',
-                    headers: buildHeaders(requestId),
-                    signal: AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS),
-                });
-                try {
-                    if (!response.ok) {
-                        throw new CMSRequestError(response.status, response.status === 429 || response.status >= 500);
-                    }
-                    await readBoundedText(response, CMS_MAX_ERROR_BODY_BYTES);
-                } finally {
-                    response.body?.cancel().catch(() => undefined);
+            const pingPath = process.env['CMS_PING_PATH'] || '/live';
+            const url = `${config.cmsBaseUrl.replace(/\/internal\/?$/, '')}${pingPath}`;
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: buildHeaders(requestId),
+                signal: AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS),
+            });
+            try {
+                if (!response.ok) {
+                    return false;
                 }
-            }, countsAsCMSAvailabilityFailure);
-            return true;
+                await readBoundedText(response, CMS_MAX_ERROR_BODY_BYTES);
+                return true;
+            } finally {
+                response.body?.cancel().catch(() => undefined);
+            }
         } catch (error) {
             logger.warn('CMS ping failed', { error });
             return false;

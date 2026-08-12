@@ -22,7 +22,11 @@ async function createWorkers(): Promise<Worker[]> {
         { discoverySweepWorker },
         { sourceGraphWorker },
         { newsCirculationWorker },
-        { mediaCirculationWorker },
+		{ mediaCirculationWorker },
+		{ sourceRunDispatchWorker },
+		{ sourceRunVerificationWorker },
+		{ lifecycleReceiptWorker },
+		{ pipelineRepairWorker },
     ] = await Promise.all([
         import('./fetch.worker.js'),
         import('./normalize.worker.js'),
@@ -36,8 +40,12 @@ async function createWorkers(): Promise<Worker[]> {
         import('./discovery.worker.js'),
         import('./discovery-sweep.worker.js'),
         import('./source-graph.worker.js'),
-        import('./news-circulation.worker.js'),
-        import('./media-circulation.worker.js'),
+		import('./news-circulation.worker.js'),
+		import('./media-circulation.worker.js'),
+		import('./source-run-dispatch.worker.js'),
+		import('./source-run-verification.worker.js'),
+		import('./lifecycle-receipt.worker.js'),
+		import('./pipeline-repair.worker.js'),
     ]);
 
     return [
@@ -54,7 +62,11 @@ async function createWorkers(): Promise<Worker[]> {
         discoverySweepWorker,
         sourceGraphWorker,
         newsCirculationWorker,
-        mediaCirculationWorker,
+		mediaCirculationWorker,
+		sourceRunDispatchWorker,
+		sourceRunVerificationWorker,
+		lifecycleReceiptWorker,
+		pipelineRepairWorker,
     ];
 }
 
@@ -110,6 +122,20 @@ export async function startWorkers(): Promise<void> {
         syncMediaCirculationSweeper().catch(err => {
             logger.error('Failed to sync media circulation sweeper', err);
         });
+		// CMS owns due selection and authorization. This timer only requests one
+		// bounded claim; it has no source or tenant selection authority.
+		syncSourceRunDispatchSweeper().catch(err => {
+			logger.error('Failed to sync CMS source-run dispatcher', err);
+		});
+		syncSourceRunVerificationSweeper().catch(err => {
+			logger.error('Failed to sync CMS source-run verification', err);
+		});
+		syncLifecycleReceiptActionSweeper().catch(err => {
+			logger.error('Failed to sync Supply receipt recovery', err);
+		});
+		syncPipelineRepairSweeper().catch(err => {
+			logger.error('Failed to sync CMS pipeline repair dispatcher', err);
+		});
 
         const [
             { startOpMetricsFlush },
@@ -186,6 +212,26 @@ export async function syncNewsCirculationSweeper(): Promise<void> {
 export async function syncMediaCirculationSweeper(): Promise<void> {
     const mod = await import('./media-circulation.worker.js');
     return mod.syncMediaCirculationSweeper();
+}
+
+export async function syncSourceRunDispatchSweeper(): Promise<void> {
+	const mod = await import('./source-run-dispatch.worker.js');
+	return mod.syncSourceRunDispatchSweeper();
+}
+
+export async function syncSourceRunVerificationSweeper(): Promise<void> {
+	const mod = await import('./source-run-verification.worker.js');
+	return mod.syncSourceRunVerificationSweeper();
+}
+
+export async function syncLifecycleReceiptActionSweeper(): Promise<void> {
+	const mod = await import('./lifecycle-receipt.worker.js');
+	return mod.syncLifecycleReceiptActionSweeper();
+}
+
+export async function syncPipelineRepairSweeper(): Promise<void> {
+	const mod = await import('./pipeline-repair.worker.js');
+	return mod.syncPipelineRepairSweeper();
 }
 
 export { createWorker } from './base-worker.js';

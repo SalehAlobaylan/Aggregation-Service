@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { safeFailureCode, safeJobMetadata, safePayloadHash } from '../../src/observability/job-projection.js';
+import { isDependencyDeferral, safeFailureCode, safeJobMetadata, safePayloadHash } from '../../src/observability/job-projection.js';
 
 describe('job projection redaction', () => {
     it('keeps only operational identifiers and never serializes raw payload secrets', () => {
@@ -23,5 +23,8 @@ describe('job projection redaction', () => {
     it('turns raw failure text into a low-cardinality code', () => {
         expect(safeFailureCode(new Error('GET https://private.example/?token=secret timed out'))).toBe('deadline_exceeded');
         expect(safeFailureCode('upstream returned 403 token=secret')).toBe('authorization_failed');
+        expect(safeFailureCode(new Error("Circuit breaker 'cms' is open"))).toBe('circuit_open');
+        expect(isDependencyDeferral(new Error('CMS request failed with status 503'))).toBe(true);
+        expect(isDependencyDeferral(new Error('CMS returned invalid JSON'))).toBe(false);
     });
 });

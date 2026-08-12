@@ -1,3 +1,5 @@
+import type { SourceRunExecutionEnvelope, SourceRunReceipt } from '../contracts/source-runs.js';
+
 /**
  * Queue job type definitions
  */
@@ -40,6 +42,19 @@ export interface FetchJob {
 	operatorPlanId?: string;
 	operatorStepId?: string;
 	idempotencyKey?: string;
+	/** Present only for a CMS-issued, fenced source-run execution unit. */
+	sourceRun?: SourceRunExecutionEnvelope;
+	/** Internal routing context for a CMS-admitted fetch page; not evidence. */
+	sourceRunCoordinatorUnitId?: string;
+	sourceRunPageId?: string;
+}
+
+export interface LifecycleReceiptJob {
+	receipt: SourceRunReceipt;
+}
+
+export interface LifecycleReceiptActionJob {
+	trigger: 'auto';
 }
 
 /**
@@ -57,12 +72,41 @@ export interface NormalizeJob {
 	operatorPlanId?: string;
 	operatorStepId?: string;
 	idempotencyKey?: string;
+	/** Present only when this batch was authorized beneath a fetch-page unit. */
+	sourceRun?: SourceRunExecutionEnvelope;
+	sourceRunPageId?: string;
+	sourceRunBatchId?: string;
+}
+
+/** One bounded CMS dispatch tick. The job carries no source/tenant target. */
+export interface SourceRunDispatchJob {
+	trigger: 'auto' | 'manual';
+}
+
+/** One bounded read-only verification tick; CMS chooses the task. */
+export interface SourceRunVerificationJob {
+	trigger: 'auto' | 'manual';
+}
+
+/** A CMS-selected exact repair tick. It deliberately carries no target. */
+export interface PipelineRepairDispatchJob { trigger: 'auto'; }
+/** Immutable CMS repair command copied verbatim from the claim response. */
+export interface PipelineRepairStageJob {
+    schemaVersion: 'pipeline-repair/v1';
+    repairId: string; attemptId: string; claimToken: string; deterministicJobId: string;
+    stage: 'media_download' | 'media_transcode' | 'media_thumbnail' | 'text_embedding';
+    tenantId: string; contentItemId: string; itemVersion: string; sourceRunRequestId?: number;
+    fenceToken: string; leaseExpiresAt: string; leaseEpoch: number; effectInputDigest: string;
+    producerEventId: string;
+    content: { type: ContentType; source: SourceType; originalUrl?: string; mediaUrl?: string; title?: string; excerpt?: string; bodyText?: string; metadata?: Record<string, unknown> };
 }
 
 export interface RawItem {
     externalId: string;
     rawData: Record<string, unknown>;
     fetchedAt: string;
+	/** CMS-reserved replay identity. Never accepted from a dashboard/provider. */
+	upstreamObservationId?: string;
 }
 
 /**
@@ -129,6 +173,11 @@ export interface AIJob {
 export interface AtomizationJob {
     contentItemId: string;
     reason: 'media-ready' | 'transcript-ready' | 'manual' | 'reatomize' | 'sweeper';
+	workRequestId?: string;
+	workAttemptId?: string;
+	workClaimToken?: string;
+	workFenceToken?: string;
+	workInputFingerprint?: string;
 }
 
 /**
@@ -275,6 +324,10 @@ export const QUEUE_NAMES = {
     SOURCE_GRAPH: 'source-graph-queue',
     NEWS_CIRCULATION: 'news-circulation-queue',
     MEDIA_CIRCULATION: 'media-circulation-queue',
+	SOURCE_RUN_DISPATCH: 'source-run-dispatch-queue',
+	SOURCE_RUN_VERIFICATION: 'source-run-verification-queue',
+	LIFECYCLE_RECEIPTS: 'lifecycle-receipts-queue',
+	PIPELINE_REPAIR: 'pipeline-repair-queue',
     DLQ: 'aggregation-dlq',
 } as const;
 

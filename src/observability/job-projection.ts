@@ -56,6 +56,7 @@ export function safeFailureCode(reason: unknown): string {
     const value = reason instanceof Error ? reason.message : String(reason ?? '');
     if (/timeout|timed out|abort/i.test(value)) return 'deadline_exceeded';
     if (/unauthori[sz]ed|forbidden|\b401\b|\b403\b/i.test(value)) return 'authorization_failed';
+    if (/circuit(?: breaker)?.*open/i.test(value)) return 'circuit_open';
     if (/not found/i.test(value)) return 'not_found';
     if (/rate limit|\b429\b/i.test(value)) return 'rate_limited';
     if (/\b5\d\d\b|network|connect|socket|ECONN/i.test(value)) return 'upstream_unavailable';
@@ -64,6 +65,10 @@ export function safeFailureCode(reason: unknown): string {
 
 export function safeFailureSummary(reason: unknown): string {
     return safeFailureCode(reason).replaceAll('_', ' ');
+}
+
+export function isDependencyDeferral(reason: unknown): boolean {
+    return ['deadline_exceeded', 'upstream_unavailable', 'circuit_open', 'rate_limited'].includes(safeFailureCode(reason));
 }
 
 const sensitiveKey = /authorization|token|secret|password|cookie|session|api[_-]?key|body|settings|payload|download|mediaPath|path/i;

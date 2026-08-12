@@ -30,59 +30,9 @@ export async function scheduleSource(config: SourceConfig): Promise<string | und
         return undefined;
     }
 
-    const interval = config.pollIntervalMs || DEFAULT_POLL_INTERVALS[config.type];
-
-    if (!interval || interval === 0) {
-        logger.debug('No polling interval for source type', {
-            sourceId: config.id,
-            sourceType: config.type
-        });
-        return undefined;
-    }
-
-    const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
-    if (!fetchQueue) {
-        logger.error('Fetch queue not initialized');
-        return undefined;
-    }
-
-    const jobName = `scheduled-${config.type}-${config.id}`;
-
-    // Remove existing schedule if any
-    await unscheduleSource(config.id, config.type);
-
-    // Add repeatable job
-    const job = await fetchQueue.add(
-        jobName,
-        {
-            sourceId: config.id,
-            sourceType: config.type,
-            config: {
-                name: config.name,
-                url: config.url,
-                settings: config.settings,
-            },
-            triggeredBy: 'schedule',
-            triggeredAt: new Date().toISOString(),
-        },
-        {
-            repeat: {
-                every: interval,
-            },
-            jobId: jobName,
-            removeOnComplete: 10,
-            removeOnFail: 20,
-        }
-    );
-
-    logger.info('Source scheduled for polling', {
-        sourceId: config.id,
-        sourceType: config.type,
-        intervalMs: interval,
-        jobId: job.id,
-    });
-
-    return job.id ?? undefined;
+	await unscheduleSource(config.id, config.type);
+	logger.warn('Legacy per-source scheduling is disabled; CMS durable admission owns source work', { sourceId: config.id, sourceType: config.type });
+	return undefined;
 }
 
 /**
@@ -112,48 +62,8 @@ export async function unscheduleSource(sourceId: string, sourceType: SourceType)
  * Trigger an immediate poll for a source
  */
 export async function triggerPoll(config: SourceConfig, lineage?: { sourceRunRequestId?: string; tenantId?: string; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string }): Promise<string | undefined> {
-    const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
-    if (!fetchQueue) {
-        logger.error('Fetch queue not initialized');
-        return undefined;
-    }
-
-    const jobName = `manual-${config.type}-${config.id}-${Date.now()}`;
-
-    const job = await fetchQueue.add(
-        jobName,
-        {
-            sourceId: config.id,
-            sourceType: config.type,
-            config: {
-                name: config.name,
-                url: config.url,
-                settings: config.settings,
-            },
-            triggeredBy: 'manual',
-            triggeredAt: new Date().toISOString(),
-			sourceRunRequestId: lineage?.sourceRunRequestId,
-			tenantId: lineage?.tenantId,
-			operatorPlanId: lineage?.operatorPlanId,
-			operatorStepId: lineage?.operatorStepId,
-			idempotencyKey: lineage?.idempotencyKey,
-        },
-        {
-            priority: 1, // High priority for manual triggers
-			// A registered Operator action is a one-step plan. Replays of the
-			// exact handoff therefore share one BullMQ job rather than enqueueing
-			// another source fetch. Legacy manual runs retain their current shape.
-			...(lineage?.idempotencyKey ? { jobId: lineage.idempotencyKey } : {}),
-        }
-    );
-
-    logger.info('Manual poll triggered', {
-        sourceId: config.id,
-        sourceType: config.type,
-        jobId: job.id,
-    });
-
-    return job.id ?? undefined;
+	void config; void lineage;
+	throw new Error('LEGACY_SOURCE_ADMISSION_DISABLED: create a CMS durable source-run request');
 }
 
 /**

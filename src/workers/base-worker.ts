@@ -8,12 +8,22 @@ import { logger, createLogger, type LogContext } from '../observability/logger.j
 import { jobsTotal, jobDuration, retryCount, dlqSize } from '../observability/metrics.js';
 import { getQueue, QUEUE_NAMES, type DLQJob } from '../queues/index.js';
 import { safeFailureCode, safeFailureSummary, safeJobMetadata, safePayloadHash } from '../observability/job-projection.js';
+import { registerWorkerLiveness } from './worker-liveness.js';
 
 export interface WorkerConfig {
     queueName: string;
     concurrency?: number;
     timeoutMs?: number;
     processor: (job: Job, jobLogger: ReturnType<typeof createLogger>, signal?: AbortSignal) => Promise<void>;
+    /**
+     * Control ticks are disposable scheduler wakeups, not durable operational
+     * units. Their CMS-owned work remains recoverable from its ledger and the
+     * next tick, so copying an exhausted tick into the DLQ only creates noise.
+     */
+    shouldDeadLetter?: (job: Job) => boolean;
+    /** A control tick may safely wait for its next schedule when no durable
+     * effect was claimed and a dependency is temporarily unavailable. */
+    shouldDeferFailure?: (job: Job, error: unknown) => boolean;
 }
 
 /**
@@ -25,6 +35,8 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
         concurrency = config.workerConcurrency,
         timeoutMs = config.defaultJobTimeoutMs,
         processor,
+        shouldDeadLetter = () => true,
+        shouldDeferFailure = () => false,
     } = workerConfig;
 
     const worker = new Worker(
@@ -50,6 +62,10 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
 
                 jobLogger.info(`Job completed`, { durationMs: Date.now() - startTime });
             } catch (error) {
+                if (shouldDeferFailure(job, error)) {
+                    jobLogger.warn('Control tick deferred', { failureCode: safeFailureCode(error) });
+                    return;
+                }
                 jobLogger.error(`Job failed`, error);
                 throw error; // Re-throw to let BullMQ handle retries
             }
@@ -82,7 +98,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
             });
 
             // Move to DLQ if all retries exhausted
-            if (job.opts.attempts && attemptsMade >= job.opts.attempts) {
+            if (job.opts.attempts && attemptsMade >= job.opts.attempts && shouldDeadLetter(job)) {
                 await moveToDeadLetterQueue(job, queueName, error.message);
             }
         }
@@ -104,6 +120,8 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
     worker.on('ready', () => {
         logger.info(`Worker ready for queue: ${queueName}`);
     });
+
+    registerWorkerLiveness(worker);
 
     return worker;
 }
