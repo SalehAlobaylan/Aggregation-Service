@@ -217,6 +217,18 @@ function getNumber(raw: Record<string, unknown>, keys: string[]): number | undef
     return undefined;
 }
 
+export function youtubeCandidateLimit(
+    maxResults: number,
+    minDurationSec?: number,
+    maxDurationSec?: number,
+): number {
+    // Duration filtering happens after the details lookup. Pull a bounded
+    // candidate window so a few Shorts do not empty an otherwise valid batch.
+    return minDurationSec || maxDurationSec
+        ? Math.min(50, maxResults * 4)
+        : maxResults;
+}
+
 export const youtubeFetcher: Fetcher = {
     sourceType: 'YOUTUBE',
 
@@ -243,6 +255,7 @@ export const youtubeFetcher: Fetcher = {
         const maxDurationSec = typeof maxDurationMinCandidate === 'number' && maxDurationMinCandidate > 0
             ? Math.floor(maxDurationMinCandidate * 60)
             : undefined;
+        const candidateLimit = youtubeCandidateLimit(maxResults, minDurationSec, maxDurationSec);
 
         let { channelId, playlistId, searchQuery } = ytConfig.settings as {
             channelId?: string;
@@ -314,7 +327,7 @@ export const youtubeFetcher: Fetcher = {
                 const playlistUrl = new URL(`${YOUTUBE_API_BASE}/playlistItems`);
                 playlistUrl.searchParams.set('part', 'snippet');
                 playlistUrl.searchParams.set('playlistId', playlistId);
-                playlistUrl.searchParams.set('maxResults', maxResults.toString());
+                playlistUrl.searchParams.set('maxResults', candidateLimit.toString());
                 playlistUrl.searchParams.set('key', apiKey);
                 if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
 
@@ -340,7 +353,7 @@ export const youtubeFetcher: Fetcher = {
                 searchUrl.searchParams.set('type', 'video');
                 searchUrl.searchParams.set('order', 'date');
                 searchUrl.searchParams.set('q', searchQuery);
-                searchUrl.searchParams.set('maxResults', maxResults.toString());
+                searchUrl.searchParams.set('maxResults', candidateLimit.toString());
                 searchUrl.searchParams.set('key', apiKey);
                 if (cursor) searchUrl.searchParams.set('pageToken', cursor);
 
@@ -386,7 +399,7 @@ export const youtubeFetcher: Fetcher = {
                         searchUrl.searchParams.set('type', 'video');
                         searchUrl.searchParams.set('order', 'date');
                         searchUrl.searchParams.set('videoDuration', 'short');
-                        searchUrl.searchParams.set('maxResults', maxResults.toString());
+                        searchUrl.searchParams.set('maxResults', candidateLimit.toString());
                         searchUrl.searchParams.set('key', apiKey);
                         if (cursor) searchUrl.searchParams.set('pageToken', cursor);
 
@@ -411,7 +424,7 @@ export const youtubeFetcher: Fetcher = {
                         const playlistUrl = new URL(`${YOUTUBE_API_BASE}/playlistItems`);
                         playlistUrl.searchParams.set('part', 'snippet');
                         playlistUrl.searchParams.set('playlistId', targetPlaylistId);
-                        playlistUrl.searchParams.set('maxResults', maxResults.toString());
+                        playlistUrl.searchParams.set('maxResults', candidateLimit.toString());
                         playlistUrl.searchParams.set('key', apiKey);
                         if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
 
@@ -437,7 +450,7 @@ export const youtubeFetcher: Fetcher = {
                     const playlistUrl = new URL(`${YOUTUBE_API_BASE}/playlistItems`);
                     playlistUrl.searchParams.set('part', 'snippet');
                     playlistUrl.searchParams.set('playlistId', targetPlaylistId);
-                    playlistUrl.searchParams.set('maxResults', maxResults.toString());
+                    playlistUrl.searchParams.set('maxResults', candidateLimit.toString());
                     playlistUrl.searchParams.set('key', apiKey);
                     if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
 

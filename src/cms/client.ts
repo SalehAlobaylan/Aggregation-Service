@@ -74,6 +74,7 @@ const cmsCircuitBreaker = new CircuitBreaker({
 });
 
 const CMS_REQUEST_TIMEOUT_MS = 10_000;
+const CMS_CIRCULATION_CLAIM_TIMEOUT_MS = 60_000;
 const CMS_MAX_SUCCESS_BODY_BYTES = 2 << 20;
 const CMS_MAX_ERROR_BODY_BYTES = 16 << 10;
 
@@ -152,6 +153,7 @@ async function makeRequest<T>(
     body?: unknown,
     requestId?: string,
     parentSignal?: AbortSignal,
+    timeoutMs = CMS_REQUEST_TIMEOUT_MS,
 ): Promise<T> {
     const url = `${config.cmsBaseUrl}${path}`;
     const reqId = requestId || uuidv4();
@@ -164,8 +166,8 @@ async function makeRequest<T>(
         headers: buildHeaders(reqId),
         body: body ? JSON.stringify(body) : undefined,
         signal: parentSignal
-            ? AbortSignal.any([parentSignal, AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS)])
-            : AbortSignal.timeout(CMS_REQUEST_TIMEOUT_MS),
+            ? AbortSignal.any([parentSignal, AbortSignal.timeout(timeoutMs)])
+            : AbortSignal.timeout(timeoutMs),
     });
 
     if (!response.ok) {
@@ -203,9 +205,10 @@ async function makeProtectedRequest<T>(
     body?: unknown,
     requestId?: string,
     parentSignal?: AbortSignal,
+    timeoutMs = CMS_REQUEST_TIMEOUT_MS,
 ): Promise<T> {
     return cmsCircuitBreaker.execute(
-        () => makeRequest<T>(method, path, body, requestId, parentSignal),
+        () => makeRequest<T>(method, path, body, requestId, parentSignal, timeoutMs),
         countsAsCMSAvailabilityFailure,
     );
 }
@@ -526,8 +529,8 @@ export const cmsClient = {
         return makeRequest('GET', '/discovery/profiles?enabled=true', undefined, requestId);
     },
 
-    async getCirculationPolicy(tenantId = 'default', requestId?: string): Promise<NewsCirculationPolicy> {
-        return makeRequest('GET', `/circulation/policy?tenant_id=${encodeURIComponent(tenantId)}`, undefined, requestId);
+    async getCirculationPolicy(tenantId = 'default', requestId?: string, parentSignal?: AbortSignal, lane: 'news' | 'media' = 'news'): Promise<NewsCirculationPolicy> {
+        return makeRequest('GET', `/circulation/policy?tenant_id=${encodeURIComponent(tenantId)}&lane=${lane}`, undefined, requestId, parentSignal);
     },
 
     async claimCirculationSources(
@@ -535,14 +538,17 @@ export const cmsClient = {
         limit = 20,
         force = false,
         requestId?: string,
-        recovery?: { runId: string; manifestHash: string; lane: 'news' | 'media'; sourceIds: string[]; lookbackHours: number; maxItems: number; preserveCheckpoints: true }
+        recovery?: { runId: string; manifestHash: string; lane: 'news' | 'media'; sourceIds: string[]; lookbackHours: number; maxItems: number; preserveCheckpoints: true },
+        parentSignal?: AbortSignal,
     ): Promise<ClaimCirculationSourcesResponse> {
         const recoveryQuery = recovery ? `&recovery_lane=${recovery.lane}&recovery_run_id=${encodeURIComponent(recovery.runId)}&recovery_manifest_hash=${encodeURIComponent(recovery.manifestHash)}&recovery_source_ids=${encodeURIComponent(recovery.sourceIds.join(','))}&recovery_lookback_hours=${recovery.lookbackHours}&recovery_max_items=${recovery.maxItems}&preserve_checkpoints=true` : '';
         return makeProtectedRequest(
             'POST',
             `/circulation/claim-sources?tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}&force=${force ? 'true' : 'false'}${recoveryQuery}`,
             {},
-            requestId
+            requestId,
+            parentSignal,
+            CMS_CIRCULATION_CLAIM_TIMEOUT_MS,
         );
     },
 
@@ -550,12 +556,15 @@ export const cmsClient = {
         tenantId = 'default',
         limit = 0,
         requestId?: string,
+		parentSignal?: AbortSignal,
     ): Promise<ClaimMediaCirculationSourcesResponse> {
         return makeProtectedRequest(
             'POST',
             `/circulation/claim-sources?lane=media&tenant_id=${encodeURIComponent(tenantId)}&limit=${limit}`,
             {},
             requestId,
+			parentSignal,
+			CMS_CIRCULATION_CLAIM_TIMEOUT_MS,
         );
     },
 
@@ -563,8 +572,8 @@ export const cmsClient = {
         await makeProtectedRequest('POST', '/circulation/source-runs', data, requestId, parentSignal);
     },
 
-	async acceptSourceRunRequest(sourceRunRequestId: string, jobId: string, requestId?: string): Promise<void> {
-		await makeProtectedRequest('POST', `/source-run-requests/${encodeURIComponent(sourceRunRequestId)}/accepted`, { job_id: jobId }, requestId);
+	async acceptSourceRunRequest(sourceRunRequestId: string, jobId: string, requestId?: string, parentSignal?: AbortSignal): Promise<void> {
+		await makeProtectedRequest('POST', `/source-run-requests/${encodeURIComponent(sourceRunRequestId)}/accepted`, { job_id: jobId }, requestId, parentSignal);
 	},
 
     /**

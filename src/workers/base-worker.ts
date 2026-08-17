@@ -134,6 +134,17 @@ interface ProcessorTimeoutOptions {
 }
 
 const DEFAULT_CANCELLATION_GRACE_MS = 5_000;
+const activeProcessorControllers = new Set<AbortController>();
+
+export function abortActiveProcessors(
+    reason: Error = new Error('Aggregation worker shutdown requested'),
+): number {
+    const controllers = [...activeProcessorControllers];
+    for (const controller of controllers) {
+        controller.abort(reason);
+    }
+    return controllers.length;
+}
 
 // Deliberately indirect only for the child-process test. Production uses an
 // immediate role exit: returning a failed BullMQ promise while the processor
@@ -155,6 +166,7 @@ export async function runProcessorWithTimeout(
     options: ProcessorTimeoutOptions
 ): Promise<void> {
     const controller = new AbortController();
+    activeProcessorControllers.add(controller);
     const timeoutError = jobTimeoutError(options.timeoutMs, options.queueName, options.jobId);
     const cancellationGraceMs = options.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS;
     let timeoutWake: (() => void) | undefined;
@@ -203,6 +215,7 @@ export async function runProcessorWithTimeout(
         }
     } finally {
         clearTimeout(timer);
+        activeProcessorControllers.delete(controller);
     }
 }
 

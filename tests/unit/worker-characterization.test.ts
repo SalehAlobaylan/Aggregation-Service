@@ -250,7 +250,7 @@ describe('media worker characterization', () => {
                 operations: ['transcript', 'embedding'],
                 mediaUrl: 'https://storage.example.com/content/content-1/processed.mp4',
             }),
-            { priority: 2, jobId: 'ai-content-1' }
+            { priority: 1, jobId: 'ai-content-1' }
         );
         expect(mocks.downloadHttp).not.toHaveBeenCalled();
         expect(mocks.downloadYouTube).not.toHaveBeenCalled();

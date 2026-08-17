@@ -23,7 +23,7 @@ const ids = {
   page: '44444444-4444-4444-8444-444444444444', fence: '55555555-5555-4555-8555-555555555555', lease: '66666666-6666-4666-8666-666666666666',
 }
 const claim = {
-  request: { id: ids.request, tenant_id: 'tenant-a', source_id: '77777777-7777-4777-8777-777777777777', item_cap: 3, byte_cap: 4096, provider_call_cap: 1, metadata: {} },
+  request: { id: ids.request, tenant_id: 'tenant-a', source_id: '77777777-7777-4777-8777-777777777777', lane: 'media', purpose: 'circulation', correlation_id: 'media:test', item_cap: 3, byte_cap: 4096, provider_call_cap: 1, workload_cap: 4, metadata: {} },
   attempt: { id: ids.attempt, fence_token: ids.fence },
   unit: { id: ids.root, job_id: 'source-unit:root', attempt_fence_token: ids.fence },
   source: { id: '77777777-7777-4777-8777-777777777777', type: 'PODCAST', name: 'Tenant A podcast', url: 'https://example.test/feed', settings: {}, fetch_interval_minutes: 30 },
@@ -57,6 +57,10 @@ describe('source-run dispatch worker', () => {
     const fetchCall = mocks.queues.get('fetch-queue')!.add.mock.calls[0]
     expect(fetchCall[0]).toBe('source-run-fetch-page')
     expect(fetchCall[1]).toEqual(expect.objectContaining({ tenantId: 'tenant-a', sourceRunRequestId: ids.request, sourceRunCoordinatorUnitId: ids.root, sourceRunPageId: 'initial', sourceRun: expect.objectContaining({ executionUnitId: ids.page, attemptFenceToken: ids.fence, executionLeaseToken: ids.lease }) }))
+    expect(fetchCall[1].config.settings).toEqual(expect.objectContaining({
+      max_results: 3,
+      min_duration_minutes: 4.5,
+    }))
     expect(fetchCall[2]).toEqual(expect.objectContaining({ jobId: 'source-unit:page' }))
     expect(mocks.enqueueSourceRunReceipt).toHaveBeenCalledTimes(1)
   })

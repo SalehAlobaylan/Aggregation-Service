@@ -59,7 +59,11 @@ import {
     keyFromUrl,
     sourceKeyCandidates,
 } from '../../src/services/quality.service.js';
-import { DEFAULT_ENCODE_PROFILE } from '../../src/media/transcoder.js';
+import {
+    buildEncodeOptions,
+    DEFAULT_ENCODE_PROFILE,
+    FFMPEG_TRANSCODE_THREADS,
+} from '../../src/media/transcoder.js';
 
 describe('toEncodeProfile', () => {
     it('maps every CMS QualityProfile field onto its ffmpeg counterpart', () => {
@@ -229,5 +233,13 @@ describe('DEFAULT_ENCODE_PROFILE', () => {
             audioCodec: 'aac',
             audioBitrateKbps: 128,
         });
+    });
+
+    it('bounds FFmpeg threads so media work cannot starve BullMQ lock renewal', () => {
+        expect(FFMPEG_TRANSCODE_THREADS).toBe(2);
+        expect(buildEncodeOptions(DEFAULT_ENCODE_PROFILE)).toEqual(expect.arrayContaining([
+            '-threads 2',
+            '-filter_threads 1',
+        ]));
     });
 });

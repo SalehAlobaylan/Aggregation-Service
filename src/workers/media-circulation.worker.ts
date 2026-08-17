@@ -7,26 +7,35 @@
  * evidence or decides which source is eligible.
  */
 import { Job, Queue } from 'bullmq';
-import { getQueue, QUEUE_NAMES, type MediaCirculationJob } from '../queues/index.js';
+import { getQueue, QUEUE_NAMES, type FetchJob, type MediaCirculationJob } from '../queues/index.js';
 import { createWorker } from './base-worker.js';
 import { logger } from '../observability/logger.js';
+import { cmsClient } from '../cms/client.js';
+import { sourceAdmissionMode } from '../services/source-admission-mode.js';
 
 const REPEATABLE_NAME = 'media-circulation-repeatable';
 
 export const mediaCirculationWorker = createWorker({
     queueName: QUEUE_NAMES.MEDIA_CIRCULATION,
-	processor: async (job: Job<MediaCirculationJob>, jobLogger): Promise<void> => {
-		jobLogger.info('Legacy media circulation work rejected; CMS source-run admission owns all source work', { trigger: job.data.trigger });
-		return;
-		/* legacy read-compatible implementation retained below for contract history
-        const tenantId = job.data.tenantId || 'default';
+	timeoutMs: 120_000,
+	processor: async (job: Job<MediaCirculationJob>, jobLogger, signal): Promise<void> => {
+		const tenantId = job.data.tenantId || 'default';
+		const policy = await cmsClient.getCirculationPolicy(tenantId, job.id, signal, 'media');
+		const admissionMode = sourceAdmissionMode(policy);
+		if (admissionMode !== 'compatibility') {
+			jobLogger.info('Media circulation claim skipped: durable CMS admission owns the lane', {
+				admissionMode,
+				trigger: job.data.trigger,
+			});
+			return;
+		}
         const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
         if (!fetchQueue) {
             jobLogger.warn('Media circulation skipped: fetch queue unavailable');
             return;
         }
 
-        const claimed = await cmsClient.claimMediaCirculationSources(tenantId, 0, job.id);
+        const claimed = await cmsClient.claimMediaCirculationSources(tenantId, 0, job.id, signal);
         let enqueued = 0;
         for (const source of claimed.data ?? []) {
             const fetchJob: FetchJob = {
@@ -52,7 +61,7 @@ export const mediaCirculationWorker = createWorker({
                 { priority: job.data.trigger === 'manual' ? 1 : 3 },
             );
             if (source.source_run_request_id && fetchJobRecord.id) {
-                await cmsClient.acceptSourceRunRequest(source.source_run_request_id, String(fetchJobRecord.id), job.id);
+                await cmsClient.acceptSourceRunRequest(source.source_run_request_id, String(fetchJobRecord.id), job.id, signal);
             }
             enqueued++;
         }
@@ -62,7 +71,6 @@ export const mediaCirculationWorker = createWorker({
             claimed: claimed.data?.length ?? 0,
             enqueued,
 		});
-		*/
 	},
 });
 
@@ -79,5 +87,26 @@ export async function syncMediaCirculationSweeper(): Promise<void> {
             .map((entry) => queue.removeRepeatableByKey(entry.key).catch(() => undefined)),
     );
 
-	logger.info('media circulation: retired legacy repeatable in favor of CMS source-run dispatch');
+	const policy = await cmsClient.getCirculationPolicy('default', undefined, undefined, 'media');
+	const admissionMode = sourceAdmissionMode(policy);
+	if (admissionMode === 'durable') {
+		logger.info('media circulation: durable CMS source-run admission owns the lane');
+		return;
+	}
+
+	const intervalMinutes = Math.max(1, policy.source_claim_interval_minutes || 15);
+	await queue.add(
+		REPEATABLE_NAME,
+		{ trigger: 'auto', tenantId: 'default' } satisfies MediaCirculationJob,
+		{
+			repeat: { every: intervalMinutes * 60_000 },
+			jobId: REPEATABLE_NAME,
+		},
+	);
+	await queue.add(
+		'media-circulation-bootstrap',
+		{ trigger: 'auto', tenantId: 'default' } satisfies MediaCirculationJob,
+		{ jobId: 'media-circulation-bootstrap', removeOnComplete: true, removeOnFail: true },
+	);
+	logger.info('media circulation: registered compatibility source claim', { intervalMinutes });
 }

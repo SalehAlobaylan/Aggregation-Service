@@ -4,7 +4,7 @@
  */
 import { spawn } from 'child_process';
 import { createWriteStream } from 'fs';
-import { mkdir, unlink, stat, writeFile } from 'fs/promises';
+import { mkdir, readFile, rename, unlink, stat, writeFile } from 'fs/promises';
 import { join, basename } from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
@@ -61,6 +61,11 @@ const SPONSORBLOCK_ARGS = [
 // discipline. Podcast/video episodes are well under this; anything larger is
 // almost certainly a mistake or abuse.
 export const MAX_MEDIA_DOWNLOAD_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
+// The canonical ingest profile caps output at 720p. Downloading 1080p/4K only
+// increases transfer, disk, and encode pressure before those pixels are thrown
+// away by the transcoder.
+export const YOUTUBE_VIDEO_FORMAT = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]';
+export const YOUTUBE_FORCE_OVERWRITE_ARGS = ['--force-overwrites'] as const;
 const MAX_YTDLP_BUF = 4 * 1024 * 1024; // Tail keeps --print-json and recent logs.
 const MEDIA_RESPONSE_TIMEOUT_MS = 30_000;
 
@@ -112,6 +117,85 @@ async function ensureTempDir(): Promise<string> {
  */
 function getTempPath(contentItemId: string, extension: string): string {
     return join(config.mediaTempDir, `${contentItemId}.${extension}`);
+}
+
+/** Return a same-item source download from an earlier attempt, if one exists. */
+export async function findExistingYouTubeDownload(
+    contentItemId: string,
+    tempDir: string = config.mediaTempDir,
+): Promise<DownloadResult | undefined> {
+    for (const format of ['mp4', 'mkv', 'webm', 'm4a']) {
+        const filePath = join(tempDir, `${contentItemId}.${format}`);
+        try {
+            const file = await stat(filePath);
+            if (file.isFile() && file.size > 0) return { filePath, format };
+        } catch {
+            // Try the next canonical yt-dlp output extension.
+        }
+    }
+    return undefined;
+}
+
+export interface CachedYouTubeFallback {
+    url: string;
+    extension: string;
+    height: number;
+}
+
+/**
+ * Choose a muxed, bounded video+audio URL from yt-dlp metadata written by a
+ * previous same-item attempt. The URL still passes downloadHttp's public-host,
+ * response-type, and byte-cap checks before any file is accepted.
+ */
+export function selectCachedYouTubeFallback(metadata: unknown): CachedYouTubeFallback | undefined {
+    if (!metadata || typeof metadata !== 'object') return undefined;
+    const formats = (metadata as { formats?: unknown }).formats;
+    if (!Array.isArray(formats)) return undefined;
+
+    const candidates = formats.flatMap((value): CachedYouTubeFallback[] => {
+        if (!value || typeof value !== 'object') return [];
+        const format = value as Record<string, unknown>;
+        const url = typeof format.url === 'string' ? format.url : '';
+        const extension = typeof format.ext === 'string' ? format.ext.toLowerCase() : '';
+        const height = Number(format.height ?? 0);
+        const size = Number(format.filesize ?? format.filesize_approx ?? 0);
+        const hasVideo = typeof format.vcodec === 'string' && format.vcodec !== 'none';
+        const hasAudio = typeof format.acodec === 'string' && format.acodec !== 'none';
+        let protocolAllowed = false;
+        try {
+            const protocol = new URL(url).protocol;
+            protocolAllowed = protocol === 'https:' || protocol === 'http:';
+        } catch {
+            protocolAllowed = false;
+        }
+        if (
+            !protocolAllowed ||
+            !hasVideo ||
+            !hasAudio ||
+            !Number.isFinite(height) ||
+            height <= 0 ||
+            height > 720 ||
+            (size > 0 && size > MAX_MEDIA_DOWNLOAD_BYTES) ||
+            !['mp4', 'webm'].includes(extension)
+        ) {
+            return [];
+        }
+        return [{ url, extension, height }];
+    });
+
+    return candidates.sort((a, b) => {
+        if (a.height !== b.height) return b.height - a.height;
+        return Number(b.extension === 'mp4') - Number(a.extension === 'mp4');
+    })[0];
+}
+
+async function readCachedYouTubeFallback(contentItemId: string): Promise<CachedYouTubeFallback | undefined> {
+    try {
+        const raw = await readFile(getTempPath(contentItemId, 'info.json'), 'utf8');
+        return selectCachedYouTubeFallback(JSON.parse(raw));
+    } catch {
+        return undefined;
+    }
 }
 
 export function isAllowedYouTubeUrl(rawUrl: string): boolean {
@@ -239,14 +323,34 @@ export async function downloadYouTube(
 
     const outputTemplate = getTempPath(contentItemId, '%(ext)s');
     const outputPath = getTempPath(contentItemId, 'mp4'); // Expected output
+    const existingDownload = await findExistingYouTubeDownload(contentItemId);
+    const cachedFallback = await readCachedYouTubeFallback(contentItemId);
+    const backupPath = existingDownload ? `${existingDownload.filePath}.retry-backup` : undefined;
+
+    if (existingDownload && backupPath) {
+        await unlink(backupPath).catch(() => {});
+        await rename(existingDownload.filePath, backupPath);
+    }
+
+    const restoreExistingDownload = async (): Promise<DownloadResult | undefined> => {
+        if (!existingDownload || !backupPath) return undefined;
+        await unlink(existingDownload.filePath).catch(() => {});
+        await rename(backupPath, existingDownload.filePath);
+        return existingDownload;
+    };
+
+    const discardExistingBackup = async (): Promise<void> => {
+        if (backupPath) await unlink(backupPath).catch(() => {});
+    };
 
     logger.info('Starting YouTube download', { url, contentItemId });
 
-    const buildArgs = (withSubtitles: boolean) => [
-        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+    const buildArgs = (withSubtitles: boolean, forceOverwrite: boolean) => [
+        '-f', YOUTUBE_VIDEO_FORMAT,
         '--merge-output-format', 'mp4',
         '-o', outputTemplate,
         '--no-playlist',
+        ...(forceOverwrite ? YOUTUBE_FORCE_OVERWRITE_ARGS : []),
         '--write-info-json',
         ...(withSubtitles ? SUBTITLE_ARGS : []),
         ...SPONSORBLOCK_ARGS,
@@ -304,20 +408,57 @@ export async function downloadYouTube(
     };
 
     try {
-        const { stdout } = await runYtDlp(buildArgs(true), url, { signal });
-        return parseResult(stdout);
+        // Replace a prior source when YouTube is available so retries honor the
+        // current 720p ingest ceiling. yt-dlp writes through a .part file, so a
+        // pre-existing complete source remains available if extraction is
+        // rejected before transfer begins.
+        const { stdout } = await runYtDlp(buildArgs(true, true), url, { signal });
+        const result = await parseResult(stdout);
+        await discardExistingBackup();
+        return result;
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!message.includes('Unable to download video subtitles')) {
-            throw err;
+        if (message.includes('Unable to download video subtitles')) {
+            logger.warn('YouTube subtitle download failed; retrying media without subtitles', {
+                url,
+                contentItemId,
+                error: message,
+            });
+            try {
+                const { stdout } = await runYtDlp(buildArgs(false, false), url, { signal });
+                const result = await parseResult(stdout);
+                await discardExistingBackup();
+                return result;
+            } catch (subtitleRetryError) {
+                await restoreExistingDownload();
+                throw subtitleRetryError;
+            }
         }
-        logger.warn('YouTube subtitle download failed; retrying media without subtitles', {
-            url,
-            contentItemId,
-            error: message,
-        });
-        const { stdout } = await runYtDlp(buildArgs(false), url, { signal });
-        return parseResult(stdout);
+
+        const restoredDownload = await restoreExistingDownload();
+        if (message.includes('Sign in to confirm you')) {
+            if (restoredDownload) {
+                logger.warn('YouTube challenged fresh download; reusing validated same-item source', {
+                    contentItemId,
+                    format: restoredDownload.format,
+                });
+                return restoredDownload;
+            }
+            if (cachedFallback) {
+                logger.warn('YouTube challenged extraction; downloading bounded same-item cached format', {
+                    contentItemId,
+                    format: cachedFallback.extension,
+                    height: cachedFallback.height,
+                });
+                return downloadHttp(
+                    cachedFallback.url,
+                    contentItemId,
+                    cachedFallback.extension,
+                    signal,
+                );
+            }
+        }
+        throw err;
     }
 }
 

@@ -2,7 +2,11 @@ import { EventEmitter } from 'events';
 import type { Job } from 'bullmq';
 import { describe, expect, it, vi } from 'vitest';
 import { createLogger } from '../../src/observability/logger.js';
-import { runProcessorWithTimeout, workerTestUtils } from '../../src/workers/base-worker.js';
+import {
+    abortActiveProcessors,
+    runProcessorWithTimeout,
+    workerTestUtils,
+} from '../../src/workers/base-worker.js';
 import { transcoderTestUtils } from '../../src/media/transcoder.js';
 
 describe('worker timeout cancellation', () => {
@@ -53,6 +57,28 @@ describe('worker timeout cancellation', () => {
         await expect(failure).rejects.toBe(reason);
         expect(command.kill).toHaveBeenCalledWith('SIGKILL');
         expect(command.run).toHaveBeenCalledOnce();
+    });
+
+    it('aborts active processor signals during worker shutdown', async () => {
+        const job = { id: 'job-shutdown', name: 'test', data: {} } as unknown as Job;
+        const jobLogger = createLogger({ queue: 'test-queue', jobId: 'job-shutdown' });
+        const shutdownReason = new Error('shutdown requested');
+
+        const run = runProcessorWithTimeout(
+            async (_job, _logger, signal) => {
+                await new Promise<void>((_resolve, reject) => {
+                    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+                });
+            },
+            job,
+            jobLogger,
+            { timeoutMs: 60_000, queueName: 'test-queue', jobId: 'job-shutdown' },
+        );
+
+        await Promise.resolve();
+        expect(abortActiveProcessors(shutdownReason)).toBe(1);
+        await expect(run).rejects.toBe(shutdownReason);
+        expect(abortActiveProcessors()).toBe(0);
     });
 
     it('terminates the worker role when a processor ignores cancellation', async () => {

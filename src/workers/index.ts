@@ -92,6 +92,17 @@ export async function startWorkers(): Promise<void> {
         logger.info('Starting all workers...');
         workers = await createWorkers();
 
+        // Jobs queued before the media priority split would otherwise remain
+        // buried behind the existing News embedding backlog after a restart.
+        import('../services/ai-queue-priority.js')
+            .then(async ({ reprioritizePendingMediaAIJobs }) => {
+                const repaired = await reprioritizePendingMediaAIJobs();
+                if (repaired > 0) {
+                    logger.info('Reprioritized pending media AI jobs', { count: repaired });
+                }
+            })
+            .catch(err => logger.error('Failed to repair pending media AI priorities', err));
+
         // Schedule repeatable storage sweepers (best-effort — non-fatal if CMS is down)
         syncRepeatableSweepers().catch(err => {
             logger.error('Failed to sync repeatable storage sweepers', err);
@@ -162,6 +173,15 @@ export async function startWorkers(): Promise<void> {
  */
 export async function closeWorkers(): Promise<void> {
     logger.info('Closing all workers...');
+
+    // BullMQ's close waits for active processors, but the dev watcher force-kills
+    // the role after five seconds. Abort first so downloads and FFmpeg children
+    // receive their cooperative signal and cannot survive as orphan processes.
+    const { abortActiveProcessors } = await import('./base-worker.js');
+    const aborted = abortActiveProcessors();
+    if (aborted > 0) {
+        logger.info('Aborted active processors for shutdown', { count: aborted });
+    }
 
     const activeWorkers = workers;
     await Promise.all(

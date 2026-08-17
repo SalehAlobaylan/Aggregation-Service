@@ -789,6 +789,7 @@ export interface ListMissingEmbeddingResponse {
 
 export interface NewsCirculationPolicy {
   tenant_id: string;
+  lane?: "news" | "media";
   preset: string;
   timezone: string;
   source_cadence_mode: "suggest" | "auto_apply" | "manual";
@@ -796,6 +797,8 @@ export interface NewsCirculationPolicy {
   source_min_interval_minutes: number;
   source_max_interval_minutes: number;
   source_max_change_percent: number;
+  /** Absent only while rolling against a CMS build predating mode exposure. */
+  source_run_admission_mode?: "compatibility" | "durable";
 }
 
 export interface CirculationSourceClaim {

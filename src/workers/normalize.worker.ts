@@ -15,6 +15,7 @@ import type { NormalizedItem } from '../normalizers/types.js';
 import { sourceRunExecutionEnvelopeSchema } from '../contracts/source-runs.js';
 import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
+import { aiPriorityForContentType } from '../services/ai-queue-priority.js';
 
 interface SourceFilters {
     include_keywords?: string[];
@@ -365,7 +366,7 @@ export const normalizeWorker = createWorker({
                                         mediaUrl: normalized.mediaUrl,
                                     },
                                     // Deterministic id coalesces duplicate AI jobs on re-ingest.
-                                    { priority: 2, jobId: `ai-${contentItemId}` }
+                                    { priority: aiPriorityForContentType(normalized.type), jobId: `ai-${contentItemId}` }
                                 );
 
                             aiEnqueued++;
@@ -431,7 +432,7 @@ export const normalizeWorker = createWorker({
                                     },
                                 },
                                 // Deterministic id coalesces duplicate AI jobs on re-ingest.
-                                { priority: 2, jobId: `ai-${contentItemId}` }
+                                { priority: aiPriorityForContentType(normalized.type), jobId: `ai-${contentItemId}` }
                             );
 
                         aiEnqueued++;

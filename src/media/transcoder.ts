@@ -59,6 +59,13 @@ export const DEFAULT_ENCODE_PROFILE: EncodeProfile = {
     audioBitrateKbps: 128,
 };
 
+// Media workers run alongside every other BullMQ lane in one Node process.
+// Leaving x264 at its automatic thread count lets two encodes create hundreds
+// of runnable threads on a developer machine, starving BullMQ lock renewal and
+// stalling unrelated queues. Keep each encode bounded; worker concurrency still
+// provides parallelism across media items.
+export const FFMPEG_TRANSCODE_THREADS = 2;
+
 function runFfmpegWithTimeout(
     command: ReturnType<typeof ffmpeg>,
     label: string,
@@ -139,6 +146,7 @@ export function buildEncodeOptions(profile: EncodeProfile): string[] {
     const opts: string[] = [];
     opts.push(`-c:v ${videoCodecFlag(profile.videoCodec)}`);
     opts.push(`-preset ${profile.preset}`);
+    opts.push(`-threads ${FFMPEG_TRANSCODE_THREADS}`, '-filter_threads 1');
 
     // Keep mobile compatibility for h264. h265/av1 ignore profile:baseline.
     if (profile.videoCodec === 'h264') {

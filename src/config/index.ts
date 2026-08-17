@@ -94,7 +94,7 @@ const configSchema = z.object({
     queueNames: z.string().default('fetch,normalize,media,ai').transform(s => s.split(',')),
 
     // Job Timeouts & Stall Detection
-    mediaJobTimeoutMs: positiveIntSchema.default(1800000),  // 30 min — FFmpeg can be slow
+    mediaJobTimeoutMs: positiveIntSchema.default(3_600_000), // 60 min — bounded for legal 4K/AV1 recovery
     defaultJobTimeoutMs: positiveIntSchema.default(300000), // 5 min — fetch/normalize/ai
     stalledIntervalMs: positiveIntSchema.default(30000),    // 30s between stall checks
     maxStalledCount: positiveIntSchema.default(1),          // fail job after 1 stall detection

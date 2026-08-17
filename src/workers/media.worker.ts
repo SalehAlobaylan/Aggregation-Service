@@ -39,6 +39,7 @@ import {
 } from "../services/quality.service.js";
 import { captionsToFullText } from "../media/captions.js";
 import { lookup as lookupMime } from "mime-types";
+import { aiPriorityForContentType } from "../services/ai-queue-priority.js";
 
 type CaptionState = "youtube_human" | "youtube_auto" | "none";
 type MediaSuitabilityVerdict =
@@ -144,7 +145,7 @@ function classifyMediaSuitability(args: {
 export const mediaWorker = createWorker({
   queueName: QUEUE_NAMES.MEDIA,
   concurrency: 2, // Media processing is resource-intensive
-  timeoutMs: config.mediaJobTimeoutMs, // 30 min default — FFmpeg transcodes can be slow
+  timeoutMs: config.mediaJobTimeoutMs, // 60 min default — covers bounded 4K/AV1 fallback recovery
   processor: async (job: Job<MediaJob>, jobLogger, signal): Promise<void> => {
     const {
       contentItemId,
@@ -625,7 +626,7 @@ async function enqueueAIJob(
       captionText,
     },
     {
-      priority: 2,
+      priority: aiPriorityForContentType(contentType),
       jobId,
     },
   );

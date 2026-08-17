@@ -17,6 +17,7 @@ import { isDependencyDeferral } from '../observability/job-projection.js';
 
 const REPEATABLE_NAME = 'source-run-dispatch-repeatable';
 const DISPATCH_INTERVAL_MS = 5_000;
+const PODS_MIN_DURATION_MINUTES = 4.5;
 
 interface ClaimedDispatchJob extends SourceRunDispatchJob {
   claim: SourceRunDispatchClaim;
@@ -32,9 +33,18 @@ function sourceRunSettings(sourceSettings: Record<string, unknown>, request: Sou
     const value = metadata[key];
     if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 1000) settings[key] = value;
   }
+	// Canonicalize provider limits so a source's camel-case setting cannot win
+	// over the CMS-issued cap in fetchers that support both spellings.
+	delete settings.maxResults;
 	settings.max_results = request.item_cap;
 	settings.max_bytes = request.byte_cap;
 	settings.max_provider_calls = request.provider_call_cap;
+  if (request.lane === 'media') {
+    const configuredMinimums = [settings.minDurationMinutes, settings.min_duration_minutes]
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    delete settings.minDurationMinutes;
+    settings.min_duration_minutes = Math.max(PODS_MIN_DURATION_MINUTES, ...configuredMinimums);
+  }
   const observationMap = metadata.deferred_observation_map;
   if (observationMap && typeof observationMap === 'object' && !Array.isArray(observationMap)) {
     const entries = Object.entries(observationMap).filter(([upstreamId, observationId]) =>

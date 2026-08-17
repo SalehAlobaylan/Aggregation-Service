@@ -6,18 +6,27 @@
  * telemetry drive CMS recommendations.
  */
 import { Job, Queue } from 'bullmq';
-import { getQueue, QUEUE_NAMES, type NewsCirculationJob } from '../queues/index.js';
+import { getQueue, QUEUE_NAMES, type FetchJob, type NewsCirculationJob } from '../queues/index.js';
 import { createWorker } from './base-worker.js';
+import { cmsClient } from '../cms/client.js';
 import { logger } from '../observability/logger.js';
+import { sourceAdmissionMode } from '../services/source-admission-mode.js';
 
 const REPEATABLE_NAME = 'news-circulation-repeatable';
 
 export const newsCirculationWorker = createWorker({
     queueName: QUEUE_NAMES.NEWS_CIRCULATION,
-	processor: async (job: Job<NewsCirculationJob>, jobLogger): Promise<void> => {
-		jobLogger.info('Legacy news circulation work rejected; CMS source-run admission owns all source work', { trigger: job.data.trigger });
-		return;
-		/* legacy read-compatible implementation retained below for contract history
+	timeoutMs: 120_000,
+	processor: async (job: Job<NewsCirculationJob>, jobLogger, signal): Promise<void> => {
+		const policy = await cmsClient.getCirculationPolicy(job.data.tenantId || 'default', job.id, signal);
+		const admissionMode = sourceAdmissionMode(policy);
+		if (admissionMode !== 'compatibility') {
+			jobLogger.info('News circulation claim skipped: durable CMS admission owns the lane', {
+				admissionMode,
+				trigger: job.data.trigger,
+			});
+			return;
+		}
         const tenantId = job.data.tenantId || 'default';
         const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
         if (!fetchQueue) {
@@ -29,7 +38,7 @@ export const newsCirculationWorker = createWorker({
         // so CMS applies the configured batch instead of a hardcoded ceiling here.
         const recovery = job.data.recovery;
         const claimLimit = recovery ? Math.min(recovery.sourceIds.length, 200) : 0;
-        const claimed = await cmsClient.claimCirculationSources(tenantId, claimLimit, force, job.id, recovery);
+		const claimed = await cmsClient.claimCirculationSources(tenantId, claimLimit, force, job.id, recovery, signal);
 
         let enqueued = 0;
         for (const source of claimed.data ?? []) {
@@ -67,7 +76,7 @@ export const newsCirculationWorker = createWorker({
                 priority: job.data.trigger === 'manual' ? 1 : 3,
             });
 			if (source.source_run_request_id && fetchJobRecord.id) {
-				await cmsClient.acceptSourceRunRequest(source.source_run_request_id, String(fetchJobRecord.id), job.id);
+				await cmsClient.acceptSourceRunRequest(source.source_run_request_id, String(fetchJobRecord.id), job.id, signal);
 			}
             enqueued++;
         }
@@ -77,7 +86,6 @@ export const newsCirculationWorker = createWorker({
             claimed: claimed.data?.length ?? 0,
             enqueued,
 		});
-		*/
 	},
 });
 
@@ -88,6 +96,7 @@ export async function syncNewsCirculationSweeper(): Promise<void> {
         return;
     }
 
+    const policy = await cmsClient.getCirculationPolicy('default');
     const repeatables = await queue.getRepeatableJobs().catch(() => []);
     await Promise.all(
         repeatables
@@ -95,9 +104,20 @@ export async function syncNewsCirculationSweeper(): Promise<void> {
             .map((entry) => queue.removeRepeatableByKey(entry.key).catch(() => undefined))
     );
 
-	// CMS source-run admission is now the only automatic due-work selector.
-	// Removing this legacy repeatable prevents duplicate source effects during
-	// the compatibility window; explicit legacy jobs remain non-durable and
-	// cannot acquire a source-run envelope.
-	logger.info('news circulation: retired legacy repeatable in favor of CMS source-run dispatch');
+	const admissionMode = sourceAdmissionMode(policy);
+	if (admissionMode === 'durable') {
+		logger.info('news circulation: durable CMS source-run admission owns the lane');
+		return;
+	}
+
+	const intervalMinutes = Math.max(1, policy.source_claim_interval_minutes || 15);
+	await queue.add(
+		REPEATABLE_NAME,
+		{ trigger: 'auto', tenantId: 'default' } satisfies NewsCirculationJob,
+		{
+			repeat: { every: intervalMinutes * 60_000 },
+			jobId: REPEATABLE_NAME,
+		}
+	);
+	logger.info('news circulation: registered compatibility source claim', { intervalMinutes });
 }
