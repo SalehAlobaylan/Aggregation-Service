@@ -424,7 +424,7 @@ export async function computeStorageUsage(tier: StorageTier = 'primary'): Promis
             if (parts.length >= 3 && parts[0] === 'content') {
                 const filename = parts[parts.length - 1];
                 const dot = filename.lastIndexOf('.');
-                group = dot > 0 ? filename.slice(0, dot) : filename;
+                group = artifactFamilyForKey(key) ?? (dot > 0 ? filename.slice(0, dot) : filename);
             }
             byArtifactType[group] = (byArtifactType[group] ?? 0) + size;
         }
@@ -536,20 +536,18 @@ export async function deleteContentObjects(
     let keys = all.map(o => o.Key!).filter(Boolean);
     if (artifacts && artifacts.length > 0) {
         const setLike = new Set(artifacts);
-        keys = keys.filter(key => {
-            const file = key.split('/').pop() ?? '';
-            const dot = file.lastIndexOf('.');
-            const artifactType = dot > 0 ? file.slice(0, dot) : file;
-            return setLike.has(artifactType);
-        });
+        keys = keys.filter(key => matchesArtifactFamily(key, setLike));
     }
     const result = await deleteObjectsByKeys(keys, tier);
-    let objectsAbsent = !artifacts || artifacts.length === 0;
-    if (result.errors.length === 0 && objectsAbsent) {
+    let objectsAbsent = false;
+    if (result.errors.length === 0) {
         try {
             const remaining = await listContentObjects(contentItemId, tier);
             objectsAbsent = remaining.length === 0;
-            if (!objectsAbsent) {
+            const selectedRemaining = artifacts && artifacts.length > 0
+                ? remaining.map(object => object.Key ?? '').filter(Boolean).filter(key => matchesArtifactFamily(key, new Set(artifacts)))
+                : remaining.map(object => object.Key ?? '').filter(Boolean);
+            if (selectedRemaining.length > 0) {
                 result.errors.push('provider readback found remaining content objects');
             }
         } catch (error) {
@@ -557,6 +555,27 @@ export async function deleteContentObjects(
         }
     }
     return { ...result, objectsAbsent };
+}
+
+/** Classify canonical, versioned, HLS, and repair artifacts by lifecycle family. */
+export function artifactFamilyForKey(key: string): 'processed' | 'original' | 'thumbnail' | undefined {
+    const relative = key.split('/').slice(2).join('/');
+    const root = relative.split('/')[0] ?? '';
+    const filename = relative.split('/').pop() ?? '';
+    if (root === 'hls') return 'processed';
+    for (const artifact of ['processed', 'original', 'thumbnail'] as const) {
+        if (
+            root === artifact || root.startsWith(`${artifact}.`) || root.startsWith(`${artifact}_`) ||
+            filename === artifact || filename.startsWith(`${artifact}.`) || filename.startsWith(`${artifact}_`)
+        ) return artifact;
+    }
+    return undefined;
+}
+
+/** Match an artifact root and all deterministic version/HLS/repair children. */
+export function matchesArtifactFamily(key: string, artifacts: Set<string>): boolean {
+    const family = artifactFamilyForKey(key);
+    return family !== undefined && artifacts.has(family);
 }
 
 /**
@@ -632,12 +651,7 @@ export async function moveObjectBetweenTiers(
     let keys = sourceObjs.map(o => o.Key!).filter(Boolean);
     if (artifacts && artifacts.length > 0) {
         const setLike = new Set(artifacts);
-        keys = keys.filter(key => {
-            const file = key.split('/').pop() ?? '';
-            const dot = file.lastIndexOf('.');
-            const artifactType = dot > 0 ? file.slice(0, dot) : file;
-            return setLike.has(artifactType);
-        });
+        keys = keys.filter(key => matchesArtifactFamily(key, setLike));
     }
 
     const result: MoveResult = {

@@ -38,6 +38,16 @@ vi.mock('../../src/storage/client.js', () => ({
     listAllObjects: mocks.listAllObjects,
     moveObjectBetweenTiers: mocks.moveObjectBetweenTiers,
     isColdTierConfigured: mocks.isColdTierConfigured,
+    artifactFamilyForKey: (key: string) => {
+        const relative = key.split('/').slice(2).join('/');
+        const root = relative.split('/')[0] ?? '';
+        const filename = relative.split('/').pop() ?? '';
+        if (root === 'hls') return 'processed';
+        if (filename.startsWith('processed.') || filename.startsWith('processed_')) return 'processed';
+        if (filename.startsWith('original.') || filename.startsWith('original_')) return 'original';
+        if (filename.startsWith('thumbnail.') || filename.startsWith('thumbnail_')) return 'thumbnail';
+        return undefined;
+    },
 }));
 
 vi.mock('../../src/queues/index.js', () => ({
@@ -229,6 +239,7 @@ describe('reconcileStorage', () => {
         async function* pages() {
             yield [
                 { Key: 'content/11111111-2222-3333-4444-555555555555/processed.mp4', Size: 100 },
+                { Key: 'content/11111111-2222-3333-4444-555555555555/hls/index.m3u8', Size: 10 },
                 { Key: 'content/22222222-2222-3333-4444-555555555555/processed.mp4', Size: 100 },
                 { Key: 'loose/orphan.bin', Size: 50 },
             ];
@@ -254,7 +265,7 @@ describe('reconcileStorage', () => {
             'content/22222222-2222-3333-4444-555555555555/processed.mp4',
             'loose/orphan.bin',
         ]);
-        expect(result.scannedObjectCount).toBe(3);
+        expect(result.scannedObjectCount).toBe(4);
         expect(result.partial).toBe(false);
     });
 });

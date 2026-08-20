@@ -22,11 +22,15 @@ import type {
     TelegramMediaType,
     TelegramSourceConfig,
 } from './types.js';
+import { configuredMaximumDurationSec, configuredMinimumDurationSec, configuredResultLimit } from '../services/pods-admission.js';
 
-const DEFAULT_MIN_DURATION_SEC = 120;
 const DEFAULT_MAX_RESULTS = 50;
 const DEFAULT_MIN_TEXT_LENGTH = 20;
 const MAX_RESULTS_CAP = 200;
+
+export function telegramCandidateLimit(maxResults: number): number {
+    return Math.min(MAX_RESULTS_CAP, maxResults * 4);
+}
 
 interface ParsedTelegramSettings {
     channelUsername: string;
@@ -56,11 +60,7 @@ export const telegramFetcher: Fetcher = {
         const rateCheck = await rateLimiter.consumeRateLimit('TELEGRAM', configInput.id);
         if (!rateCheck.allowed) {
             logger.warn('Telegram rate limit exceeded', { sourceId: configInput.id });
-            return {
-                items: [],
-                hasMore: false,
-                metadata: { totalFetched: 0, skipped: 0, errors: 0 },
-            };
+            throw new Error('Telegram source rate limit exceeded');
         }
 
         const client = createTelegramClient();
@@ -83,8 +83,9 @@ export const telegramFetcher: Fetcher = {
             const publicChannel = settings.channelUsername.replace(/^@/, '');
             const sourceVerified = isEntityVerified(entity);
 
+            const candidateLimit = telegramCandidateLimit(settings.maxResults);
             for await (const message of client.iterMessages(entity, {
-                limit: settings.maxResults,
+                limit: candidateLimit,
                 offsetId,
             }) as AsyncIterable<Api.Message>) {
                 try {
@@ -93,6 +94,9 @@ export const telegramFetcher: Fetcher = {
                         continue;
                     }
                     scannedMessages++;
+                    // Cursor progress follows provider observations, not accepted
+                    // items. Otherwise an all-short window repeats forever.
+                    lastMessageId = message.id;
 
                     const extracted = extractTelegramContent(message);
                     if (!extracted) {
@@ -149,7 +153,6 @@ export const telegramFetcher: Fetcher = {
                         }
                     }
 
-                    lastMessageId = message.id;
                     const rawMessageText = (message.message as string | undefined) || '';
                     const rawDate = message.date as unknown;
                     const publishedAt = rawDate instanceof Date
@@ -200,6 +203,7 @@ export const telegramFetcher: Fetcher = {
                     };
 
                     items.push(item);
+                    if (items.length >= settings.maxResults) break;
                 } catch (error) {
                     errors++;
                     logger.error('Failed to process Telegram message', error, {
@@ -211,7 +215,7 @@ export const telegramFetcher: Fetcher = {
             return {
                 items,
                 cursor: lastMessageId ? String(lastMessageId) : undefined,
-                hasMore: scannedMessages >= settings.maxResults && !!lastMessageId,
+                hasMore: scannedMessages >= candidateLimit && !!lastMessageId,
                 metadata: {
                     totalFetched: items.length,
                     skipped,
@@ -221,17 +225,13 @@ export const telegramFetcher: Fetcher = {
         } catch (error) {
             const details = classifyTelegramError(error);
             if (details.transient) {
-                logger.warn('Telegram fetch skipped after transient failure', {
+                logger.warn('Telegram fetch failed transiently and will be retried', {
                     sourceId: configInput.id,
                     channelUsername: settings.channelUsername,
                     code: details.code,
                     error: details.message,
                 });
-                return {
-                    items: [],
-                    hasMore: false,
-                    metadata: { totalFetched: 0, skipped, errors: errors + 1 },
-                };
+                throw new Error(`${details.code}: ${details.message}`, { cause: error });
             }
             logger.error('Failed to fetch Telegram channel', error, {
                 sourceId: configInput.id,
@@ -257,10 +257,7 @@ function parseTelegramSettings(configInput: TelegramSourceConfig): ParsedTelegra
         throw new Error('Telegram source requires channelUsername or a valid t.me URL');
     }
 
-    const minDurationCandidate = getNumber(raw, ['minDurationSec', 'min_duration_sec']);
-    const minDurationSec = typeof minDurationCandidate === 'number' && minDurationCandidate > 0
-        ? Math.floor(minDurationCandidate)
-        : DEFAULT_MIN_DURATION_SEC;
+    const minDurationSec = configuredMinimumDurationSec(raw);
 
     const rawMediaTypes = getArray(raw, ['mediaTypes', 'media_types']);
     const requestedMediaTypes = Array.isArray(rawMediaTypes)
@@ -275,15 +272,12 @@ function parseTelegramSettings(configInput: TelegramSourceConfig): ParsedTelegra
         ? requestedMediaTypes
         : ['audio', 'voice'];
 
-    const maxResultsCandidate = getNumber(raw, ['maxResults', 'max_results']);
-    const maxResults = typeof maxResultsCandidate === 'number' && maxResultsCandidate > 0
-        ? Math.min(MAX_RESULTS_CAP, Math.floor(maxResultsCandidate))
-        : DEFAULT_MAX_RESULTS;
+    const maxResults = configuredResultLimit(raw, DEFAULT_MAX_RESULTS, MAX_RESULTS_CAP);
 
-    const maxDurationCandidate = getNumber(raw, ['maxDurationSec', 'max_duration_sec']);
-    const maxDurationSec = typeof maxDurationCandidate === 'number' && maxDurationCandidate > 0
-        ? Math.floor(maxDurationCandidate)
-        : undefined;
+    const maxDurationSec = configuredMaximumDurationSec(raw);
+    if (maxDurationSec !== undefined && maxDurationSec < minDurationSec) {
+        throw new Error('Telegram duration settings are contradictory: maximum is below minimum');
+    }
 
     const maxAgeHoursCandidate = getNumber(raw, ['maxAgeHours', 'max_age_hours']);
     const maxAgeHours = typeof maxAgeHoursCandidate === 'number' && maxAgeHoursCandidate > 0
@@ -392,6 +386,7 @@ export const telegramFetcherTestUtils = {
     extractTelegramContent,
     extractTitleAndBody,
     classifyTelegramError,
+    telegramCandidateLimit,
 };
 
 /**

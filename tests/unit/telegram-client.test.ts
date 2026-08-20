@@ -54,7 +54,7 @@ describe('telegram error handling', () => {
         expect(wrapped.message).toContain('telegram_media_download_timeout');
     });
 
-    it('returns an empty fetch result instead of throwing on transient fetch timeout', async () => {
+    it('throws on transient fetch timeout so the source job is retried', async () => {
         const disconnect = vi.fn(async () => undefined);
         setTelegramClientFactoryForTest(() => ({
             connect: vi.fn(async () => {
@@ -77,11 +77,7 @@ describe('telegram error handling', () => {
             settings: { media_types: ['text'] } as unknown as TelegramSourceConfig['settings'],
         };
 
-        const result = await telegramFetcher.fetch(source);
-
-        expect(result.items).toEqual([]);
-        expect(result.hasMore).toBe(false);
-        expect(result.metadata.errors).toBe(1);
+        await expect(telegramFetcher.fetch(source)).rejects.toThrow('telegram_timeout: TIMEOUT');
         expect(disconnect).toHaveBeenCalledOnce();
     });
 });

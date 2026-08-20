@@ -204,7 +204,11 @@ describe('media worker characterization', () => {
         mocks.objectExists.mockResolvedValue(true);
         mocks.updateStatus.mockResolvedValue(undefined);
         mocks.updateArtifacts.mockResolvedValue(undefined);
-        mocks.getContentItem.mockResolvedValue({ tenant_id: 'default' });
+        mocks.getContentItem.mockResolvedValue({
+            tenant_id: 'default',
+            duration_sec: 600,
+            metadata: { duration_verification: { source: 'ffprobe', duration_sec: 600 } },
+        });
         mocks.containerMime.mockReturnValue('video/mp4');
     });
 
@@ -258,6 +262,38 @@ describe('media worker characterization', () => {
         expect(mocks.downloadTelegram).not.toHaveBeenCalled();
         expect(mocks.transcodeToMp4).not.toHaveBeenCalled();
         expect(mocks.uploadFile).not.toHaveBeenCalled();
+    });
+
+    it('does not repair an existing Pods object whose duration was never verified', async () => {
+        const ai = aiQueue();
+        mocks.getQueue.mockImplementation((name: string) => (name === aiQueueName ? ai : undefined));
+        mocks.getContentItem.mockResolvedValue({ tenant_id: 'default', duration_sec: null });
+        const processor = mocks.capturedWorkers.get(mediaQueueName)?.processor;
+
+        await processor!(
+            {
+                id: 'media-job-unverified',
+                log: vi.fn(),
+                data: {
+                    contentItemId: 'content-unverified',
+                    contentType: 'VIDEO',
+                    sourceType: 'YOUTUBE',
+                    sourceUrl: 'https://youtube.com/watch?v=unverified',
+                    operations: ['download', 'transcode', 'thumbnail'],
+                    textContent: { title: 'Unverified video' },
+                },
+            },
+            logger()
+        );
+
+        expect(mocks.updateArtifacts).not.toHaveBeenCalled();
+        expect(ai.add).not.toHaveBeenCalled();
+        expect(mocks.updateStatus).toHaveBeenLastCalledWith(
+            'content-unverified',
+            { status: 'FAILED', failure_reason: 'media_artifact_duration_unverified' },
+            'media-job-unverified',
+            undefined,
+        );
     });
 
     it('does not enqueue duplicate AI work when an AI job is already active', async () => {

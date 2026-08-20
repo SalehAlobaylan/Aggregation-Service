@@ -30,9 +30,14 @@ describe('telegramFetcherTestUtils', () => {
 
         const parsed = telegramFetcherTestUtils.parseTelegramSettings(sourceConfig);
         expect(parsed.channelUsername).toBe('@wahb_overrides');
-        expect(parsed.minDurationSec).toBe(180);
+        expect(parsed.minDurationSec).toBe(270);
         expect(parsed.maxDurationSec).toBe(900);
         expect(parsed.mediaTypes).toEqual(['voice', 'video', 'photo']);
         expect(parsed.maxResults).toBe(25);
+    });
+
+    it('overfetches a bounded candidate window so short media cannot consume the accepted-item cap', () => {
+        expect(telegramFetcherTestUtils.telegramCandidateLimit(25)).toBe(100);
+        expect(telegramFetcherTestUtils.telegramCandidateLimit(100)).toBe(200);
     });
 });

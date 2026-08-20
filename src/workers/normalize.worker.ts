@@ -16,6 +16,7 @@ import { sourceRunExecutionEnvelopeSchema } from '../contracts/source-runs.js';
 import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 import { aiPriorityForContentType } from '../services/ai-queue-priority.js';
+import { knownDurationAdmissionFailure } from '../services/pods-admission.js';
 
 interface SourceFilters {
     include_keywords?: string[];
@@ -228,6 +229,19 @@ export const normalizeWorker = createWorker({
 					normalized.recovery = { runId: recovery.run_id, manifestHash: recovery.manifest_hash };
 				}
 
+                // Covers every provider and direct ingestion path that reaches
+                // normalization. Unknown duration proceeds only to the later
+                // authoritative FFprobe gate in the Media worker.
+                const durationFailure = knownDurationAdmissionFailure(normalized.type, normalized.durationSec);
+                if (durationFailure) {
+                    await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'duration_below_minimum');
+                    filtered++;
+                    jobLogger.info('Skipping media outside Pods admission contract', {
+                        sourceId, sourceType, durationSec: normalized.durationSec, reason: durationFailure,
+                    });
+                    continue;
+                }
+
                 const filterDecision = shouldSkipByFilters(normalized, item, sourceFilters);
                 if (filterDecision.skip) {
 					await recordObservationDisposition(job, rawItem, 'filtered', undefined, filterDecision.reason as 'include_keywords' | 'exclude_keywords' | 'min_engagement');
@@ -357,7 +371,17 @@ export const normalizeWorker = createWorker({
                         (normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
 
                     if (requiresMediaJob && normalized.status !== 'ARCHIVED') {
-                        const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady);
+                        // A claimed ready URL with unknown duration still needs
+                        // authoritative probing; otherwise manual/import paths
+                        // can bypass the Media duration gate entirely.
+                        // Pods media must always pass the authoritative local
+                        // FFprobe gate. `mediaReady` is only a transport hint;
+                        // neither it nor a provider-supplied duration proves
+                        // that the referenced bytes satisfy the feed contract.
+                        const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady) &&
+                            normalized.type !== 'VIDEO' &&
+                            normalized.type !== 'PODCAST' &&
+                            typeof normalized.durationSec === 'number';
                         const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
 
                         if (mediaReady && normalized.mediaUrl) {
@@ -506,7 +530,7 @@ export const normalizeWorker = createWorker({
 async function recordObservationDisposition(
 	job: Job<NormalizeJob>, rawItem: { upstreamObservationId?: string }, disposition: 'materialized' | 'filtered',
 	contentItemId?: string,
-	filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate',
+	filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate' | 'duration_below_minimum',
 ): Promise<void> {
 	if (!rawItem.upstreamObservationId || !job.data.sourceRun) return;
 	const envelope = sourceRunExecutionEnvelopeSchema.parse(job.data.sourceRun);

@@ -41,6 +41,7 @@ import { captionsToFullText } from "../media/captions.js";
 import { lookup as lookupMime } from "mime-types";
 import { aiPriorityForContentType } from "../services/ai-queue-priority.js";
 import { createLogger } from "../observability/logger.js";
+import { hasAuthoritativeDurationVerification, knownDurationAdmissionFailure, PODS_MIN_DURATION_SEC } from '../services/pods-admission.js';
 
 type CaptionState = "youtube_human" | "youtube_auto" | "none";
 type MediaSuitabilityVerdict =
@@ -126,7 +127,7 @@ function classifyMediaSuitability(args: {
   if (
     args.hasCaptions &&
     args.mediaInfo.hasAudio &&
-    args.mediaInfo.duration >= 270
+    args.mediaInfo.duration >= PODS_MIN_DURATION_SEC
   ) {
     reasons.push("captioned long-form audio media");
     return { verdict: "audio_first_show", confidence: 0.62, reasons };
@@ -134,7 +135,7 @@ function classifyMediaSuitability(args: {
   if (
     args.mediaInfo.hasVideo &&
     args.mediaInfo.hasAudio &&
-    args.mediaInfo.duration >= 270
+    args.mediaInfo.duration >= PODS_MIN_DURATION_SEC
   ) {
     reasons.push("long-form audio/video media, visual dependency unknown");
     return { verdict: "unknown", confidence: 0.45, reasons };
@@ -209,19 +210,46 @@ export async function processMediaJob(job: Job<MediaJob>, jobLogger: ReturnType<
           contentItemId,
         });
 
-        // A previous attempt may have uploaded the object and then
-        // failed before CMS artifact write-back. Repair that idempotent
-        // write before enqueueing AI so the feed has playback metadata.
-        const publicUrl = getPublicUrl(processedKey);
-        await repairExistingArtifacts(
-          contentItemId,
-          processedKey,
-          publicUrl,
-          job.id,
-          job.data.contentStage,
-        );
-		if (!job.data.contentStage) await enqueueAIJob(job, contentItemId, contentType, publicUrl);
-        return;
+        // A bare object-exists result is not proof that a previous attempt
+        // produced a valid Pods artifact. Never turn an unknown or undersized
+        // historical object into feed-ready metadata without a persisted
+        // authoritative duration.
+        const podsMedia = contentType === 'VIDEO' || contentType === 'PODCAST';
+        const persistedDurationFailure = knownDurationAdmissionFailure(contentType, contentItem.duration_sec);
+        if (persistedDurationFailure || (contentType === 'VIDEO' || contentType === 'PODCAST') && contentItem.duration_sec == null) {
+          const reason = persistedDurationFailure ?? 'media_artifact_duration_unverified';
+          jobLogger.warn('Existing media artifact is not eligible for repair', { contentItemId, reason });
+          if (job.data.contentStage && job.data.contentStageClaim) {
+            await cmsClient.failContentStage(job.data.contentStageClaim, 'media_policy_rejected', reason, job.id);
+          } else {
+            await cmsClient.updateStatus(contentItemId, { status: 'FAILED', failure_reason: reason }, job.id, signal);
+          }
+          return;
+        }
+
+        if (podsMedia && !hasAuthoritativeDurationVerification(contentItem.metadata, contentItem.duration_sec)) {
+          // Legacy objects may carry only provider-declared duration. Continue
+          // through download/probe/transcode and overwrite the deterministic
+          // key instead of promoting unverified bytes to the feed.
+          jobLogger.warn('Existing media artifact lacks authoritative duration provenance; reprocessing', {
+            contentItemId,
+          });
+        } else {
+
+          // A previous verified attempt may have uploaded the object and then
+          // failed before CMS artifact write-back. Repair that idempotent
+          // write before enqueueing AI so the feed has playback metadata.
+          const publicUrl = getPublicUrl(processedKey);
+          await repairExistingArtifacts(
+            contentItemId,
+            processedKey,
+            publicUrl,
+            job.id,
+            job.data.contentStage,
+          );
+		  if (!job.data.contentStage) await enqueueAIJob(job, contentItemId, contentType, publicUrl);
+          return;
+        }
       }
 
       // 3. Download media
@@ -265,6 +293,27 @@ export async function processMediaJob(job: Job<MediaJob>, jobLogger: ReturnType<
       // 4. Get media info
       const mediaInfo = await getMediaInfo(downloadResult.filePath);
       jobLogger.debug("Media info", { ...mediaInfo });
+
+      // Provider metadata can be missing or stale. FFprobe is authoritative,
+      // and this gate is deliberately before transcoding, thumbnail extraction,
+      // R2 upload, CMS artifact write-back, and AI handoff.
+      // Floor fractional FFprobe output so 269.9 seconds cannot be rounded
+      // across the 270-second legal boundary.
+      const verifiedDurationSec = Math.floor(mediaInfo.duration);
+      const durationFailure = knownDurationAdmissionFailure(contentType, verifiedDurationSec);
+      if (durationFailure) {
+        jobLogger.warn('Media rejected by authoritative Pods duration gate', {
+          contentItemId,
+          durationSec: verifiedDurationSec,
+          reason: durationFailure,
+        });
+        if (job.data.contentStage && job.data.contentStageClaim) {
+          await cmsClient.failContentStage(job.data.contentStageClaim, 'media_policy_rejected', durationFailure, job.id);
+        } else {
+          await cmsClient.updateStatus(contentItemId, { status: 'FAILED', failure_reason: durationFailure }, job.id, signal);
+        }
+        return;
+      }
 
       // 5. Resolve the ingest profile for the authoritative tenant.
       const {
@@ -446,6 +495,12 @@ export async function processMediaJob(job: Job<MediaJob>, jobLogger: ReturnType<
       // categories) into the item's metadata. Omitted when absent so we
       // never send empty keys (non-YouTube items have none).
       const downloadMeta: Record<string, unknown> = {};
+      if (contentType === 'VIDEO' || contentType === 'PODCAST') {
+        downloadMeta["duration_verification"] = {
+          source: "ffprobe",
+          duration_sec: Math.floor(duration),
+        };
+      }
       if (downloadResult.heatmap?.length)
         downloadMeta["heatmap"] = downloadResult.heatmap;
       if (downloadResult.sponsorSegments?.length)
@@ -484,7 +539,7 @@ export async function processMediaJob(job: Job<MediaJob>, jobLogger: ReturnType<
         {
           media_url: mediaUrl,
           thumbnail_url: thumbnailUrl,
-          duration_sec: Math.round(duration),
+          duration_sec: Math.floor(duration),
           file_size_bytes: processedBytes + thumbnailBytes,
           original_size_bytes:
             originalSourceBytes > 0 ? originalSourceBytes : undefined,
@@ -506,7 +561,7 @@ export async function processMediaJob(job: Job<MediaJob>, jobLogger: ReturnType<
         contentItemId,
         mediaUrl,
         thumbnailUrl,
-        duration: Math.round(duration),
+        duration: Math.floor(duration),
       });
 
       // 9a. Caption-first: if YouTube gave us a usable caption track, persist

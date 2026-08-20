@@ -7,6 +7,7 @@ import { logger } from '../observability/logger.js';
 import { rateLimiter } from '../services/rate-limiter.js';
 import { safeFetch } from '../utils/safe-fetch.js';
 import type { Fetcher, FetchResult, RawFetchedItem, SourceConfig } from './types.js';
+import { configuredMaximumDurationSec, configuredMinimumDurationSec, configuredResultLimit } from '../services/pods-admission.js';
 
 // Standard rss-parser without complex customFields
 const parser = new Parser({
@@ -47,16 +48,18 @@ export const podcastFetcher: Fetcher = {
         const items: RawFetchedItem[] = [];
         let skipped = 0;
         let errors = 0;
+        const minDurationSec = configuredMinimumDurationSec(config.settings as Record<string, unknown> | undefined);
+        const maxDurationSec = configuredMaximumDurationSec(config.settings as Record<string, unknown> | undefined);
+        const maxResults = configuredResultLimit(config.settings as Record<string, unknown> | undefined, 10, 200);
+        if (maxDurationSec !== undefined && maxDurationSec < minDurationSec) {
+            throw new Error('Podcast duration settings are contradictory: maximum is below minimum');
+        }
 
         // Check rate limit
         const rateCheck = await rateLimiter.consumeRateLimit('PODCAST', config.id);
         if (!rateCheck.allowed) {
             logger.warn('Podcast rate limit exceeded', { sourceId: config.id });
-            return {
-                items: [],
-                hasMore: false,
-                metadata: { totalFetched: 0, skipped: 0, errors: 0 },
-            };
+            throw new Error('Podcast source rate limit exceeded');
         }
 
         try {
@@ -96,6 +99,12 @@ export const podcastFetcher: Fetcher = {
                     const itunesSummary = (episode as Record<string, unknown>)['itunes:summary'] as string | undefined;
                     const itunesExplicit = (episode as Record<string, unknown>)['itunes:explicit'] as string | undefined;
 
+                    const duration = parseDuration(itunesDuration);
+                    if (duration !== undefined && (duration < minDurationSec || maxDurationSec !== undefined && duration > maxDurationSec)) {
+                        skipped++;
+                        continue;
+                    }
+
                     const item: RawFetchedItem = {
                         externalId: episode.guid || episode.enclosure.url,
                         sourceType: 'PODCAST',
@@ -106,7 +115,7 @@ export const podcastFetcher: Fetcher = {
                         author: itunesAuthor || episode.creator,
                         publishedAt: episode.isoDate || episode.pubDate,
                         thumbnailUrl: itunesImage || showImage,
-                        duration: parseDuration(itunesDuration),
+                        duration,
                         metadata: {
                             showName,
                             showUrl: feed.link,
@@ -123,6 +132,7 @@ export const podcastFetcher: Fetcher = {
                     };
 
                     items.push(item);
+                    if (items.length >= maxResults) break;
                 } catch (itemError) {
                     errors++;
                     logger.error('Error processing podcast episode', itemError, {

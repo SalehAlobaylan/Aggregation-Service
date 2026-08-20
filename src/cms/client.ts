@@ -948,7 +948,8 @@ export const cmsClient = {
         | "min_engagement"
         | "moderation_rejected"
         | "normalization_unsupported"
-        | "exact_duplicate";
+        | "exact_duplicate"
+        | "duration_below_minimum";
     },
     requestId?: string,
   ): Promise<{ created: boolean }> {

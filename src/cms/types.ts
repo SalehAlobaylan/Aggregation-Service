@@ -438,6 +438,7 @@ export interface InternalContentItem {
   current_quality_profile_id?: number | null;
   current_bitrate_kbps?: number | null;
   duration_sec?: number | null;
+  metadata?: Record<string, unknown>;
   media_suitability?: string;
   media_suitability_confidence?: number | null;
   media_suitability_reasons?: unknown;

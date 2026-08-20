@@ -17,6 +17,7 @@ import { cmsClient } from '../cms/client.js';
 import { generateEmbeddingViaEnrichment } from '../ai/enrichment-client.js';
 import { buildEmbeddingText } from '../ai/embeddings.js';
 import { resolveIngestProfile } from '../services/quality.service.js';
+import { knownDurationAdmissionFailure } from '../services/pods-admission.js';
 
 export interface PipelineRepairEffect {
   outputDigest: string;
@@ -53,6 +54,9 @@ function requireVerifiedArtifact(job: PipelineRepairStageJob, key: string): stri
 async function mediaDownload(job: PipelineRepairStageJob, signal?: AbortSignal): Promise<PipelineRepairEffect> {
   const source = await download(job, signal);
   try {
+    const mediaInfo = await getMediaInfo(source.filePath);
+    const durationFailure = knownDurationAdmissionFailure(job.content.type, Math.floor(mediaInfo.duration));
+    if (durationFailure) throw new Error(durationFailure);
     const key = `content/${job.contentItemId}/pipeline-repair/${job.attemptId}/original.${source.format || 'bin'}`;
     const url = await uploadFile(key, source.filePath, 'application/octet-stream', 'primary', signal);
     const bytes = await stat(source.filePath).then((entry) => entry.size).catch(() => 0);
@@ -73,10 +77,13 @@ async function mediaTranscode(job: PipelineRepairStageJob, signal?: AbortSignal)
     const outputPath = join(config.mediaTempDir, `${job.contentItemId}-${job.attemptId}-repair.mp4`);
     temp.push(outputPath);
     const result = await transcodeToMp4(source.filePath, outputPath, profile, { signal });
+    const verifiedDurationSec = Math.floor(result.duration);
+    const durationFailure = knownDurationAdmissionFailure(job.content.type, verifiedDurationSec);
+    if (durationFailure) throw new Error(durationFailure);
     const key = `content/${job.contentItemId}/pipeline-repair/${job.attemptId}/processed.mp4`;
     const url = await uploadFile(key, result.outputPath, 'video/mp4', 'primary', signal);
-    const output = { stage: job.stage, storage_key: key, playback_url: url, duration_sec: Math.round(result.duration) };
-    await cmsClient.updateArtifacts(job.contentItemId, { media_url: url, playback_url: url, playback_type: 'mp4', duration_sec: Math.round(result.duration), metadata: { pipeline_repair_processed_url: url, pipeline_repair_processed_digest: digest({ key, url, duration: Math.round(result.duration) }) }, expected_item_updated_at: job.itemVersion }, job.deterministicJobId, signal);
+    const output = { stage: job.stage, storage_key: key, playback_url: url, duration_sec: verifiedDurationSec };
+    await cmsClient.updateArtifacts(job.contentItemId, { media_url: url, playback_url: url, playback_type: 'mp4', duration_sec: verifiedDurationSec, metadata: { pipeline_repair_processed_url: url, pipeline_repair_processed_digest: digest({ key, url, duration: verifiedDurationSec }), duration_verification: { source: 'ffprobe', duration_sec: verifiedDurationSec } }, expected_item_updated_at: job.itemVersion }, job.deterministicJobId, signal);
     return { outputDigest: digest(output), output };
   } finally { await Promise.all(temp.map((path) => cleanupTempFile(path))); }
 }

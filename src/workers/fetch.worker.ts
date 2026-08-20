@@ -384,6 +384,7 @@ function getNonNegativeInteger(...values: unknown[]): number | undefined {
 }
 
 function sourceObservationCapability(sourceType: string): 'replayable_listing' | 'peek' | undefined {
+	sourceType = sourceType.toLowerCase();
 	if (['rss', 'podcast', 'youtube', 'reddit'].includes(sourceType)) return 'replayable_listing';
 	if (['twitter', 'telegram', 'website'].includes(sourceType)) return 'peek';
 	return undefined;

@@ -29,19 +29,6 @@ export const manualFetcher: Fetcher = {
             };
         }
 
-        if (!payload.contentType || !payload.title) {
-            logger.warn('Manual fetcher missing required payload fields', {
-                sourceId: config.id,
-                hasContentType: !!(payload as ManualPayload).contentType,
-                hasTitle: !!(payload as ManualPayload).title,
-            });
-            return {
-                items: [],
-                hasMore: false,
-                metadata: { totalFetched: 0, skipped: 1, errors: 1 },
-            };
-        }
-
         const externalId = payload.externalId || config.id || `manual-${Date.now()}`;
         const url = payload.originalUrl || payload.mediaUrl || config.url || buildFallbackUrl(externalId);
         const item: RawFetchedItem = {

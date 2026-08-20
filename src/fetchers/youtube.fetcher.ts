@@ -6,6 +6,7 @@ import { logger } from '../observability/logger.js';
 import { rateLimiter } from '../services/rate-limiter.js';
 import { getRedisConnection } from '../queues/redis.js';
 import type { Fetcher, FetchResult, RawFetchedItem, SourceConfig, YouTubeSourceConfig } from './types.js';
+import { configuredMaximumDurationSec, configuredMinimumDurationSec, configuredResultLimit } from '../services/pods-admission.js';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const QUOTA_KEY = 'youtube:quota:daily';
@@ -32,10 +33,7 @@ async function resolveHandleToChannelId(handle: string, apiKey: string): Promise
     url.searchParams.set('key', apiKey);
 
     const response = await fetch(url.toString());
-    if (!response.ok) {
-        logger.warn('Failed to resolve YouTube handle', { handle, status: response.status });
-        return null;
-    }
+    await requireYoutubeOk(response, 'handle resolution');
 
     const data = await response.json();
     return data.items?.[0]?.id || null;
@@ -48,10 +46,7 @@ async function resolveCustomUrlToChannelId(customUrl: string, apiKey: string): P
     url.searchParams.set('key', apiKey);
 
     const response = await fetch(url.toString());
-    if (!response.ok) {
-        logger.warn('Failed to resolve custom URL', { customUrl, status: response.status });
-        return null;
-    }
+    await requireYoutubeOk(response, 'custom URL resolution');
 
     const data = await response.json();
     return data.items?.[0]?.id || null;
@@ -217,6 +212,24 @@ function getNumber(raw: Record<string, unknown>, keys: string[]): number | undef
     return undefined;
 }
 
+async function requireYoutubeOk(response: Response, operation: string): Promise<void> {
+    if (response.ok) return;
+    let details = '';
+    try {
+        const body = await response.json() as { error?: { message?: string } };
+        details = body.error?.message ? `: ${body.error.message}` : '';
+    } catch {
+        // Keep the HTTP status as the stable diagnostic for non-JSON bodies.
+    }
+    throw new Error(`YouTube ${operation} API error: ${response.status}${details}`);
+}
+
+export function shouldContinueYoutubePagination(nextCursor: string | undefined, acceptedCount: number, maxResults: number, currentCursor?: string): boolean {
+    // Do not stop on an all-Shorts page: stop only after satisfying this
+    // page's accepted-item target or exhausting the provider cursor.
+    return Boolean(nextCursor && nextCursor !== currentCursor && acceptedCount < maxResults);
+}
+
 export function youtubeCandidateLimit(
     maxResults: number,
     minDurationSec?: number,
@@ -236,25 +249,19 @@ export const youtubeFetcher: Fetcher = {
         const ytConfig = config as YouTubeSourceConfig;
         const rawSettings = (ytConfig.settings || {}) as Record<string, unknown>;
 
-        const maxResultsCandidate = getNumber(rawSettings, ['maxResults', 'max_results']);
-        const maxResults = typeof maxResultsCandidate === 'number' && maxResultsCandidate > 0
-            ? Math.min(50, Math.floor(maxResultsCandidate))
-            : 10;
+        const maxResults = configuredResultLimit(rawSettings, 10, 50);
 
         const maxAgeHoursCandidate = getNumber(rawSettings, ['maxAgeHours', 'max_age_hours']);
         const maxAgeHours = typeof maxAgeHoursCandidate === 'number' && maxAgeHoursCandidate > 0
             ? Math.floor(maxAgeHoursCandidate)
             : undefined;
 
-        const minDurationMinCandidate = getNumber(rawSettings, ['minDurationMinutes', 'min_duration_minutes']);
-        const minDurationSec = typeof minDurationMinCandidate === 'number' && minDurationMinCandidate > 0
-            ? Math.floor(minDurationMinCandidate * 60)
-            : undefined;
+        const minDurationSec = configuredMinimumDurationSec(rawSettings);
 
-        const maxDurationMinCandidate = getNumber(rawSettings, ['maxDurationMinutes', 'max_duration_minutes']);
-        const maxDurationSec = typeof maxDurationMinCandidate === 'number' && maxDurationMinCandidate > 0
-            ? Math.floor(maxDurationMinCandidate * 60)
-            : undefined;
+        const maxDurationSec = configuredMaximumDurationSec(rawSettings);
+        if (maxDurationSec !== undefined && maxDurationSec < minDurationSec) {
+            throw new Error('YouTube duration settings are contradictory: maximum is below minimum');
+        }
         const candidateLimit = youtubeCandidateLimit(maxResults, minDurationSec, maxDurationSec);
 
         let { channelId, playlistId, searchQuery } = ytConfig.settings as {
@@ -269,11 +276,7 @@ export const youtubeFetcher: Fetcher = {
         const rateCheck = await rateLimiter.consumeRateLimit('YOUTUBE', config.id);
         if (!rateCheck.allowed) {
             logger.warn('YouTube rate limit exceeded', { sourceId: config.id });
-            return {
-                items: [],
-                hasMore: false,
-                metadata: { totalFetched: 0, skipped: 0, errors: 0 },
-            };
+            throw new Error('YouTube source rate limit exceeded');
         }
 
         try {
@@ -287,8 +290,11 @@ export const youtubeFetcher: Fetcher = {
                     playlistId = resolved.playlistId;
                     searchQuery = resolved.searchQuery;
                     if (resolved.isShorts && channelId) {
-                        playlistId = 'shorts'; // Marker to fetch shorts playlist later
-                        logger.info('URL targets shorts, will fetch from shorts playlist', { channelId });
+                        // Shorts cannot satisfy the canonical 270-second Pods
+                        // floor. Treat the URL as a channel selector and fetch
+                        // eligible uploads instead of spending quota on a
+                        // surface whose entire inventory will be rejected.
+                        logger.info('URL targets Shorts; using channel uploads for Pods eligibility', { channelId });
                     }
                     if (channelId) {
                         logger.info('Resolved channel ID', { channelId });
@@ -316,6 +322,7 @@ export const youtubeFetcher: Fetcher = {
             }
 
             let videoIds: string[] = [];
+            let missingVideoDetails = 0;
 
             // Determine fetch mode: playlist, search, or channel uploads
             if (playlistId) {
@@ -332,9 +339,7 @@ export const youtubeFetcher: Fetcher = {
                 if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
 
                 const response = await fetch(playlistUrl.toString());
-                if (!response.ok) {
-                    throw new Error(`YouTube API error: ${response.status}`);
-                }
+                await requireYoutubeOk(response, 'playlistItems');
 
                 const data = await response.json();
                 nextCursor = data.nextPageToken;
@@ -358,9 +363,7 @@ export const youtubeFetcher: Fetcher = {
                 if (cursor) searchUrl.searchParams.set('pageToken', cursor);
 
                 const searchResponse = await fetch(searchUrl.toString());
-                if (!searchResponse.ok) {
-                    throw new Error(`YouTube search API error: ${searchResponse.status}`);
-                }
+                await requireYoutubeOk(searchResponse, 'search');
 
                 const searchData = await searchResponse.json();
                 nextCursor = searchData.nextPageToken;
@@ -379,6 +382,7 @@ export const youtubeFetcher: Fetcher = {
                 channelUrl.searchParams.set('key', apiKey);
 
                 const channelResponse = await fetch(channelUrl.toString());
+                await requireYoutubeOk(channelResponse, 'channels');
                 const channelData = await channelResponse.json();
 
                 const relatedPlaylists = channelData.items?.[0]?.contentDetails?.relatedPlaylists;
@@ -404,9 +408,7 @@ export const youtubeFetcher: Fetcher = {
                         if (cursor) searchUrl.searchParams.set('pageToken', cursor);
 
                         const searchResponse = await fetch(searchUrl.toString());
-                        if (!searchResponse.ok) {
-                            throw new Error(`YouTube search API error: ${searchResponse.status}`);
-                        }
+                        await requireYoutubeOk(searchResponse, 'shorts search');
 
                         const searchData = await searchResponse.json();
                         nextCursor = searchData.nextPageToken;
@@ -429,6 +431,7 @@ export const youtubeFetcher: Fetcher = {
                         if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
 
                         const response = await fetch(playlistUrl.toString());
+                        await requireYoutubeOk(response, 'shorts playlistItems');
                         const data = await response.json();
                         nextCursor = data.nextPageToken;
 
@@ -455,6 +458,7 @@ export const youtubeFetcher: Fetcher = {
                     if (cursor) playlistUrl.searchParams.set('pageToken', cursor);
 
                     const response = await fetch(playlistUrl.toString());
+                    await requireYoutubeOk(response, 'uploads playlistItems');
                     const data = await response.json();
                     nextCursor = data.nextPageToken;
 
@@ -476,7 +480,9 @@ export const youtubeFetcher: Fetcher = {
                 videosUrl.searchParams.set('key', apiKey);
 
                 const videosResponse = await fetch(videosUrl.toString());
+                await requireYoutubeOk(videosResponse, 'videos');
                 const videosData = await videosResponse.json();
+                missingVideoDetails = Math.max(0, videoIds.length - (videosData.items?.length ?? 0));
 
                 for (const video of videosData.items || []) {
                     const item: RawFetchedItem = {
@@ -507,7 +513,7 @@ export const youtubeFetcher: Fetcher = {
 
             // Apply maxAgeHours filter
             let filteredItems = items;
-            let skipped = 0;
+            let skipped = missingVideoDetails;
             if (maxAgeHours && maxAgeHours > 0) {
                 const cutoffTime = new Date();
                 cutoffTime.setHours(cutoffTime.getHours() - maxAgeHours);
@@ -539,6 +545,7 @@ export const youtubeFetcher: Fetcher = {
                     return true;
                 });
                 const durationSkipped = beforeCount - filteredItems.length;
+                skipped += durationSkipped;
                 if (durationSkipped > 0) {
                     logger.info('Filtered videos by duration', {
                         minDurationSec,
@@ -554,8 +561,7 @@ export const youtubeFetcher: Fetcher = {
                 filteredItems = filteredItems.slice(0, maxResults);
             }
 
-            // Only continue pagination if we actually got items and haven't reached our limit
-            const shouldContinue = !!(nextCursor && filteredItems.length > 0);
+            const shouldContinue = shouldContinueYoutubePagination(nextCursor, filteredItems.length, maxResults, cursor);
 
             logger.info('YouTube videos fetched', {
                 sourceId: config.id,

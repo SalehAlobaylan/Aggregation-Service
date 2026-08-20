@@ -13,6 +13,7 @@ import {
     listAllObjects,
     moveObjectBetweenTiers,
     isColdTierConfigured,
+    artifactFamilyForKey,
 } from '../storage/client.js';
 import { logger } from '../observability/logger.js';
 import type { StoragePolicy, MoveToColdItem } from '../cms/types.js';
@@ -616,15 +617,12 @@ export async function reconcileStorage(): Promise<{
     partial: boolean;
     truncatedReason?: string;
 }> {
-    const maxObjects = 1_000;
-    const maxObjectIdsToResolve = 250;
-    const maxCmsItems = 250;
-
-    // 1) Build set of every key currently in S3
+    // 1) Build a complete, paginated inventory. This endpoint is diagnostic;
+    // partial reconciliation hides the exact historic prefixes operators need
+    // to classify before any cleanup decision.
     const s3Keys = new Set<string>();
     const keysByContentId = new Map<string, Set<string>>();
     const processedByContentId = new Set<string>();
-    let objectLimitHit = false;
     for await (const page of listAllObjects()) {
         for (const obj of page) {
             if (!obj.Key) continue;
@@ -638,13 +636,6 @@ export async function reconcileStorage(): Promise<{
                     processedByContentId.add(parsed.contentId);
                 }
             }
-            if (s3Keys.size >= maxObjects) {
-                objectLimitHit = true;
-                break;
-            }
-        }
-        if (objectLimitHit) {
-            break;
         }
     }
 
@@ -654,10 +645,8 @@ export async function reconcileStorage(): Promise<{
     const cmsIdsWithObjects = new Set<string>();
     const resolvedObjectIds = new Set<string>();
     const objectIds = Array.from(keysByContentId.keys());
-    const objectIdsToResolve = objectIds.slice(0, maxObjectIdsToResolve);
-    const objectIdLimitHit = objectIds.length > objectIdsToResolve.length;
-    for (let i = 0; i < objectIdsToResolve.length; i += 100) {
-        const ids = objectIdsToResolve.slice(i, i + 100);
+    for (let i = 0; i < objectIds.length; i += 100) {
+        const ids = objectIds.slice(i, i + 100);
         if (ids.length === 0) continue;
         ids.forEach(id => resolvedObjectIds.add(id));
         const list = await cmsClient.listContentItems({ ids, limit: ids.length });
@@ -666,15 +655,15 @@ export async function reconcileStorage(): Promise<{
         }
     }
 
-    // 3) Walk a bounded CMS sample to report expected processed artifacts that
-    // are missing. Orphan detection remains complete unless maxObjects is hit.
+    // 3) Walk all CMS pages to report expected processed artifacts that are
+    // missing. The object inventory above remains the source of truth for
+    // physical prefix presence.
     const expectedKeys = new Set<string>();
     const missing: string[] = [];
 
     let page = 1;
     const limit = 500;
     let scannedCmsItemCount = 0;
-    let cmsLimitHit = false;
     while (true) {
         const list = await cmsClient.listContentItems({ page, limit });
         if (!list.data || list.data.length === 0) break;
@@ -688,13 +677,7 @@ export async function reconcileStorage(): Promise<{
             if (item.metadata && (item.metadata as Record<string, unknown>)['expects_processed'] && !processedByContentId.has(item.id)) {
                 missing.push(`content/${item.id}/processed.*`);
             }
-            if (scannedCmsItemCount >= maxCmsItems) {
-                cmsLimitHit = true;
-                break;
-            }
         }
-
-        if (cmsLimitHit) break;
         if (list.data.length < limit) break;
         page += 1;
     }
@@ -713,8 +696,6 @@ export async function reconcileStorage(): Promise<{
         }
     }
 
-    const partial = objectLimitHit || objectIdLimitHit || cmsLimitHit;
-
     return {
         orphanKeys,
         missingObjects: missing,
@@ -722,14 +703,7 @@ export async function reconcileStorage(): Promise<{
         missingCount: missing.length,
         scannedObjectCount: s3Keys.size,
         scannedCmsItemCount,
-        partial,
-        truncatedReason: partial
-            ? [
-                objectLimitHit ? `object_limit_${maxObjects}` : '',
-                objectIdLimitHit ? `object_id_resolution_limit_${maxObjectIdsToResolve}` : '',
-                cmsLimitHit ? `cms_item_limit_${maxCmsItems}` : '',
-            ].filter(Boolean).join(',')
-            : undefined,
+        partial: false,
     };
 }
 
@@ -740,6 +714,6 @@ function parseContentObjectKey(key: string): { contentId: string; artifact: stri
     }
     const filename = parts[parts.length - 1] ?? '';
     const dot = filename.lastIndexOf('.');
-    const artifact = dot > 0 ? filename.slice(0, dot) : filename;
+    const artifact = artifactFamilyForKey(key) ?? (dot > 0 ? filename.slice(0, dot) : filename);
     return { contentId: parts[1], artifact };
 }
