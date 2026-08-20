@@ -1,6 +1,6 @@
 /**
  * CMS Upsert Helper
- * Handles idempotent content item creation with Redis caching
+ * Handles idempotent content item creation with CMS as the authority.
  */
 import { cmsClient } from "./client.js";
 import { dedupService } from "../services/dedup.service.js";
@@ -22,19 +22,20 @@ export async function upsertContentItem(
   item: NormalizedItem,
   requestId?: string,
 	lineage?: { tenantId: string; contentSourceId: string; sourceRunRequestId?: string; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string },
-): Promise<{ contentItemId: string; created: boolean; retired: boolean }> {
+): Promise<{
+	contentItemId: string;
+	created: boolean;
+	retired: boolean;
+	status: ContentStatus;
+	disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
+	activeStages: string[];
+	deliveryMode: "legacy" | "shadow" | "durable_required";
+}> {
   const redis = getRedisConnection();
   const cacheKey = `${SOURCE_CACHE_PREFIX}${item.idempotencyKey}`;
 
-  // Check cache first
-  const cachedId = await redis.get(cacheKey);
-  if (cachedId) {
-    logger.debug("Using cached content item ID", {
-      idempotencyKey: item.idempotencyKey,
-      cachedId,
-    });
-    return { contentItemId: cachedId, created: false, retired: false };
-  }
+  // Redis is an optimization only. Every observation reaches CMS so the
+  // atomic manifest, generation, cutover, and lifecycle state are authoritative.
 
   // Build CMS request
   const request: CreateContentItemRequest = {
@@ -75,7 +76,7 @@ export async function upsertContentItem(
 			idempotencyKey: item.idempotencyKey,
 			contentItemId,
 		});
-		return { contentItemId, created: false, retired: true };
+		return { contentItemId, created: false, retired: true, status: response.status, disposition: "retired", activeStages: [], deliveryMode: response.delivery_mode ?? "legacy" };
 	}
 
     // Cache the mapping
@@ -93,7 +94,15 @@ export async function upsertContentItem(
       created,
     });
 
-    return { contentItemId, created, retired: false };
+    return {
+		contentItemId,
+		created,
+		retired: false,
+		status: response.status,
+		disposition: response.disposition ?? "unknown",
+		activeStages: response.active_stages ?? [],
+		deliveryMode: response.delivery_mode ?? "legacy",
+	};
   } catch (error) {
     // Check if it's a duplicate error (409 Conflict)
     if (error instanceof Error && error.message.includes("409")) {
@@ -106,7 +115,9 @@ export async function upsertContentItem(
           idempotencyKey: item.idempotencyKey,
           existingId,
         });
-        return { contentItemId: existingId, created: false, retired: false };
+		// A cache hit cannot safely recover the missing CMS disposition. Let the
+		// caller retry the authoritative idempotent request instead.
+		throw error;
       }
     }
 

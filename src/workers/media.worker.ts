@@ -6,9 +6,9 @@ import { Job } from "bullmq";
 import { join } from "path";
 import { stat } from "fs/promises";
 import { createWorker } from "./base-worker.js";
-import { QUEUE_NAMES, type MediaJob } from "../queues/index.js";
+import { QUEUE_NAMES, type ContentStageJob, type MediaJob } from "../queues/index.js";
 import { getQueue } from "../queues/index.js";
-import { cmsClient } from "../cms/client.js";
+import { cmsClient, contentStageCorrelation } from "../cms/client.js";
 import { config } from "../config/index.js";
 
 // Media services
@@ -40,6 +40,7 @@ import {
 import { captionsToFullText } from "../media/captions.js";
 import { lookup as lookupMime } from "mime-types";
 import { aiPriorityForContentType } from "../services/ai-queue-priority.js";
+import { createLogger } from "../observability/logger.js";
 
 type CaptionState = "youtube_human" | "youtube_auto" | "none";
 type MediaSuitabilityVerdict =
@@ -142,11 +143,7 @@ function classifyMediaSuitability(args: {
   return { verdict: "unknown", confidence: 0.35, reasons };
 }
 
-export const mediaWorker = createWorker({
-  queueName: QUEUE_NAMES.MEDIA,
-  concurrency: 2, // Media processing is resource-intensive
-  timeoutMs: config.mediaJobTimeoutMs, // 60 min default — covers bounded 4K/AV1 fallback recovery
-  processor: async (job: Job<MediaJob>, jobLogger, signal): Promise<void> => {
+export async function processMediaJob(job: Job<MediaJob>, jobLogger: ReturnType<typeof createLogger>, signal?: AbortSignal): Promise<void> {
     const {
       contentItemId,
       contentType,
@@ -192,12 +189,9 @@ export const mediaWorker = createWorker({
       }
 
       // 1. Set status to PROCESSING
-      await cmsClient.updateStatus(
-        contentItemId,
-        { status: "PROCESSING" },
-        job.id,
-        signal,
-      );
+	  if (!job.data.contentStage) {
+		await cmsClient.updateStatus(contentItemId, { status: "PROCESSING" }, job.id, signal);
+	  }
 
       // 2. Check if already processed (idempotent)
       const artifactExtension = inferArtifactExtension(
@@ -224,8 +218,9 @@ export const mediaWorker = createWorker({
           processedKey,
           publicUrl,
           job.id,
+          job.data.contentStage,
         );
-        await enqueueAIJob(job, contentItemId, contentType, publicUrl);
+		if (!job.data.contentStage) await enqueueAIJob(job, contentItemId, contentType, publicUrl);
         return;
       }
 
@@ -303,15 +298,11 @@ export const mediaWorker = createWorker({
           contentItemId,
           reason: preflightFailure,
         });
-        await cmsClient.updateStatus(
-          contentItemId,
-          {
-            status: "FAILED",
-            failure_reason: preflightFailure,
-          },
-          job.id,
-          signal,
-        );
+		if (job.data.contentStage && job.data.contentStageClaim) {
+			await cmsClient.failContentStage(job.data.contentStageClaim, "media_policy_rejected", preflightFailure, job.id);
+		} else {
+			await cmsClient.updateStatus(contentItemId, { status: "FAILED", failure_reason: preflightFailure }, job.id, signal);
+		}
         return; // stop here — no S3 writes, no AI enqueue
       }
 
@@ -461,6 +452,22 @@ export const mediaWorker = createWorker({
         downloadMeta["sponsor_segments"] = downloadResult.sponsorSegments;
       if (downloadResult.categories?.length)
         downloadMeta["categories"] = downloadResult.categories;
+	  const boundedCaptions = downloadResult.captions;
+	  if (boundedCaptions && boundedCaptions.segments.length > 0 && boundedCaptions.segments.length <= 10_000) {
+		const fullText = captionsToFullText(boundedCaptions.segments);
+		if (fullText.length <= 2_000_000) {
+		  downloadMeta["caption_artifact"] = {
+			full_text: fullText,
+			language: boundedCaptions.language,
+			segments: boundedCaptions.segments,
+			chapters: downloadResult.chapters?.slice(0, 500),
+			source: boundedCaptions.isAuto ? "youtube_auto" : "youtube_human",
+			provider: "youtube",
+		  };
+		} else {
+		  jobLogger.warn("Caption artifact exceeded bounded text contract; Media STT will be used", { contentItemId, textLength: fullText.length });
+		}
+	  }
       const suitability = classifyMediaSuitability({
         contentType,
         sourceType,
@@ -489,6 +496,7 @@ export const mediaWorker = createWorker({
           media_suitability_reasons: suitability.reasons,
           metadata:
             Object.keys(downloadMeta).length > 0 ? downloadMeta : undefined,
+		  content_stage: job.data.contentStage,
         },
         job.id,
         signal,
@@ -509,7 +517,7 @@ export const mediaWorker = createWorker({
       let captionText: string | undefined;
       const captions = downloadResult.captions;
       const chapters = downloadResult.chapters;
-      if (captions && captions.segments.length > 0) {
+      if (!job.data.contentStage && captions && captions.segments.length > 0) {
         captionState = captions.isAuto ? "youtube_auto" : "youtube_human";
         captionText = captionsToFullText(captions.segments);
         try {
@@ -543,35 +551,35 @@ export const mediaWorker = createWorker({
       }
 
       // 9b. Enqueue AI job for transcript (STT, if needed) + embedding
-      await enqueueAIJob(
-        job,
-        contentItemId,
-        contentType,
-        mediaUrl,
-        captionState,
-        captionText,
-        true,
-      );
+      if (!job.data.contentStage) {
+		await enqueueAIJob(
+		  job,
+		  contentItemId,
+		  contentType,
+		  mediaUrl,
+		  captionState,
+		  captionText,
+		  true,
+		);
+	  }
 
       jobLogger.info("Media job completed successfully", { contentItemId });
     } catch (error) {
       jobLogger.error("Media job failed", error, { contentItemId });
 
-      // Update status to FAILED
-      try {
-        await cmsClient.updateStatus(
-          contentItemId,
-          {
-            status: "FAILED",
-            failure_reason:
-              error instanceof Error ? error.message : "Unknown error",
-          },
-          job.id,
-          signal,
-        );
-      } catch (statusError) {
-        jobLogger.error("Failed to update status", statusError);
-      }
+	  if (job.data.contentStage) {
+		// Download/transcode/upload may already have crossed an external effect
+		// boundary. Preserve uncertainty and let CMS verify before any retry.
+		const claim = job.data.contentStageClaim;
+		if (!claim) throw error;
+		await cmsClient.uncertainContentStage(claim, "Media stage may have produced or uploaded an artifact", job.id).catch(statusError => jobLogger.error("Failed to preserve media-stage uncertainty", statusError));
+	  } else {
+		try {
+		  await cmsClient.updateStatus(contentItemId, { status: "FAILED", failure_reason: error instanceof Error ? error.message : "Unknown error" }, job.id, signal);
+		} catch (statusError) {
+		  jobLogger.error("Failed to update status", statusError);
+		}
+	  }
 
       throw error;
     } finally {
@@ -580,6 +588,47 @@ export const mediaWorker = createWorker({
         await cleanupTempFile(tempFile);
       }
     }
+}
+
+export const createLegacyMediaWorker = () => createWorker({
+  queueName: QUEUE_NAMES.MEDIA,
+  concurrency: 2,
+  timeoutMs: config.mediaJobTimeoutMs,
+  processor: processMediaJob,
+});
+
+export const createPodsMediaWorker = () => createWorker({
+  queueName: QUEUE_NAMES.PODS_MEDIA,
+  concurrency: 2,
+  timeoutMs: config.mediaJobTimeoutMs,
+	deadLetterQueueName: QUEUE_NAMES.PODS_STAGE_DLQ,
+  processor: async (stageJob: Job<ContentStageJob>, jobLogger, signal): Promise<void> => {
+	const { claim } = stageJob.data;
+	if (claim.lane !== 'pods' || claim.stage !== 'pods_media_artifacts') {
+		await cmsClient.deferContentStage(claim, 1, 'Wrong-lane delivery to Pods media worker', stageJob.id);
+		jobLogger.warn('Rejected wrong-lane Pods media delivery', { lane: claim.lane, stage: claim.stage });
+		return;
+	}
+	await cmsClient.beginContentStage(claim, stageJob.id);
+	const heartbeat = setInterval(() => void cmsClient.heartbeatContentStage(claim, stageJob.id).catch(() => undefined), 15_000);
+	heartbeat.unref();
+	try {
+		const mediaData: MediaJob = {
+			contentItemId: claim.content_item_id,
+			tenantId: claim.tenant_id,
+			contentType: claim.bounded_input.content_type ?? 'VIDEO',
+			sourceType: claim.bounded_input.source ?? 'YOUTUBE',
+			sourceUrl: claim.bounded_input.original_url ?? '',
+			textContent: { title: claim.bounded_input.title ?? '', excerpt: claim.bounded_input.excerpt ?? undefined, bodyText: claim.bounded_input.body_text ?? undefined },
+			operations: ['download', 'transcode', 'thumbnail'],
+			contentStage: contentStageCorrelation(claim),
+			contentStageClaim: claim,
+		};
+		const mediaJob = Object.assign(stageJob, { data: mediaData }) as unknown as Job<MediaJob>;
+		await processMediaJob(mediaJob, jobLogger, signal);
+	} finally {
+		clearInterval(heartbeat);
+	}
   },
 });
 
@@ -639,6 +688,7 @@ async function repairExistingArtifacts(
   processedKey: string,
   publicUrl: string,
   requestId?: string,
+	contentStage?: MediaJob['contentStage'],
 ): Promise<void> {
   const ext = processedKey.split(".").pop()?.toLowerCase();
   const isAudio =
@@ -676,6 +726,7 @@ async function repairExistingArtifacts(
           is_primary: true,
         },
       ],
+	  content_stage: contentStage,
     },
     requestId,
   );

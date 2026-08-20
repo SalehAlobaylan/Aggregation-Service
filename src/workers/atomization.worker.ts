@@ -3,7 +3,7 @@ import { join } from "path";
 import { readdir, rm, stat } from "fs/promises";
 import { createWorker } from "./base-worker.js";
 import { getQueue, QUEUE_NAMES, type AtomizationJob } from "../queues/index.js";
-import { cmsClient } from "../cms/client.js";
+import { cmsClient, contentStageCorrelation } from "../cms/client.js";
 import { config } from "../config/index.js";
 import { downloadHttp, cleanupTempFile } from "../media/downloader.js";
 import {
@@ -29,6 +29,7 @@ import type {
 import {
   buildChapterEmbeddingJobs,
   buildWindows,
+  compatibilityChapterChildren,
   countReviewChapters,
   minFeedUnitSeconds,
   normalizeGeneratedChapters,
@@ -48,9 +49,11 @@ export const atomizationWorker = createWorker({
     signal,
   ): Promise<void> => {
     const { contentItemId } = job.data;
-	const governed = job.data.workRequestId && job.data.workClaimToken
-		? { id: job.data.workRequestId, claimToken: job.data.workClaimToken }
-		: undefined;
+    const stageClaim = job.data.contentStageClaim;
+    const governed =
+      job.data.workRequestId && job.data.workClaimToken
+        ? { id: job.data.workRequestId, claimToken: job.data.workClaimToken }
+        : undefined;
     jobLogger.info("Processing atomization job", {
       contentItemId,
       reason: job.data.reason,
@@ -79,8 +82,20 @@ export const atomizationWorker = createWorker({
       runId = response.run_id;
     };
 
+    let stageHeartbeat: NodeJS.Timeout | undefined;
     try {
-	  if (governed) await cmsClient.beginAtomizationWork(governed, job.id);
+      if (stageClaim) {
+        await cmsClient.beginContentStage(stageClaim, job.id);
+        stageHeartbeat = setInterval(
+          () =>
+            void cmsClient
+              .heartbeatContentStage(stageClaim, job.id)
+              .catch(() => undefined),
+          15_000,
+        );
+        stageHeartbeat.unref();
+      }
+      if (governed) await cmsClient.beginAtomizationWork(governed, job.id);
       await report("running", "planning");
       const input = await cmsClient.getAtomizationInput(
         contentItemId,
@@ -91,6 +106,13 @@ export const atomizationWorker = createWorker({
         jobLogger.info("Atomization disabled by source policy", {
           contentItemId,
         });
+        if (stageClaim) {
+          await cmsClient.settleAtomizationNotRequired(
+            stageClaim,
+            "CMS atomization policy is disabled",
+            job.id,
+          );
+        }
         await report("completed", "planning");
         return;
       }
@@ -107,6 +129,13 @@ export const atomizationWorker = createWorker({
             durationSec: input.item.duration_sec,
           },
         );
+        if (stageClaim) {
+          await cmsClient.settleAtomizationNotRequired(
+            stageClaim,
+            "Parent duration no longer requires atomization",
+            job.id,
+          );
+        }
         await report("completed", "planning");
         return;
       }
@@ -135,7 +164,18 @@ export const atomizationWorker = createWorker({
         job.id,
         signal,
       );
-	  if (governed) await cmsClient.checkpointAtomizationWork({ ...governed, phase: 'plan_persisted', proof: { input_fingerprint: job.data.workInputFingerprint, chapter_count: chapters.length } }, job.id);
+      if (governed)
+        await cmsClient.checkpointAtomizationWork(
+          {
+            ...governed,
+            phase: "plan_persisted",
+            proof: {
+              input_fingerprint: job.data.workInputFingerprint,
+              chapter_count: chapters.length,
+            },
+          },
+          job.id,
+        );
       await report("running", "cutting");
 
       const tempFiles: string[] = [];
@@ -156,7 +196,8 @@ export const atomizationWorker = createWorker({
 
         const children: AtomizationChapter[] = [];
         for (let i = 0; i < chapters.length; i += 1) {
-		  if (governed) await cmsClient.heartbeatAtomizationWork(governed, job.id);
+          if (governed)
+            await cmsClient.heartbeatAtomizationWork(governed, job.id);
           const chapter = chapters[i]!;
           const clipPath = join(
             config.mediaTempDir,
@@ -176,7 +217,11 @@ export const atomizationWorker = createWorker({
             { signal },
           );
           tempFiles.push(clipPath);
-		  if (governed && i === 0) await cmsClient.checkpointAtomizationWork({ ...governed, phase: 'first_cut', proof: { chapter_index: 0 } }, job.id);
+          if (governed && i === 0)
+            await cmsClient.checkpointAtomizationWork(
+              { ...governed, phase: "first_cut", proof: { chapter_index: 0 } },
+              job.id,
+            );
 
           currentPhase = "renditions";
           const mp4Key = getStorageKey(
@@ -300,7 +345,15 @@ export const atomizationWorker = createWorker({
             durationSec: cut.duration,
           });
         }
-		if (governed) await cmsClient.checkpointAtomizationWork({ ...governed, phase: 'uploads_complete', proof: { chapter_count: children.length } }, job.id);
+        if (governed)
+          await cmsClient.checkpointAtomizationWork(
+            {
+              ...governed,
+              phase: "uploads_complete",
+              proof: { chapter_count: children.length },
+            },
+            job.id,
+          );
 
         await report("running", "children", {
           child_count: children.length,
@@ -312,12 +365,33 @@ export const atomizationWorker = createWorker({
         const result = await cmsClient.createAtomizedChildren(
           contentItemId,
           children,
+          stageClaim ? contentStageCorrelation(stageClaim) : undefined,
           job.id,
           signal,
         );
-		if (governed) await cmsClient.checkpointAtomizationWork({ ...governed, phase: 'children_persisted', proof: { child_ids: result.children.map((child) => child.id) } }, job.id);
+        if (stageHeartbeat) {
+          clearInterval(stageHeartbeat);
+          stageHeartbeat = undefined;
+        }
+        if (governed)
+          await cmsClient.checkpointAtomizationWork(
+            {
+              ...governed,
+              phase: "children_persisted",
+              proof: { child_ids: result.children.map((child) => child.id) },
+            },
+            job.id,
+          );
         await enqueueChapterEmbeddingJobs(result.children, children, input);
-		if (governed) await cmsClient.checkpointAtomizationWork({ ...governed, phase: 'embedding_handoff', proof: { child_count: result.children.length } }, job.id);
+        if (governed)
+          await cmsClient.checkpointAtomizationWork(
+            {
+              ...governed,
+              phase: "embedding_handoff",
+              proof: { child_count: result.children.length },
+            },
+            job.id,
+          );
         const reviewCount = countReviewChapters(
           children,
           input.policy.high_confidence_threshold,
@@ -330,7 +404,18 @@ export const atomizationWorker = createWorker({
             review_count: reviewCount,
           },
         );
-		if (governed) await cmsClient.checkpointAtomizationWork({ ...governed, phase: 'owner_complete', proof: { child_ids: result.children.map((child) => child.id), review_count: reviewCount } }, job.id);
+        if (governed)
+          await cmsClient.checkpointAtomizationWork(
+            {
+              ...governed,
+              phase: "owner_complete",
+              proof: {
+                child_ids: result.children.map((child) => child.id),
+                review_count: reviewCount,
+              },
+            },
+            job.id,
+          );
         jobLogger.info("Atomization completed", {
           contentItemId,
           children: result.children.length,
@@ -363,18 +448,29 @@ export const atomizationWorker = createWorker({
         });
       }
       throw error;
+    } finally {
+      if (stageHeartbeat) clearInterval(stageHeartbeat);
     }
   },
 });
 
 async function enqueueChapterEmbeddingJobs(
-  created: Array<{ id: string; feed_visibility: string }>,
+  created: Array<{
+    id: string;
+    feed_visibility: string;
+    delivery_mode: "legacy" | "shadow" | "durable_required";
+  }>,
   chapters: AtomizationChapter[],
   input: AtomizationInputResponse,
 ): Promise<void> {
   const aiQueue = getQueue(QUEUE_NAMES.AI);
   if (!aiQueue) return;
-  for (const job of buildChapterEmbeddingJobs(created, chapters, input)) {
+  const compatibilityChildren = compatibilityChapterChildren(created);
+  for (const job of buildChapterEmbeddingJobs(
+    compatibilityChildren,
+    chapters,
+    input,
+  )) {
     const existing = await aiQueue.getJob(job.options.jobId);
     if (existing) {
       const state = await existing.getState();

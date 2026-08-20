@@ -24,6 +24,9 @@ export interface WorkerConfig {
     /** A control tick may safely wait for its next schedule when no durable
      * effect was claimed and a dependency is temporarily unavailable. */
     shouldDeferFailure?: (job: Job, error: unknown) => boolean;
+	/** Durable domain stages have independent exception queues so one lane's
+	 * incident cannot hide the other lane's failures. */
+	deadLetterQueueName?: string;
 }
 
 /**
@@ -37,6 +40,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
         processor,
         shouldDeadLetter = () => true,
         shouldDeferFailure = () => false,
+		deadLetterQueueName = QUEUE_NAMES.DLQ,
     } = workerConfig;
 
     const worker = new Worker(
@@ -99,7 +103,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
 
             // Move to DLQ if all retries exhausted
             if (job.opts.attempts && attemptsMade >= job.opts.attempts && shouldDeadLetter(job)) {
-                await moveToDeadLetterQueue(job, queueName, error.message);
+                await moveToDeadLetterQueue(job, queueName, error.message, deadLetterQueueName);
             }
         }
     });
@@ -235,9 +239,10 @@ export const workerTestUtils = {
 async function moveToDeadLetterQueue(
     job: Job,
     originalQueue: string,
-    failureReason: string
+    failureReason: string,
+	dlqName: string,
 ): Promise<void> {
-    const dlq = getQueue(QUEUE_NAMES.DLQ);
+    const dlq = getQueue(dlqName as Parameters<typeof getQueue>[0]);
     if (!dlq) {
         logger.error('DLQ not initialized, cannot move failed job');
         return;

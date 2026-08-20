@@ -132,7 +132,8 @@ vi.mock('../../src/cms/upsert.js', () => ({
     upsertContentItem: mocks.upsertContentItem,
 }));
 
-await import('../../src/workers/media.worker.js');
+const { createLegacyMediaWorker } = await import('../../src/workers/media.worker.js');
+createLegacyMediaWorker();
 await import('../../src/workers/normalize.worker.js');
 
 const mediaQueueName = 'media-queue';

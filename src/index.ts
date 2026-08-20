@@ -10,11 +10,15 @@ import { config, getRedactedConfig } from './config/index.js';
 import { logger } from './observability/logger.js';
 import { getRedisConnection, closeRedisConnection } from './queues/redis.js';
 import { initializeQueues, closeQueues } from './queues/index.js';
-import { startWorkers, closeWorkers } from './workers/index.js';
+import { startWorkers, closeWorkers, type WorkerRole } from './workers/index.js';
 import { startServer, stopServer } from './server/index.js';
 
 async function main(): Promise<void> {
-    logger.info('Starting Aggregation Service...');
+	const requestedRole = (process.argv[2] ?? 'all') as WorkerRole;
+	if (!['all', 'intake-control', 'news', 'pods'].includes(requestedRole)) {
+		throw new Error(`Unknown Aggregation role: ${requestedRole}`);
+	}
+    logger.info('Starting Aggregation Service...', { role: requestedRole });
     logger.info('Configuration loaded', getRedactedConfig(config));
     logger.info('Connection targets', {
         cmsBaseUrl: config.cmsBaseUrl,
@@ -36,11 +40,14 @@ async function main(): Promise<void> {
 
         // Start workers
         logger.info('Starting workers...');
-        await startWorkers();
+        await startWorkers(requestedRole);
 
-        // Start HTTP server
-        logger.info('Starting HTTP server...');
-        await startServer();
+		// Only the control role exposes health/admin HTTP. Domain worker roles are
+		// independently supervised processes and never contend for the same port.
+		if (requestedRole === 'all' || requestedRole === 'intake-control') {
+			logger.info('Starting HTTP server...');
+			await startServer();
+		}
 
         logger.info('Aggregation Service started successfully');
     } catch (error) {
@@ -55,7 +62,7 @@ async function shutdown(signal: string): Promise<void> {
 
     try {
         // Stop accepting new work
-        await stopServer();
+		await stopServer().catch(() => undefined);
 
         // Wait for workers to finish current jobs
         await closeWorkers();

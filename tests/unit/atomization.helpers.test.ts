@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     buildChapterEmbeddingJobs,
     buildWindows,
+	compatibilityChapterChildren,
     countReviewChapters,
     normalizeGeneratedChapters,
     shouldAtomizeParent,
@@ -228,6 +229,15 @@ describe('atomization helpers', () => {
         });
         expect(jobs[0].options.jobId).toBe('atomized-embed-child-publish');
     });
+
+	it('keeps durable atomized children out of the legacy shared AI queue', () => {
+		const children = compatibilityChapterChildren([
+			{ id: 'legacy', delivery_mode: 'legacy' as const },
+			{ id: 'shadow', delivery_mode: 'shadow' as const },
+			{ id: 'durable', delivery_mode: 'durable_required' as const },
+		]);
+		expect(children.map(child => child.id)).toEqual(['legacy', 'shadow']);
+	});
 
     it('builds transcript windows with enough granularity for long episodes', () => {
         const windows = buildWindows([

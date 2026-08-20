@@ -18,10 +18,21 @@ export function initializeQueues(): Map<QueueName, Queue> {
 
     // Create each queue
     for (const [key, queueName] of Object.entries(QUEUE_NAMES)) {
+		const durableStageQueue = new Set<string>([
+			QUEUE_NAMES.NEWS_ASSET,
+			QUEUE_NAMES.NEWS_ENRICHMENT,
+			QUEUE_NAMES.NEWS_OPTIONAL,
+			QUEUE_NAMES.PODS_MEDIA,
+			QUEUE_NAMES.PODS_COMPLETION,
+			QUEUE_NAMES.PODS_OPTIONAL,
+			QUEUE_NAMES.PODS_ATOMIZATION,
+		]).has(queueName);
         const queue = new Queue(queueName, {
             connection,
             defaultJobOptions: {
-                attempts: 3,
+				// CMS owns retry and uncertainty for durable normal-stage work.
+				// A BullMQ delivery must therefore execute at most once.
+                attempts: durableStageQueue ? 1 : 3,
                 backoff: {
                     type: 'exponential',
                     delay: 1000,

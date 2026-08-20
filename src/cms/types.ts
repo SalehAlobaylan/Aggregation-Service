@@ -127,10 +127,25 @@ export interface CreateContentItemRequest {
 
 export interface CreateContentItemResponse {
   id: string;
+	tenant_id: string;
   status: ContentStatus;
   created: boolean; // true if newly created, false if already existed
 	retired?: boolean; // identity is a Retention tombstone; never enqueue downstream work
   created_at: string;
+	processing_generation: number;
+	disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
+	required_stages: string[];
+	active_stages: string[];
+	delivery_mode: "legacy" | "shadow" | "durable_required";
+}
+
+export interface ContentStageCorrelationRequest {
+	request_id: string;
+	attempt_id: string;
+	claim_token: string;
+	fence_token: string;
+	input_fingerprint: string;
+	producer_event_id: string;
 }
 
 /**
@@ -193,6 +208,7 @@ export interface UpdateArtifactsRequest {
   // CMS-issued item-version fence for an exact Pipeline repair. Normal
   // ingestion must not synthesize this value.
   expected_item_updated_at?: string;
+	content_stage?: ContentStageCorrelationRequest;
 }
 
 export interface MediaRendition {
@@ -301,6 +317,7 @@ export interface AtomizedChildResponse {
   id: string;
   status: string;
   feed_visibility: string;
+  delivery_mode: 'legacy' | 'shadow' | 'durable_required';
 }
 
 export interface AtomizationCandidate {
@@ -726,6 +743,7 @@ export interface CreateSweepRunRequest {
  */
 export interface LinkTranscriptRequest {
   transcript_id: string;
+	content_stage?: ContentStageCorrelationRequest;
 }
 
 /**
@@ -734,6 +752,7 @@ export interface LinkTranscriptRequest {
 export interface UpdateEmbeddingRequest {
   embedding: number[];
   topic_tags?: string[];
+	content_stage?: ContentStageCorrelationRequest;
 }
 
 /**

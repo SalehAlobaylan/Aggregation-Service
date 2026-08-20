@@ -6,12 +6,25 @@ import { logger } from '../observability/logger.js';
 
 let workers: Worker[] = [];
 let startPromise: Promise<void> | null = null;
+export type WorkerRole = 'all' | 'intake-control' | 'news' | 'pods';
 
-async function createWorkers(): Promise<Worker[]> {
+async function createWorkers(role: WorkerRole): Promise<Worker[]> {
+	if (role === 'news') {
+		const { createNewsEnrichmentWorker, createNewsOptionalWorker } = await import('./content-stage-embedding.worker.js');
+		return [createNewsEnrichmentWorker(), createNewsOptionalWorker()];
+	}
+	if (role === 'pods') {
+		const [{ createPodsCompletionWorker, createPodsOptionalWorker }, { createPodsMediaWorker }, { podsAtomizationStageWorker }] = await Promise.all([
+			import('./content-stage-embedding.worker.js'),
+			import('./media.worker.js'),
+			import('./content-stage-atomization.worker.js'),
+		]);
+		return [createPodsMediaWorker(), createPodsCompletionWorker(), createPodsOptionalWorker(), podsAtomizationStageWorker];
+	}
     const [
         { fetchWorker },
         { normalizeWorker },
-        { mediaWorker },
+		{ createLegacyMediaWorker },
         { aiWorker },
         { atomizationWorker },
         { atomizationSweepWorker },
@@ -48,10 +61,10 @@ async function createWorkers(): Promise<Worker[]> {
 		import('./pipeline-repair.worker.js'),
     ]);
 
-    return [
+	const intakeWorkers = [
         fetchWorker,
         normalizeWorker,
-        mediaWorker,
+		createLegacyMediaWorker(),
         aiWorker,
         atomizationWorker,
         atomizationSweepWorker,
@@ -68,6 +81,13 @@ async function createWorkers(): Promise<Worker[]> {
 		lifecycleReceiptWorker,
 		pipelineRepairWorker,
     ];
+	if (role === 'intake-control') return intakeWorkers;
+	const [{ createNewsEnrichmentWorker, createNewsOptionalWorker, createPodsCompletionWorker, createPodsOptionalWorker }, { createPodsMediaWorker }, { podsAtomizationStageWorker }] = await Promise.all([
+		import('./content-stage-embedding.worker.js'),
+		import('./media.worker.js'),
+		import('./content-stage-atomization.worker.js'),
+	]);
+	return [...intakeWorkers, createNewsEnrichmentWorker(), createNewsOptionalWorker(), createPodsMediaWorker(), createPodsCompletionWorker(), createPodsOptionalWorker(), podsAtomizationStageWorker];
 }
 
 /**
@@ -80,7 +100,7 @@ export function getAllWorkers(): Worker[] {
 /**
  * Start all workers.
  */
-export async function startWorkers(): Promise<void> {
+export async function startWorkers(role: WorkerRole = 'all'): Promise<void> {
     if (workers.length > 0) {
         return;
     }
@@ -89,8 +109,12 @@ export async function startWorkers(): Promise<void> {
     }
 
     startPromise = (async () => {
-        logger.info('Starting all workers...');
-        workers = await createWorkers();
+        logger.info('Starting worker role', { role });
+        workers = await createWorkers(role);
+		if (role === 'news' || role === 'pods') return;
+		const { startContentStageDispatcher } = await import('../services/content-stage-dispatcher.js');
+		startContentStageDispatcher('news');
+		startContentStageDispatcher('pods');
 
         // Jobs queued before the media priority split would otherwise remain
         // buried behind the existing News embedding backlog after a restart.
@@ -178,6 +202,8 @@ export async function closeWorkers(): Promise<void> {
     // the role after five seconds. Abort first so downloads and FFmpeg children
     // receive their cooperative signal and cannot survive as orphan processes.
     const { abortActiveProcessors } = await import('./base-worker.js');
+	const { stopContentStageDispatchers } = await import('../services/content-stage-dispatcher.js');
+	stopContentStageDispatchers();
     const aborted = abortActiveProcessors();
     if (aborted > 0) {
         logger.info('Aborted active processors for shutdown', { count: aborted });

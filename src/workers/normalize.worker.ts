@@ -306,7 +306,7 @@ export const normalizeWorker = createWorker({
                 }
 
                 // Upsert to CMS
-				const { contentItemId, created, retired } = await upsertContentItem(normalized, job.id, {
+				const { contentItemId, created, retired, status: cmsStatus, disposition, deliveryMode } = await upsertContentItem(normalized, job.id, {
 					tenantId, contentSourceId: sourceId, sourceRunRequestId, operatorPlanId, operatorStepId, idempotencyKey,
 				});
 				if (contentItemId) cmsUpserted++;
@@ -318,6 +318,18 @@ export const normalizeWorker = createWorker({
 				if (retired) {
 					duplicates++;
 					jobLogger.info('Skipping downstream work for retained News identity', { idempotencyKey: normalized.idempotencyKey });
+					continue;
+				}
+				if (deliveryMode === 'durable_required') {
+					if (created) processed++; else duplicates++;
+					jobLogger.info('CMS durable stage manifest owns downstream delivery', {
+						contentItemId, disposition, status: cmsStatus,
+					});
+					continue;
+				}
+				if (!created && (cmsStatus === 'READY' || cmsStatus === 'ARCHIVED')) {
+					duplicates++;
+					jobLogger.info('Skipping unchanged terminal compatibility item', { contentItemId, disposition, status: cmsStatus });
 					continue;
 				}
 

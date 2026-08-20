@@ -299,6 +299,10 @@ export function buildChapterEmbeddingJobs(
     return jobs;
 }
 
+export function compatibilityChapterChildren<T extends { delivery_mode: 'legacy' | 'shadow' | 'durable_required' }>(children: T[]): T[] {
+    return children.filter(child => child.delivery_mode !== 'durable_required');
+}
+
 export {
     DEFAULT_ATOMIZATION_MIN_PARENT_SEC,
     DEFAULT_MIN_FEED_UNIT_SEC,

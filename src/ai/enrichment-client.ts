@@ -10,9 +10,12 @@
  * embeddings + topic_tags to CMS via its /internal/* API.
  */
 import { config } from '../config/index.js';
+import type { ContentStageCorrelation } from '../queues/schemas.js';
 import { logger } from '../observability/logger.js';
 
-const EMBED_TIMEOUT_MS = 30_000;
+// The client deadline must exceed Enrichment's bounded 60-second server
+// deadline so a valid writeback is not misclassified as a local timeout.
+const EMBED_TIMEOUT_MS = 75_000;
 const CHAPTERS_TIMEOUT_MS = 90_000;
 
 /** Strip any trailing slash so we never produce `//v1/...` URLs. */
@@ -166,6 +169,8 @@ export async function generateEmbeddingViaEnrichment(
             expected_item_version: string;
             input_digest: string;
         };
+		lane?: 'news' | 'pods';
+		contentStage?: ContentStageCorrelation;
     } = {},
 ): Promise<EmbedResult> {
     const body: {
@@ -173,10 +178,14 @@ export async function generateEmbeddingViaEnrichment(
         content_ids?: string[];
         extract_tags?: boolean;
         pipeline_repair?: NonNullable<typeof opts.pipelineRepair>;
+		lane?: 'news' | 'pods';
+		content_stage?: ContentStageCorrelation;
     } = { texts: [text] };
     if (contentItemId) body.content_ids = [contentItemId];
     if (opts.extractTags) body.extract_tags = true;
     if (opts.pipelineRepair) body.pipeline_repair = opts.pipelineRepair;
+	if (opts.lane) body.lane = opts.lane;
+	if (opts.contentStage) body.content_stage = opts.contentStage;
 
     const response = await fetch(`${baseUrl()}/v1/embed`, {
         method: 'POST',
@@ -239,6 +248,31 @@ export async function generateEmbeddingViaEnrichment(
         tags: result.tags ?? undefined,
         entities: result.entities ?? undefined,
     };
+}
+
+export async function generateMetadataViaEnrichment(
+	text: string,
+	contentItemId: string,
+	opts: { requestId?: string; contentStage: ContentStageCorrelation; signal?: AbortSignal },
+): Promise<{ writeBackStatus: string; writeBackError?: string }> {
+	const response = await fetch(`${baseUrl()}/v1/summarize`, {
+		method: 'POST',
+		body: JSON.stringify({ text: text.slice(0, 12_000), max_length: 200, style: 'brief', content_id: contentItemId, content_stage: opts.contentStage }),
+		headers: { 'Content-Type': 'application/json', ...authHeaders(), ...tracingHeaders(opts.requestId) },
+		signal: requestSignal(opts.signal, EMBED_TIMEOUT_MS),
+	});
+	if (!response.ok) {
+		const errorText = await response.text().catch(() => '');
+		const retryAfterHeader = Number(response.headers?.get?.('retry-after'));
+		throw new EnrichmentRequestError(
+			`Enrichment /v1/summarize failed: ${response.status} ${response.statusText} - ${errorText}`,
+			response.status,
+			response.status === 429 || response.status >= 500,
+			Number.isFinite(retryAfterHeader) && retryAfterHeader > 0 ? retryAfterHeader : undefined,
+		);
+	}
+	const result = await response.json() as { write_back_status?: string; write_back_error?: string | null };
+	return { writeBackStatus: result.write_back_status ?? 'not_attempted', writeBackError: result.write_back_error ?? undefined };
 }
 
 export interface TelegramChannelInfo {
