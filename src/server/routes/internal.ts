@@ -19,12 +19,13 @@ import {
     type NewsCirculationJob,
     type SourceGraphJob,
 } from '../../queues/index.js';
-import { deleteContentObjects, deleteContentObjectsExact, deleteObject, getStorageKey, objectExists, readObjectBuffer, recoveryArtifactEncryptionVerified, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
+import { deleteContentObjects, deleteContentObjectsExact, deleteObject, getStorageKey, objectExists, readObjectBuffer, readObjectDigest, recoveryArtifactEncryptionVerified, uploadEncryptedMigrationArtifact, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
 import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
 import { runSweepForTenant } from '../../services/storage.service.js';
+import { databaseMigrationQuiescence, quiesceForDatabaseMigration, resumeAfterDatabaseMigration } from '../../services/database-migration-quiescence.js';
 
 interface UserContentResponse {
     success: boolean;
@@ -64,10 +65,21 @@ const USER_CONTENT_PREFIX_BYTES = 64;
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RECOVERY_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024;
 const RECOVERY_ARTIFACT_PREFIX = /^system\/recovery\/[a-z0-9_-]{1,64}\/[0-9a-f-]{36}\/[a-f0-9]{64}\.json\.gz$/;
+const DATABASE_MIGRATION_ARTIFACT_MAX_BYTES = 20 * 1024 * 1024 * 1024;
+const DATABASE_MIGRATION_ARTIFACT_PREFIX = /^system\/database-migrations\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/[a-f0-9]{64}\.(?:dump|manifest)$/;
 let activeUserContentAdmissions = 0;
 
 function validRecoveryArtifactRef(key: string, checksum: string): boolean {
 	return RECOVERY_ARTIFACT_PREFIX.test(key) && /^[a-f0-9]{64}$/.test(checksum) && key.endsWith(`/${checksum}.json.gz`);
+}
+
+function validDatabaseMigrationArtifactRef(key: string, checksum: string): boolean {
+	return DATABASE_MIGRATION_ARTIFACT_PREFIX.test(key) && /^[a-f0-9]{64}$/.test(checksum) && key.includes(`/${checksum}.`);
+}
+
+function databaseMigrationArtifactKey(programId: string, unitId: string, checksum: string, kind: string): string | null {
+	if (!CANONICAL_UUID.test(programId) || !CANONICAL_UUID.test(unitId) || !/^[a-f0-9]{64}$/.test(checksum) || (kind !== 'dump' && kind !== 'manifest')) return null;
+	return `system/database-migrations/${programId.toLowerCase()}/${unitId.toLowerCase()}/${checksum}.${kind}`;
 }
 
 type UserAudioFormat = { extension: 'mp3' | 'wav' | 'm4a'; mimeType: string };
@@ -123,9 +135,12 @@ async function spoolUserAudio(file: NodeJS.ReadableStream): Promise<{ directory:
 }
 
 export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
+	if (!fastify.hasContentTypeParser('application/octet-stream')) {
+		fastify.addContentTypeParser('application/octet-stream', (request, payload, done) => done(null, payload));
+	}
     fastify.addHook('onRequest', verifyInternalServiceAuth);
 
-    fastify.get<{ Reply: { data: InternalQueueStats[] } }>('/internal/queues', async (_request, reply) => {
+	fastify.get<{ Reply: { data: InternalQueueStats[] } }>('/internal/queues', async (_request, reply) => {
         const data: InternalQueueStats[] = [];
         for (const queueName of Object.values(QUEUE_NAMES)) {
             const queue = getQueue(queueName);
@@ -187,6 +202,60 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 			const verified = createHash('sha256').update(body).digest('hex') === checksum && await recoveryArtifactEncryptionVerified(key);
 			return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.length, verified } });
 		} catch { return reply.status(502).send({ message: 'recovery artifact unavailable' }); }
+	});
+	fastify.get('/internal/database-migration/quiescence', async (_request, reply) => reply.send(await databaseMigrationQuiescence()));
+	fastify.post<{ Body: { program_id?: string; expected_epoch?: number } }>('/internal/database-migration/quiesce', async (request, reply) => {
+		const programId=String(request.body?.program_id??'');const epoch=Number(request.body?.expected_epoch);
+		if(!CANONICAL_UUID.test(programId)||!Number.isSafeInteger(epoch)||epoch<0)return reply.status(400).send({message:'valid program_id and expected_epoch are required'});
+		try{return reply.send(await quiesceForDatabaseMigration(programId,epoch))}catch{return reply.status(409).send({message:'migration owner precondition changed'})}
+	});
+	fastify.post<{ Body: { program_id?: string; expected_epoch?: number } }>('/internal/database-migration/resume', async (request, reply) => {
+		const programId=String(request.body?.program_id??'');const epoch=Number(request.body?.expected_epoch);
+		if(!CANONICAL_UUID.test(programId)||!Number.isSafeInteger(epoch)||epoch<0)return reply.status(400).send({message:'valid program_id and expected_epoch are required'});
+		try{return reply.send(await resumeAfterDatabaseMigration(programId,epoch))}catch{return reply.status(409).send({message:'migration owner precondition changed'})}
+	});
+
+	// Database migration artifacts are owned by Aggregation's private storage
+	// boundary. The coordinator supplies only a manifest-bound key/checksum;
+	// this route accepts no bucket, provider URL, public URL, or arbitrary key.
+	fastify.post<{ Body: NodeJS.ReadableStream }>(
+		'/internal/database-migration-artifacts',
+		{ bodyLimit: DATABASE_MIGRATION_ARTIFACT_MAX_BYTES },
+		async (request, reply) => {
+			const programId = String(request.headers['x-migration-program-id'] ?? '');
+			const unitId = String(request.headers['x-migration-unit-id'] ?? '');
+			const checksum = String(request.headers['x-content-sha256'] ?? '').toLowerCase();
+			const kind = String(request.headers['x-artifact-kind'] ?? '').toLowerCase();
+			const key = databaseMigrationArtifactKey(programId, unitId, checksum, kind);
+			const byteCount = Number(request.headers['content-length'] ?? 0);
+			if (!key || !Number.isSafeInteger(byteCount) || byteCount < 1 || byteCount > DATABASE_MIGRATION_ARTIFACT_MAX_BYTES || typeof request.body?.pipe !== 'function') return reply.status(400).send({ message: 'invalid database migration artifact request' });
+			try {
+				if (await objectExists(key)) {
+					const existing = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES);
+					const verified = existing.sha256 === checksum && await recoveryArtifactEncryptionVerified(key);
+					return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: existing.bytes, verified, idempotent: true } });
+				}
+				let streamed = 0;
+				const hash = createHash('sha256');
+				const counter = new Transform({ transform(chunk: Buffer, _encoding, callback) { streamed += chunk.length; if (streamed > DATABASE_MIGRATION_ARTIFACT_MAX_BYTES) return callback(new Error('artifact exceeds byte limit')); hash.update(chunk); callback(null, chunk); } });
+				request.body.pipe(counter);
+				await uploadEncryptedMigrationArtifact(key, counter, byteCount, kind === 'manifest' ? 'application/json' : 'application/octet-stream');
+				if (streamed !== byteCount || hash.digest('hex') !== checksum) { await deleteObject(key).catch(() => undefined); return reply.status(400).send({ message: 'database migration artifact checksum or size rejected' }); }
+				const readback = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES);
+				const verified = readback.sha256 === checksum && await recoveryArtifactEncryptionVerified(key);
+				return reply.status(verified ? 200 : 502).send({ data: { key, sha256: checksum, bytes: streamed, verified, encrypted: verified } });
+			} catch (error) { logger.warn('Database migration artifact operation failed', { key, error: error instanceof Error ? error.message : 'unknown' }); return reply.status(502).send({ message: 'database migration artifact storage unavailable' }); }
+		},
+	);
+	fastify.post<{ Body: { key?: string; sha256?: string } }>('/internal/database-migration-artifacts/verify', async (request, reply) => {
+		const key = String(request.body?.key ?? ''); const checksum = String(request.body?.sha256 ?? '').toLowerCase();
+		if (!validDatabaseMigrationArtifactRef(key, checksum)) return reply.status(400).send({ message: 'invalid database migration artifact reference' });
+		try { const body = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES); const verified = body.sha256 === checksum && await recoveryArtifactEncryptionVerified(key); return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.bytes, verified, encrypted: verified } }); } catch { return reply.status(502).send({ message: 'database migration artifact unavailable' }); }
+	});
+	fastify.delete<{ Body: { key?: string; sha256?: string; approval_id?: string; retention_expired?: boolean } }>('/internal/database-migration-artifacts', async (request, reply) => {
+		const key = String(request.body?.key ?? ''); const checksum = String(request.body?.sha256 ?? '').toLowerCase(); const approval = String(request.body?.approval_id ?? '');
+		if (!validDatabaseMigrationArtifactRef(key, checksum) || !CANONICAL_UUID.test(approval) || request.body?.retention_expired !== true) return reply.status(400).send({ message: 'exact artifact, approval, and retention proof are required' });
+		try { const existing = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES); if (existing.sha256 !== checksum) return reply.status(409).send({ message: 'artifact checksum changed' }); await deleteObject(key); const absent = !await objectExists(key); return reply.status(absent ? 200 : 502).send({ data: { key, sha256: checksum, deleted: absent, approval_id: approval } }); } catch { return reply.status(502).send({ message: 'database migration artifact deletion unavailable' }); }
 	});
 
 	fastify.delete<{ Body: { key?: string } }>('/internal/recovery-artifacts', async (request, reply) => {

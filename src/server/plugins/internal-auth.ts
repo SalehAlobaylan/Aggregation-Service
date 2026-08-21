@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { config } from '../../config/index.js';
+import process from 'node:process';
 
 /**
  * verifyInternalServiceAuth gates service-to-service internal routes with a
@@ -16,11 +17,16 @@ export async function verifyInternalServiceAuth(
     // outright — accepting any/empty token would defeat the whole point of
     // having an internal auth boundary. This keeps the service bootable
     // in dev while still failing loudly when the route is actually used.
-    const expectedToken = config.internalServiceToken;
+    const migrationCapability = request.url.startsWith('/internal/database-migration');
+    const expectedToken = migrationCapability
+        ? process.env.DATABASE_MIGRATION_COORDINATOR_SERVICE_TOKEN?.trim()
+        : config.internalServiceToken;
     if (!expectedToken) {
         await reply.status(503).send({
             message:
-                'Internal service routes are disabled: set INTERNAL_SERVICE_TOKEN to enable',
+                migrationCapability
+                    ? 'Database migration routes are disabled: configure the dedicated coordinator token'
+                    : 'Internal service routes are disabled: set INTERNAL_SERVICE_TOKEN to enable',
         });
         return;
     }

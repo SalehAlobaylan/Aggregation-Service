@@ -329,6 +329,23 @@ export async function uploadEncryptedRecoveryArtifact(
     }));
 }
 
+export async function uploadEncryptedMigrationArtifact(
+    key: string,
+    body: NodeJS.ReadableStream,
+    size: number,
+    contentType: string,
+): Promise<void> {
+    const { client, bucket } = bindingFor('primary');
+    await client.send(new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: body as PutObjectCommandInput['Body'],
+        ContentType: contentType,
+        ContentLength: size,
+        ServerSideEncryption: 'AES256',
+    }));
+}
+
 export async function recoveryArtifactEncryptionVerified(key: string): Promise<boolean> {
     const { client, bucket } = bindingFor('primary');
     const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
@@ -349,6 +366,25 @@ export async function readObjectBuffer(key: string, maxBytes: number, tier: Stor
         chunks.push(Buffer.from(chunk));
     }
     return Buffer.concat(chunks, total);
+}
+
+export async function readObjectDigest(
+    key: string,
+    maxBytes: number,
+    tier: StorageTier = 'primary',
+): Promise<{ bytes: number; sha256: string }> {
+    const { createHash } = await import('node:crypto');
+    const { client, bucket } = bindingFor(tier);
+    const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    if (!response.Body) throw new Error('storage object has no body');
+    const hash = createHash('sha256');
+    let bytes = 0;
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+        bytes += chunk.length;
+        if (bytes > maxBytes) throw new Error('storage object exceeds migration artifact limit');
+        hash.update(chunk);
+    }
+    return { bytes, sha256: hash.digest('hex') };
 }
 
 /**
