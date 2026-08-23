@@ -15,7 +15,7 @@ import { startServer, stopServer } from './server/index.js';
 
 async function main(): Promise<void> {
 	const requestedRole = (process.argv[2] ?? 'all') as WorkerRole;
-	if (!['all', 'intake-control', 'news', 'pods'].includes(requestedRole)) {
+	if (!['all', 'intake-control', 'news', 'pods-control', 'media-executor', 'media-maintenance'].includes(requestedRole)) {
 		throw new Error(`Unknown Aggregation role: ${requestedRole}`);
 	}
     logger.info('Starting Aggregation Service...', { role: requestedRole });
@@ -36,18 +36,17 @@ async function main(): Promise<void> {
 
         // Initialize queues
         logger.info('Initializing queues...');
-        initializeQueues();
+        initializeQueues(requestedRole);
 
         // Start workers
         logger.info('Starting workers...');
         await startWorkers(requestedRole);
 
-		// Only the control role exposes health/admin HTTP. Domain worker roles are
-		// independently supervised processes and never contend for the same port.
-		if (requestedRole === 'all' || requestedRole === 'intake-control') {
-			logger.info('Starting HTTP server...');
-			await startServer();
-		}
+		// Every explicit role exposes its own liveness/readiness surface. The
+		// role deployments do not share a process or pod, so the per-container
+		// port remains isolated while orchestration can probe every role.
+		logger.info('Starting HTTP server for role...', { role: requestedRole });
+		await startServer();
 
         logger.info('Aggregation Service started successfully');
     } catch (error) {

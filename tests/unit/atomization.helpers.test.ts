@@ -4,7 +4,9 @@ import {
     buildWindows,
 	compatibilityChapterChildren,
     countReviewChapters,
+    enforceFullCoverage,
     normalizeGeneratedChapters,
+    planningChapterCount,
     shouldAtomizeParent,
     sliceSegments,
 } from '../../src/workers/atomization.helpers.js';
@@ -48,6 +50,30 @@ describe('atomization helpers', () => {
         expect(shouldAtomizeParent(15 * 60)).toBe(false);
         expect(shouldAtomizeParent(40 * 60)).toBe(false);
         expect(shouldAtomizeParent((40 * 60) + 1)).toBe(true);
+    });
+
+    it('expands an editorial chapter preference to the legal full-coverage minimum', () => {
+        expect(planningChapterCount({
+            ...baseInput,
+            item: { ...baseInput.item, duration_sec: 4 * 60 * 60 },
+        })).toBe(6);
+    });
+
+    it('fills planner gaps and splits an oversized span into legal coverage units', () => {
+        const windows = [
+            { index: 0, start_sec: 0, text: 'opening' },
+            { index: 1, start_sec: 3000, text: 'middle' },
+            { index: 2, start_sec: 6000, text: 'closing' },
+        ];
+        const chapters = enforceFullCoverage(normalizeGeneratedChapters(
+            [{ start_index: 1, end_index: 2, title: 'Too long middle', confidence: 0.9 }],
+            windows,
+            { ...baseInput, item: { ...baseInput.item, duration_sec: 7200 } },
+        ), { ...baseInput, item: { ...baseInput.item, duration_sec: 7200 } });
+        expect(chapters[0]?.start_ms).toBe(0);
+        expect(chapters.at(-1)?.end_ms).toBe(7_200_000);
+        expect(chapters.every(chapter => chapter.end_ms - chapter.start_ms <= 2_400_000)).toBe(true);
+        expect(chapters.every((chapter, index) => index === 0 || chapters[index - 1]?.end_ms === chapter.start_ms)).toBe(true);
     });
 
     it('preserves explicit chapter end indexes instead of stretching to the next chapter', () => {

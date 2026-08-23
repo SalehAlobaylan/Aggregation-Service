@@ -278,6 +278,85 @@ export interface AtomizationChapter {
   transcript_text?: string;
 }
 
+export type DurableUnitState =
+  | "queued" | "claimed" | "running" | "verifying" | "verified"
+  | "deferred" | "uncertain" | "failed" | "superseded";
+
+export interface ArtifactManifest {
+  id: string;
+  tenant_id: string;
+  content_item_id?: string | null;
+  parent_content_item_id?: string | null;
+  atomization_generation_id?: string | null;
+  atomization_chapter_unit_id?: string | null;
+  transcription_generation_id?: string | null;
+  transcription_segment_unit_id?: string | null;
+  attempt_id?: string | null;
+  artifact_role: string;
+  storage_tier: string;
+  bucket: string;
+  object_key: string;
+  public_url?: string | null;
+  content_type?: string | null;
+  size_bytes: number;
+  etag?: string | null;
+  sha256?: string | null;
+  duration_ms?: number | null;
+  state: string;
+  recovery_class: string;
+}
+
+export interface TranscriptionSegmentUnit {
+  id: string;
+  generation_id: string;
+  segment_index: number;
+  start_ms: number;
+  end_ms: number;
+  overlap_ms: number;
+  artifact_manifest_id?: string | null;
+  state: DurableUnitState;
+  attempt_count: number;
+  claim_token?: string | null;
+  fence_token?: string | null;
+  lease_expires_at?: string | null;
+}
+
+export interface TranscriptionGeneration {
+  id: string;
+  content_item_id: string;
+  input_digest: string;
+  analysis_audio_manifest_id?: string | null;
+  provider: string;
+  model: string;
+  language: string;
+  state: DurableUnitState;
+  total_segments: number;
+  completed_segments: number;
+}
+
+export interface AtomizationChapterUnit {
+  id: string;
+  generation_id: string;
+  unit_index: number;
+  start_ms: number;
+  end_ms: number;
+  state: DurableUnitState;
+  attempt_count: number;
+  claim_token?: string | null;
+  fence_token?: string | null;
+  result?: AtomizationChapter;
+}
+
+export interface AtomizationGeneration {
+  id: string;
+  parent_content_item_id: string;
+  work_request_id: string;
+  generation_number: number;
+  expected_units: number;
+  completed_units: number;
+  state: string;
+}
+
 export interface AtomizationInputResponse {
   item: {
     id: string;

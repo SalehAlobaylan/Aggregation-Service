@@ -41,7 +41,57 @@ export const jobDuration = new client.Histogram({
     name: 'aggregation_job_duration_seconds',
     help: 'Job processing duration in seconds',
     labelNames: ['queue', 'source_type'] as const,
-    buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300],
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 900, 1800, 3600, 7200, 14400, 28800],
+    registers: [registry],
+});
+
+/** External media children are the actual compute consumers, not Node alone. */
+export const managedChildren = new client.Gauge({
+    name: 'aggregation_managed_children_active',
+    help: 'External media children currently owned by this role',
+    labelNames: ['operation'] as const,
+    registers: [registry],
+});
+
+export const managedProcessTerminations = new client.Counter({
+    name: 'aggregation_managed_process_terminations_total',
+    help: 'Managed child process group terminations by escalation stage',
+    labelNames: ['operation', 'signal'] as const,
+    registers: [registry],
+});
+
+export const resourcePermits = new client.Gauge({
+    name: 'aggregation_resource_permit_weight',
+    help: 'Weighted compute permits held by workload and lane',
+    labelNames: ['workload', 'lane'] as const,
+    registers: [registry],
+});
+
+export const resourceDeferrals = new client.Counter({
+    name: 'aggregation_resource_deferrals_total',
+    help: 'Media effects deferred before starting because no permit was available',
+    labelNames: ['workload', 'lane'] as const,
+    registers: [registry],
+});
+
+/** Oldest eligible Media work observed by the queue metrics collector. */
+export const mediaEligibleWorkAge = new client.Gauge({
+    name: 'aggregation_media_eligible_work_age_seconds',
+    help: 'Age of the oldest waiting Media or atomization job eligible for executor capacity',
+    registers: [registry],
+});
+
+/** Redis admission reports the shared compute domain's current utilization. */
+export const mediaPermitSaturation = new client.Gauge({
+    name: 'aggregation_media_permit_saturation',
+    help: 'Fraction of the shared Media compute permit capacity currently held',
+    registers: [registry],
+});
+
+/** Aggregate optional maintenance backlog for its independently pausable role. */
+export const maintenanceQueueDepth = new client.Gauge({
+    name: 'aggregation_maintenance_queue_depth',
+    help: 'Current aggregate depth of optional media maintenance queues',
     registers: [registry],
 });
 

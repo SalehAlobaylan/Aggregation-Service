@@ -164,6 +164,7 @@ export interface MediaJob {
     mimeType?: string;
   };
   operations: ("download" | "transcode" | "thumbnail")[];
+  workAttemptId?: string;
   contentStage?: ContentStageCorrelation;
   contentStageClaim?: ContentStageClaim;
 }
@@ -245,7 +246,10 @@ export interface ContentStageClaim {
     playback_url?: string | null;
     media_url?: string | null;
     duration_sec?: number | null;
+    file_size_bytes?: number | null;
     transcript_id?: string | null;
+    analysis_audio_manifest_id?: string | null;
+    analysis_audio_url?: string | null;
     thumbnail_url?: string | null;
     caption_text?: string;
     caption_artifact?: Record<string, unknown>;

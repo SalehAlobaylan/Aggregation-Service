@@ -3,23 +3,23 @@
  */
 import type { Worker } from 'bullmq';
 import { logger } from '../observability/logger.js';
+import { reapExpiredLocalScratch } from '../runtime/local-reservations.js';
 
 let workers: Worker[] = [];
 let startPromise: Promise<void> | null = null;
-export type WorkerRole = 'all' | 'intake-control' | 'news' | 'pods';
+export type WorkerRole = 'all' | 'intake-control' | 'news' | 'pods-control' | 'media-executor' | 'media-maintenance';
 
 async function createWorkers(role: WorkerRole): Promise<Worker[]> {
 	if (role === 'news') {
 		const { createNewsEnrichmentWorker, createNewsOptionalWorker } = await import('./content-stage-embedding.worker.js');
 		return [createNewsEnrichmentWorker(), createNewsOptionalWorker()];
 	}
-	if (role === 'pods') {
-		const [{ createPodsCompletionWorker, createPodsOptionalWorker }, { createPodsMediaWorker }, { podsAtomizationStageWorker }] = await Promise.all([
+	if (role === 'pods-control') {
+		const [{ createPodsCompletionWorker, createPodsOptionalWorker }, { podsAtomizationStageWorker }] = await Promise.all([
 			import('./content-stage-embedding.worker.js'),
-			import('./media.worker.js'),
 			import('./content-stage-atomization.worker.js'),
 		]);
-		return [createPodsMediaWorker(), createPodsCompletionWorker(), createPodsOptionalWorker(), podsAtomizationStageWorker];
+		return [createPodsCompletionWorker(), createPodsOptionalWorker(), podsAtomizationStageWorker];
 	}
     const [
         { fetchWorker },
@@ -64,13 +64,8 @@ async function createWorkers(role: WorkerRole): Promise<Worker[]> {
 	const intakeWorkers = [
         fetchWorker,
         normalizeWorker,
-		createLegacyMediaWorker(),
         aiWorker,
-        atomizationWorker,
         atomizationSweepWorker,
-        storageWorker,
-        reconcileWorker,
-        qualityWorker,
         discoveryWorker,
         discoverySweepWorker,
         sourceGraphWorker,
@@ -79,15 +74,21 @@ async function createWorkers(role: WorkerRole): Promise<Worker[]> {
 		sourceRunDispatchWorker,
 		sourceRunVerificationWorker,
 		lifecycleReceiptWorker,
-		pipelineRepairWorker,
     ];
 	if (role === 'intake-control') return intakeWorkers;
+	if (role === 'media-executor') {
+		const { createPodsMediaWorker } = await import('./media.worker.js');
+		return [createLegacyMediaWorker(), createPodsMediaWorker(), atomizationWorker];
+	}
+	if (role === 'media-maintenance') {
+		return [storageWorker, reconcileWorker, qualityWorker, pipelineRepairWorker];
+	}
 	const [{ createNewsEnrichmentWorker, createNewsOptionalWorker, createPodsCompletionWorker, createPodsOptionalWorker }, { createPodsMediaWorker }, { podsAtomizationStageWorker }] = await Promise.all([
 		import('./content-stage-embedding.worker.js'),
 		import('./media.worker.js'),
 		import('./content-stage-atomization.worker.js'),
 	]);
-	return [...intakeWorkers, createNewsEnrichmentWorker(), createNewsOptionalWorker(), createPodsMediaWorker(), createPodsCompletionWorker(), createPodsOptionalWorker(), podsAtomizationStageWorker];
+	return [...intakeWorkers, createLegacyMediaWorker(), atomizationWorker, storageWorker, reconcileWorker, qualityWorker, pipelineRepairWorker, createNewsEnrichmentWorker(), createNewsOptionalWorker(), createPodsMediaWorker(), createPodsCompletionWorker(), createPodsOptionalWorker(), podsAtomizationStageWorker];
 }
 
 /**
@@ -110,11 +111,31 @@ export async function startWorkers(role: WorkerRole = 'all'): Promise<void> {
 
     startPromise = (async () => {
         logger.info('Starting worker role', { role });
+		try {
+			const removed = await reapExpiredLocalScratch();
+			if (removed > 0) logger.info('Removed expired local attempt scratch', { removed });
+		} catch (error) {
+			logger.warn('Local attempt scratch cleanup deferred', { error: error instanceof Error ? error.message : String(error) });
+        }
         workers = await createWorkers(role);
-		if (role === 'news' || role === 'pods') return;
 		const { startContentStageDispatcher } = await import('../services/content-stage-dispatcher.js');
-		startContentStageDispatcher('news');
-		startContentStageDispatcher('pods');
+		// A dispatcher must run in the role that owns the target queue client.
+		// Running both from intake-control looked harmless, but its deliberately
+		// narrow queue set cannot enqueue News/Pods stages and would instead claim
+		// then fail otherwise valid CMS work in an explicit-role deployment.
+		if (role === 'news') {
+			startContentStageDispatcher('news');
+			return;
+		}
+		if (role === 'pods-control') {
+			startContentStageDispatcher('pods');
+			return;
+		}
+		if (role !== 'all' && role !== 'intake-control') return;
+		if (role === 'all') {
+			startContentStageDispatcher('news');
+			startContentStageDispatcher('pods');
+		}
 
         // Jobs queued before the media priority split would otherwise remain
         // buried behind the existing News embedding backlog after a restart.

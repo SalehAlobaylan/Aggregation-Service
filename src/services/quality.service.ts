@@ -23,7 +23,7 @@ import {
 } from '../storage/client.js';
 import { uploadFile } from '../storage/client.js';
 import {
-    DEFAULT_ENCODE_PROFILE,
+    SAFE_FALLBACK_ENCODE_PROFILE,
     type EncodeProfile,
     getMediaInfo,
     transcodeToMp4,
@@ -60,12 +60,13 @@ async function ensureTempDir(): Promise<string> {
 async function downloadToTemp(
     contentItemId: string,
     sourceKey: string,
-    tier: StorageTier
+    tier: StorageTier,
+    signal?: AbortSignal,
 ): Promise<{ path: string; size: number; contentType?: string }> {
     await ensureTempDir();
     const tempPath = join(config.mediaTempDir, `qre-${contentItemId}.in.mp4`);
     const src = await getObjectStream(sourceKey, tier);
-    await pipeline(src.body, createWriteStream(tempPath));
+    await pipeline(src.body, createWriteStream(tempPath), { signal });
     const st = await stat(tempPath);
     return { path: tempPath, size: st.size, contentType: src.contentType };
 }
@@ -343,9 +344,10 @@ export async function reencodeOneItem(args: {
     ruleId?: number;
     trigger: 'manual' | 'rule' | 'ingest';
     contentRole?: string;
+    signal?: AbortSignal;
 }): Promise<ReencodeResult> {
     const start = Date.now();
-    const { contentItemId, targetProfileId, tenantId, ruleId, trigger, contentRole } = args;
+    const { contentItemId, targetProfileId, tenantId, ruleId, trigger, contentRole, signal } = args;
     // tenantId / ruleId are kept on the args for compatibility with the
     // BullMQ job payload shape (storage sweeps fill them in for telemetry),
     // but the per-history-row writes that consumed them were dropped in
@@ -467,7 +469,7 @@ export async function reencodeOneItem(args: {
         const sourceKey = source.key;
 
         // 2. Download.
-        const downloaded = await downloadToTemp(contentItemId, sourceKey, tier);
+        const downloaded = await downloadToTemp(contentItemId, sourceKey, tier, signal);
         tempIn = downloaded.path;
         result.originalSizeBytes = downloaded.size;
 
@@ -500,7 +502,7 @@ export async function reencodeOneItem(args: {
         }
 
         // 3. Probe.
-        const info = await getMediaInfo(tempIn);
+        const info = await getMediaInfo(tempIn, { signal });
         if (info.bitrateKbps) result.originalBitrateKbps = info.bitrateKbps;
 
         const preflightAfterProbe = preflightCheck(
@@ -539,11 +541,11 @@ export async function reencodeOneItem(args: {
         await ensureTempDir();
         tempOut = join(config.mediaTempDir, `qre-${contentItemId}.out.mp4`);
         const encodeProfile = toEncodeProfile(profile);
-        await transcodeToMp4(tempIn, tempOut, encodeProfile);
+        await transcodeToMp4(tempIn, tempOut, encodeProfile, { signal });
 
         const outStat = await stat(tempOut);
         result.newSizeBytes = outStat.size;
-        const outInfo = await getMediaInfo(tempOut).catch(() => null);
+        const outInfo = await getMediaInfo(tempOut, { signal }).catch(() => null);
         if (outInfo?.bitrateKbps) result.newBitrateKbps = outInfo.bitrateKbps;
 
         // 5. Upload to the next versioned key on the same tier. Versioning
@@ -552,7 +554,7 @@ export async function reencodeOneItem(args: {
         // — no in-memory cache, so concurrent workers and restarts are safe.
         const newVersion = item.media_version + 1;
         const newKey = versionedKey(contentItemId, newVersion);
-        await uploadFile(newKey, tempOut, 'video/mp4', tier);
+        await uploadFile(newKey, tempOut, 'video/mp4', tier, signal);
         result.newKey = newKey;
         result.oldKey = sourceKey;
 
@@ -704,8 +706,8 @@ function resolveCacheKey(tenantId: string | undefined, sourceType: string | unde
 
 /**
  * Resolve the operator-configured ingest profile for the given (tenant,
- * sourceType) combination. Falls back to DEFAULT_ENCODE_PROFILE when CMS has
- * no matching profile or is unreachable.
+ * sourceType) combination. Falls back to a bounded canonical profile when CMS
+ * has no matching profile or is unreachable.
  *
  * Returns the EncodeProfile (for ffmpeg) AND the raw CMS profile (for
  * pre-flight checks like MIME whitelist / size / duration limits).
@@ -717,6 +719,7 @@ export async function resolveIngestProfile(
     profile: EncodeProfile;
     profileId: number | null;
     rawProfile: import('../cms/types.js').QualityProfile | null;
+    profileSource: 'cms' | 'safe_fallback';
 }> {
     const now = Date.now();
     const key = resolveCacheKey(tenantId, sourceType);
@@ -726,6 +729,7 @@ export async function resolveIngestProfile(
             profile: cached.profile,
             profileId: cached.profileId,
             rawProfile: cached.rawProfile,
+            profileSource: cached.profileId == null ? 'safe_fallback' : 'cms',
         };
     }
     try {
@@ -733,17 +737,18 @@ export async function resolveIngestProfile(
             tenant_id: tenantId,
             source_type: sourceType,
         });
-        const profile = resp ? toEncodeProfile(resp.profile) : DEFAULT_ENCODE_PROFILE;
+        const profile = resp ? toEncodeProfile(resp.profile) : SAFE_FALLBACK_ENCODE_PROFILE;
         const out = {
             profile,
             profileId: resp?.profile.id ?? null,
             rawProfile: resp?.profile ?? null,
+            profileSource: resp ? ('cms' as const) : ('safe_fallback' as const),
         };
         ingestResolveCache.set(key, { ...out, expiresAt: now + RESOLVE_TTL_MS });
         return out;
     } catch (err) {
         logger.warn('resolveIngestProfile: CMS lookup failed; using built-in default', { err, tenantId, sourceType });
-        const out = { profile: DEFAULT_ENCODE_PROFILE, profileId: null, rawProfile: null };
+        const out = { profile: SAFE_FALLBACK_ENCODE_PROFILE, profileId: null, rawProfile: null, profileSource: 'safe_fallback' as const };
         ingestResolveCache.set(key, { ...out, expiresAt: now + RESOLVE_TTL_MS });
         return out;
     }
@@ -768,7 +773,8 @@ export interface PreflightInput {
 
 export function preflightCheck(
     input: PreflightInput,
-    rawProfile: import('../cms/types.js').QualityProfile | null
+    rawProfile: import('../cms/types.js').QualityProfile | null,
+    options: { trustedLongForm?: boolean } = {},
 ): string | null {
     if (!rawProfile) return null;
 
@@ -780,10 +786,10 @@ export function preflightCheck(
             return `disallowed_input_mime: got ${got}, allowed=[${allowed.join(',')}]`;
         }
     }
-    if (rawProfile.max_input_size_bytes && input.sizeBytes && input.sizeBytes > rawProfile.max_input_size_bytes) {
+    if (!options.trustedLongForm && rawProfile.max_input_size_bytes && input.sizeBytes && input.sizeBytes > rawProfile.max_input_size_bytes) {
         return `input_too_large: ${input.sizeBytes} > ${rawProfile.max_input_size_bytes}`;
     }
-    if (rawProfile.max_input_duration_sec && input.durationSec && input.durationSec > rawProfile.max_input_duration_sec) {
+    if (!options.trustedLongForm && rawProfile.max_input_duration_sec && input.durationSec && input.durationSec > rawProfile.max_input_duration_sec) {
         return `input_too_long: ${input.durationSec}s > ${rawProfile.max_input_duration_sec}s`;
     }
     return null;

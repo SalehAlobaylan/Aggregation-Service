@@ -1,4 +1,6 @@
 import { Job } from "bullmq";
+import { createHash } from "crypto";
+import { v4 as uuidv4 } from "uuid";
 import { join } from "path";
 import { readdir, rm, stat } from "fs/promises";
 import { createWorker } from "./base-worker.js";
@@ -20,6 +22,7 @@ import {
   listContentObjects,
   type StorageTier,
 } from "../storage/client.js";
+import { uploadFileWithManifest } from "../storage/manifest.js";
 import { generateChaptersViaEnrichment } from "../ai/enrichment-client.js";
 import type {
   AtomizationChapter,
@@ -31,11 +34,19 @@ import {
   buildWindows,
   compatibilityChapterChildren,
   countReviewChapters,
+  enforceFullCoverage,
   minFeedUnitSeconds,
   normalizeGeneratedChapters,
+  planningChapterCount,
   shouldAtomizeParent,
   sliceSegments,
 } from "./atomization.helpers.js";
+import { withResourceLease } from "../runtime/resource-admission.js";
+import { ResourceDeferredError } from "../runtime/resource-admission.js";
+import {
+  reserveLocalScratch,
+  type LocalReservation,
+} from "../runtime/local-reservations.js";
 
 const HLS_UPLOAD_CONCURRENCY = 6;
 
@@ -52,7 +63,11 @@ export const atomizationWorker = createWorker({
     const stageClaim = job.data.contentStageClaim;
     const governed =
       job.data.workRequestId && job.data.workClaimToken
-        ? { id: job.data.workRequestId, claimToken: job.data.workClaimToken }
+        ? {
+            id: job.data.workRequestId,
+            claimToken: job.data.workClaimToken,
+            attemptId: job.data.workAttemptId,
+          }
         : undefined;
     jobLogger.info("Processing atomization job", {
       contentItemId,
@@ -152,15 +167,51 @@ export const atomizationWorker = createWorker({
       const generated = await generateChaptersViaEnrichment(windows, {
         requestId: job.id,
         language: input.transcript.language,
-        maxChapters: input.policy.max_chapters_per_parent,
+        // The policy value is an editorial density preference. A valid long
+        // parent still needs enough legal units to cover its full timeline.
+        maxChapters: planningChapterCount(input),
         minSec: minFeedUnitSeconds(input),
         maxSec: input.policy.hard_max_chapter_minutes * 60,
         signal,
       });
-      const chapters = normalizeGeneratedChapters(generated, windows, input);
+      const normalizedChapters = normalizeGeneratedChapters(
+        generated,
+        windows,
+        input,
+      );
+      const chapters = enforceFullCoverage(normalizedChapters, input);
       await cmsClient.saveAtomizationPlan(
         contentItemId,
         chapters,
+        job.id,
+        signal,
+      );
+      const planDigest = createHash("sha256")
+        .update(JSON.stringify(chapters))
+        .digest("hex");
+      const coverageDigest = createHash("sha256")
+        .update(
+          JSON.stringify(
+            chapters.map(({ start_ms, end_ms }) => ({ start_ms, end_ms })),
+          ),
+        )
+        .digest("hex");
+      const generationResponse = await cmsClient.createAtomizationGeneration(
+        {
+          tenant_id: input.item.tenant_id,
+          parent_content_item_id: contentItemId,
+          work_request_id: governed?.id ?? uuidv4(),
+          transcript_digest: createHash("sha256")
+            .update(input.transcript.full_text)
+            .digest("hex"),
+          policy_digest: createHash("sha256")
+            .update(JSON.stringify(input.policy))
+            .digest("hex"),
+          input_digest: job.data.workInputFingerprint ?? planDigest,
+          plan_digest: planDigest,
+          coverage_digest: coverageDigest,
+          chapters,
+        },
         job.id,
         signal,
       );
@@ -180,7 +231,23 @@ export const atomizationWorker = createWorker({
 
       const tempFiles: string[] = [];
       const tempDirs: string[] = [];
+      let localReservation: LocalReservation | undefined;
+      let reservationHeartbeat: NodeJS.Timeout | undefined;
       try {
+        const estimatedBytes = Math.max(
+          512 * 1024 * 1024,
+          (input.item.duration_sec ?? 3600) * 256 * 1024,
+        );
+        localReservation = await reserveLocalScratch(
+          governed?.attemptId ?? job.id?.toString() ?? contentItemId,
+          estimatedBytes,
+          { contentId: contentItemId, ownerRole: "aggregation-media-executor" },
+        );
+        reservationHeartbeat = setInterval(
+          () => void localReservation?.heartbeat().catch(() => undefined),
+          30_000,
+        );
+        reservationHeartbeat.unref();
         const parentMedia = await resolveParentMediaForAtomization(
           input,
           jobLogger,
@@ -190,33 +257,79 @@ export const atomizationWorker = createWorker({
           `${contentItemId}_atomize`,
           parentMedia.extension,
           signal,
+          localReservation.sourceDir,
         );
         tempFiles.push(parentDownload.filePath);
         const mediaInfo = await getMediaInfo(parentDownload.filePath);
 
         const children: AtomizationChapter[] = [];
+        const existingUnits = await cmsClient.listAtomizationChapterUnits(
+          generationResponse.generation.id,
+          job.id,
+          signal,
+        );
+        const existingByIndex = new Map(
+          existingUnits.units.map((unit) => [unit.unit_index, unit]),
+        );
         for (let i = 0; i < chapters.length; i += 1) {
+          // Every chapter owns a distinct scratch set. It is removed as soon
+          // as uploads have been accepted, so a long parent never retains all
+          // completed MP4/HLS/thumb outputs until finalization.
+          const chapterTempFiles: string[] = [];
+          const chapterTempDirs: string[] = [];
+          const attemptSuffix = String(job.id ?? "attempt").replace(
+            /[^a-zA-Z0-9_-]/g,
+            "_",
+          );
           if (governed)
             await cmsClient.heartbeatAtomizationWork(governed, job.id);
+          const existingUnit = existingByIndex.get(i);
+          if (existingUnit?.state === "verified" && existingUnit.result) {
+            children.push(existingUnit.result);
+            continue;
+          }
+          const unitClaim = await cmsClient.claimAtomizationChapterUnit(
+            job.id,
+            generationResponse.generation.id,
+          );
+          if (!unitClaim || unitClaim.unit.unit_index !== i) {
+            throw new Error(`atomization unit ${i} could not be claimed`);
+          }
+          const unitId = unitClaim.unit.id;
+          const unitToken = unitClaim.unit.claim_token ?? "";
+          const unitArtifactPrefix = `${contentItemId}/generations/${generationResponse.generation.id}/chapters/${i}/attempts/${unitClaim.unit.attempt_count}`;
+          await cmsClient.transitionAtomizationChapterUnit(
+            unitId,
+            "running",
+            { claim_token: unitToken },
+            job.id,
+            signal,
+          );
           const chapter = chapters[i]!;
           const clipPath = join(
-            config.mediaTempDir,
-            `${contentItemId}_chapter_${i}.mp4`,
+            localReservation.outputDir,
+            `${contentItemId}_${attemptSuffix}_chapter_${i}.mp4`,
           );
           const startSec = chapter.start_ms / 1000;
           const durationSec = Math.max(
             1,
             (chapter.end_ms - chapter.start_ms) / 1000,
           );
-          const cut = await cutMediaSegment(
-            parentDownload.filePath,
-            clipPath,
-            startSec,
-            durationSec,
-            undefined,
-            { signal },
+          const cut = await withResourceLease(
+            "software_encode",
+            "required",
+            () =>
+              cutMediaSegment(
+                parentDownload.filePath,
+                clipPath,
+                startSec,
+                durationSec,
+                undefined,
+                { signal },
+              ),
           );
-          tempFiles.push(clipPath);
+          chapterTempFiles.push(clipPath);
+          tempFiles.push(clipPath); // final safety net if this chapter throws
           if (governed && i === 0)
             await cmsClient.checkpointAtomizationWork(
               { ...governed, phase: "first_cut", proof: { chapter_index: 0 } },
@@ -225,17 +338,30 @@ export const atomizationWorker = createWorker({
 
           currentPhase = "renditions";
           const mp4Key = getStorageKey(
-            `${contentItemId}/chapters/${i}`,
+            unitArtifactPrefix,
             "processed",
             "mp4",
           );
-          const mp4Url = await uploadFile(
-            mp4Key,
-            clipPath,
-            "video/mp4",
-            "primary",
+          const mp4Upload = await uploadFileWithManifest(
+            {
+              tenantId: input.item.tenant_id,
+              parentContentItemId: contentItemId,
+              atomizationGenerationId: generationResponse.generation.id,
+              atomizationChapterUnitId: unitId,
+              attemptId: governed?.attemptId,
+              artifactRole: "chapter_media",
+              key: mp4Key,
+              filePath: clipPath,
+              contentType: "video/mp4",
+              inputDigest: createHash("sha256")
+                .update(`${planDigest}:${i}`)
+                .digest("hex"),
+              fenceToken: unitClaim.unit.fence_token ?? undefined,
+              creatorRole: "aggregation-media-executor",
+            },
             signal,
           );
+          const mp4Url = mp4Upload.url;
           const renditions: MediaRendition[] = [
             {
               type: "mp4",
@@ -248,26 +374,37 @@ export const atomizationWorker = createWorker({
 
           let primaryUrl = mp4Url;
           let primaryType = "mp4";
+          let hlsUploadManifestIds: string[] = [];
           try {
-            const hlsDir = join(
-              config.mediaTempDir,
-              `${contentItemId}_chapter_${i}_hls`,
-            );
-            tempDirs.push(hlsDir);
+            const hlsDir = join(localReservation.hlsDir, `chapter_${i}`);
+            chapterTempDirs.push(hlsDir);
+            tempDirs.push(hlsDir); // final safety net if this chapter throws
             const hls = await createHlsVod(clipPath, hlsDir, undefined, {
               signal,
             });
-            const hlsUrl = await uploadHlsDirectory(
+            const hlsUpload = await uploadHlsDirectory(
               hlsDir,
-              `${contentItemId}/chapters/${i}`,
+              unitArtifactPrefix,
               signal,
+              {
+                tenantId: input.item.tenant_id,
+                parentContentItemId: contentItemId,
+                atomizationGenerationId: generationResponse.generation.id,
+                atomizationChapterUnitId: unitId,
+                attemptId: governed?.attemptId,
+                inputDigest: createHash("sha256")
+                  .update(`${planDigest}:${i}:hls`)
+                  .digest("hex"),
+                fenceToken: unitClaim.unit.fence_token ?? undefined,
+              },
             );
-            primaryUrl = hlsUrl || mp4Url;
-            primaryType = hlsUrl ? "hls" : "mp4";
-            if (hlsUrl) {
+            hlsUploadManifestIds = hlsUpload.manifestIds;
+            primaryUrl = hlsUpload.url || mp4Url;
+            primaryType = hlsUpload.url ? "hls" : "mp4";
+            if (hlsUpload.url) {
               renditions.unshift({
                 type: "hls",
-                url: hlsUrl,
+                url: hlsUpload.url,
                 has_video: mediaInfo.hasVideo,
                 mime_type: "application/vnd.apple.mpegurl",
                 is_primary: true,
@@ -288,25 +425,41 @@ export const atomizationWorker = createWorker({
           }
 
           let thumbUrl = input.item.thumbnail_url ?? undefined;
+          let thumbManifestId: string | undefined;
           try {
             const thumbPath = join(
-              config.mediaTempDir,
-              `${contentItemId}_chapter_${i}.jpg`,
+              localReservation.outputDir,
+              `${contentItemId}_${attemptSuffix}_chapter_${i}.jpg`,
             );
             await extractThumbnail(clipPath, thumbPath, 1, 360, { signal });
-            tempFiles.push(thumbPath);
+            chapterTempFiles.push(thumbPath);
+            tempFiles.push(thumbPath); // final safety net if this chapter throws
             const thumbKey = getStorageKey(
-              `${contentItemId}/chapters/${i}`,
+              unitArtifactPrefix,
               "thumbnail",
               "jpg",
             );
-            thumbUrl = await uploadFile(
-              thumbKey,
-              thumbPath,
-              "image/jpeg",
-              "primary",
+            const thumbUpload = await uploadFileWithManifest(
+              {
+                tenantId: input.item.tenant_id,
+                parentContentItemId: contentItemId,
+                atomizationGenerationId: generationResponse.generation.id,
+                atomizationChapterUnitId: unitId,
+                attemptId: governed?.attemptId,
+                artifactRole: "thumbnail",
+                key: thumbKey,
+                filePath: thumbPath,
+                contentType: "image/jpeg",
+                inputDigest: createHash("sha256")
+                  .update(`${planDigest}:${i}:thumbnail`)
+                  .digest("hex"),
+                fenceToken: unitClaim.unit.fence_token ?? undefined,
+                creatorRole: "aggregation-media-executor",
+              },
               signal,
             );
+            thumbUrl = thumbUpload.url;
+            thumbManifestId = thumbUpload.manifestId;
           } catch (thumbError) {
             jobLogger.warn("Chapter thumbnail failed; using parent thumbnail", {
               contentItemId,
@@ -338,12 +491,37 @@ export const atomizationWorker = createWorker({
               .filter(Boolean)
               .join(" "),
           });
+          await cmsClient.transitionAtomizationChapterUnit(
+            unitId,
+            "verified",
+            {
+              claim_token: unitToken,
+              result: children[children.length - 1],
+              artifact_manifest_ids: [
+                mp4Upload.manifestId,
+                ...hlsUploadManifestIds,
+                ...(thumbManifestId ? [thumbManifestId] : []),
+              ],
+            },
+            job.id,
+            signal,
+          );
           jobLogger.info("Chapter atomized", {
             contentItemId,
             chapter: i,
             playbackType: primaryType,
             durationSec: cut.duration,
           });
+          // Object uploads have completed and the child payload contains only
+          // remote URLs. Delete this chapter's working set before advancing.
+          await Promise.all(
+            chapterTempFiles.map((file) => cleanupTempFile(file)),
+          );
+          await Promise.all(
+            chapterTempDirs.map((dir) =>
+              rm(dir, { recursive: true, force: true }),
+            ),
+          );
         }
         if (governed)
           await cmsClient.checkpointAtomizationWork(
@@ -362,9 +540,8 @@ export const atomizationWorker = createWorker({
             input.policy.high_confidence_threshold,
           ),
         });
-        const result = await cmsClient.createAtomizedChildren(
-          contentItemId,
-          children,
+        const result = await cmsClient.finalizeAtomizationGeneration(
+          generationResponse.generation.id,
           stageClaim ? contentStageCorrelation(stageClaim) : undefined,
           job.id,
           signal,
@@ -421,6 +598,8 @@ export const atomizationWorker = createWorker({
           children: result.children.length,
         });
       } finally {
+        if (reservationHeartbeat) clearInterval(reservationHeartbeat);
+        await localReservation?.release();
         for (const tempFile of tempFiles) {
           await cleanupTempFile(tempFile);
         }
@@ -433,6 +612,19 @@ export const atomizationWorker = createWorker({
         }
       }
     } catch (error) {
+      if (error instanceof ResourceDeferredError && governed) {
+        await cmsClient.deferAtomizationWork(
+          {
+            id: governed.id,
+            claimToken: governed.claimToken,
+            retryAfterSec: error.retryAfterSec,
+            summary: error.message,
+          },
+          job.id,
+        );
+        await report("queued", currentPhase, { error_message: error.message });
+        return;
+      }
       try {
         await report("failed", currentPhase, {
           error_message:
@@ -670,9 +862,19 @@ async function uploadHlsDirectory(
   dir: string,
   keyPrefix: string,
   signal?: AbortSignal,
-): Promise<string | undefined> {
+  manifestContext?: {
+    tenantId: string;
+    parentContentItemId: string;
+    atomizationGenerationId: string;
+    atomizationChapterUnitId: string;
+    attemptId?: string;
+    inputDigest: string;
+    fenceToken?: string;
+  },
+): Promise<{ url?: string; manifestIds: string[] }> {
   const files = await readdir(dir);
   let playlistUrl: string | undefined;
+  const manifestIds: string[] = [];
   const uploadable: Array<{ file: string; path: string; contentType: string }> =
     [];
   for (const file of files) {
@@ -692,19 +894,35 @@ async function uploadHlsDirectory(
     const urls = await Promise.all(
       batch.map(async (item) => {
         const key = `content/${keyPrefix}/hls/${item.file}`;
-        const url = await uploadFile(
-          key,
-          item.path,
-          item.contentType,
-          "primary",
-          signal,
-        );
-        return { file: item.file, url };
+        const manifestUpload = manifestContext
+          ? await uploadFileWithManifest(
+              {
+                ...manifestContext,
+                artifactRole: "chapter_hls",
+                key,
+                filePath: item.path,
+                contentType: item.contentType,
+                creatorRole: "aggregation-media-executor",
+              },
+              signal,
+            )
+          : undefined;
+        const url =
+          manifestUpload?.url ??
+          (await uploadFile(
+            key,
+            item.path,
+            item.contentType,
+            "primary",
+            signal,
+          ));
+        return { file: item.file, url, manifestId: manifestUpload?.manifestId };
       }),
     );
     for (const item of urls) {
       if (item.file.endsWith(".m3u8")) playlistUrl = item.url;
+      if (item.manifestId) manifestIds.push(item.manifestId);
     }
   }
-  return playlistUrl;
+  return { url: playlistUrl, manifestIds };
 }

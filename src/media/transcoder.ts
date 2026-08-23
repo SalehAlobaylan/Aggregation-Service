@@ -8,6 +8,7 @@ import { join } from 'path';
 import { mkdir, stat, writeFile } from 'fs/promises';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
+import { runManagedProcess } from '../runtime/managed-process.js';
 
 export interface MediaInfo {
     duration: number;
@@ -57,6 +58,13 @@ export const DEFAULT_ENCODE_PROFILE: EncodeProfile = {
     preset: 'fast',
     audioCodec: 'aac',
     audioBitrateKbps: 128,
+};
+
+// Used only when CMS profile resolution is unavailable. It is deliberately a
+// named safe fallback instead of the historic uncapped fail-open recipe.
+export const SAFE_FALLBACK_ENCODE_PROFILE: EncodeProfile = {
+    ...DEFAULT_ENCODE_PROFILE,
+    maxHeight: 720,
 };
 
 // Media workers run alongside every other BullMQ lane in one Node process.
@@ -178,36 +186,48 @@ export function buildEncodeOptions(profile: EncodeProfile): string[] {
  * Returns container bitrate (when reported) so the Quality system can project
  * post-re-encode size without downloading the file twice.
  */
-export function getMediaInfo(inputPath: string): Promise<MediaInfo> {
-    return new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(inputPath, (err, metadata) => {
-            if (err) {
-                reject(err);
-                return;
-            }
-
-            const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-            const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
-            const fmtBitrate = (metadata.format as { bit_rate?: string | number }).bit_rate;
-            const bitrateBps = typeof fmtBitrate === 'string' ? parseInt(fmtBitrate, 10) : fmtBitrate;
-            const bitrateKbps =
-                typeof bitrateBps === 'number' && Number.isFinite(bitrateBps) && bitrateBps > 0
-                    ? Math.round(bitrateBps / 1000)
-                    : undefined;
-
-            resolve({
-                duration: metadata.format.duration || 0,
-                width: videoStream?.width,
-                height: videoStream?.height,
-                format: metadata.format.format_name || 'unknown',
-                hasVideo: !!videoStream,
-                hasAudio: !!audioStream,
-                bitrateKbps,
-                videoCodec: videoStream?.codec_name,
-                audioCodec: audioStream?.codec_name,
-            });
-        });
+export async function getMediaInfo(inputPath: string, options: FfmpegRunOptions = {}): Promise<MediaInfo> {
+    let stdout = '';
+    let stderr = '';
+    const result = await runManagedProcess({
+        label: 'ffprobe',
+        args: ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', inputPath],
+        timeoutMs: options.timeoutMs ?? Math.min(config.mediaJobTimeoutMs, 60_000),
+        signal: options.signal,
+        onStdout: (chunk) => { stdout += chunk.toString(); },
+        onStderr: (chunk) => { stderr += chunk.toString(); },
     });
+    if (result.code !== 0) throw new Error(`ffprobe exited with code ${result.code}: ${stderr.slice(-2048)}`);
+    let metadata: {
+        streams?: Array<{ codec_type?: string; width?: number; height?: number; codec_name?: string }>;
+        format?: { duration?: string | number; format_name?: string; bit_rate?: string | number };
+    };
+    try {
+        metadata = JSON.parse(stdout) as typeof metadata;
+    } catch {
+        throw new Error('ffprobe returned invalid JSON');
+    }
+    const streams = metadata.streams ?? [];
+    const videoStream = streams.find(s => s.codec_type === 'video');
+    const audioStream = streams.find(s => s.codec_type === 'audio');
+    const fmtBitrate = metadata.format?.bit_rate;
+    const durationRaw = metadata.format?.duration;
+    const duration = typeof durationRaw === 'string' ? Number(durationRaw) : durationRaw ?? 0;
+    const bitrateBps = typeof fmtBitrate === 'string' ? parseInt(fmtBitrate, 10) : fmtBitrate;
+    const bitrateKbps = typeof bitrateBps === 'number' && Number.isFinite(bitrateBps) && bitrateBps > 0
+        ? Math.round(bitrateBps / 1000)
+        : undefined;
+    return {
+        duration: Number.isFinite(duration) ? duration : 0,
+        width: videoStream?.width,
+        height: videoStream?.height,
+        format: metadata.format?.format_name || 'unknown',
+        hasVideo: !!videoStream,
+        hasAudio: !!audioStream,
+        bitrateKbps,
+        videoCodec: videoStream?.codec_name,
+        audioCodec: audioStream?.codec_name,
+    };
 }
 
 /**
@@ -308,6 +328,8 @@ export function audioToMp4(
                 '-profile:v baseline',
                 '-level 3.0',
                 '-tune stillimage',       // Optimize for still image
+                `-threads ${FFMPEG_TRANSCODE_THREADS}`,
+                '-filter_threads 1',
                 // Audio honours the profile.
                 `-c:a ${audioCodecFlag(profile.audioCodec)}`,
                 `-b:a ${profile.audioBitrateKbps}k`,
@@ -421,7 +443,7 @@ export function extractThumbnail(
 
         const command = ffmpeg(inputPath)
             .seekInput(offsetSeconds)
-            .outputOptions(['-vframes 1', `-vf ${scaleFilter}`])
+            .outputOptions(['-vframes 1', `-vf ${scaleFilter}`, `-threads ${FFMPEG_TRANSCODE_THREADS}`, '-filter_threads 1'])
             .output(outputPath)
             .on('end', () => {
                 logger.info('Thumbnail extracted', { outputPath });
@@ -476,6 +498,7 @@ export function extractAudio(
             .noVideo()
             .audioCodec('libmp3lame')
             .audioBitrate(128)
+            .outputOptions([`-threads ${FFMPEG_TRANSCODE_THREADS}`, '-filter_threads 1'])
             .output(outputPath)
             .on('end', () => {
                 logger.info('Audio extracted', { outputPath });

@@ -1,159 +1,160 @@
+# Explicit role deployments. Do not replace these with the legacy `all`
+# command: queue ownership and resource domains are intentionally isolated.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: aggregation-service
-  labels:
-    app: aggregation-service
-    component: worker
+  name: aggregation-intake-control
+  labels: {app: aggregation, role: intake-control}
 spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: aggregation-service
+  replicas: 1
+  selector: {matchLabels: {app: aggregation, role: intake-control}}
   template:
     metadata:
-      labels:
-        app: aggregation-service
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "5002"
-        prometheus.io/path: "/metrics"
+      labels: {app: aggregation, role: intake-control}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "5002", prometheus.io/path: /metrics}
     spec:
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
       containers:
-        - name: aggregation
+        - name: intake-control
           image: ghcr.io/your-org/aggregation-service:latest
-          ports:
-            - name: metrics
-              containerPort: 5002
-              protocol: TCP
+          command: ["node", "dist/index.js", "intake-control"]
+          ports: [{name: metrics, containerPort: 5002}]
+          envFrom: [{configMapRef: {name: aggregation-config}}, {secretRef: {name: aggregation-secrets}}]
+          env: [{name: ROLE, value: intake-control}, {name: METRICS_PORT, value: "5002"}]
+          resources: {requests: {cpu: 200m, memory: 512Mi}, limits: {cpu: 500m, memory: 1Gi, ephemeral-storage: 2Gi}}
+          readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 20, periodSeconds: 30, timeoutSeconds: 5}
+          volumeMounts: [{name: scratch, mountPath: /tmp/wahb-media}]
+      volumes: [{name: scratch, emptyDir: {sizeLimit: 2Gi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-news
+  labels: {app: aggregation, role: news}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: aggregation, role: news}}
+  template:
+    metadata:
+      labels: {app: aggregation, role: news}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "5002", prometheus.io/path: /metrics}
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      containers:
+        - name: news
+          image: ghcr.io/your-org/aggregation-service:latest
+          command: ["node", "dist/index.js", "news"]
+          ports: [{name: metrics, containerPort: 5002}]
+          envFrom: [{configMapRef: {name: aggregation-config}}, {secretRef: {name: aggregation-secrets}}]
+          env: [{name: ROLE, value: news}, {name: METRICS_PORT, value: "5002"}]
+          resources: {requests: {cpu: 250m, memory: 768Mi}, limits: {cpu: 1, memory: 2Gi, ephemeral-storage: 3Gi}}
+          readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 20, periodSeconds: 30, timeoutSeconds: 5}
+          volumeMounts: [{name: scratch, mountPath: /tmp/wahb-media}]
+      volumes: [{name: scratch, emptyDir: {sizeLimit: 3Gi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-pods-control
+  labels: {app: aggregation, role: pods-control}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: aggregation, role: pods-control}}
+  template:
+    metadata:
+      labels: {app: aggregation, role: pods-control}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "5002", prometheus.io/path: /metrics}
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      containers:
+        - name: pods-control
+          image: ghcr.io/your-org/aggregation-service:latest
+          command: ["node", "dist/index.js", "pods-control"]
+          ports: [{name: metrics, containerPort: 5002}]
+          envFrom: [{configMapRef: {name: aggregation-config}}, {secretRef: {name: aggregation-secrets}}]
+          env: [{name: ROLE, value: pods-control}, {name: METRICS_PORT, value: "5002"}]
+          resources: {requests: {cpu: 250m, memory: 768Mi}, limits: {cpu: 1, memory: 2Gi, ephemeral-storage: 3Gi}}
+          readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 20, periodSeconds: 30, timeoutSeconds: 5}
+          volumeMounts: [{name: scratch, mountPath: /tmp/wahb-media}]
+      volumes: [{name: scratch, emptyDir: {sizeLimit: 3Gi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-media-executor
+  labels: {app: aggregation, role: media-executor}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: aggregation, role: media-executor}}
+  template:
+    metadata:
+      labels: {app: aggregation, role: media-executor}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "5002", prometheus.io/path: /metrics}
+    spec:
+      terminationGracePeriodSeconds: 120
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      containers:
+        - name: media-executor
+          image: ghcr.io/your-org/aggregation-service:latest
+          command: ["node", "dist/index.js", "media-executor"]
+          ports: [{name: metrics, containerPort: 5002}]
+          envFrom: [{configMapRef: {name: aggregation-config}}, {secretRef: {name: aggregation-secrets}}]
           env:
-            - name: CMS_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: CMS_BASE_URL
-            - name: CMS_SERVICE_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: aggregation-secrets
-                  key: CMS_SERVICE_TOKEN
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: aggregation-secrets
-                  key: JWT_SECRET
-            - name: ADMIN_JWT_ISSUER
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: ADMIN_JWT_ISSUER
-            - name: ADMIN_JWT_AUDIENCE
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: ADMIN_JWT_AUDIENCE
-            - name: ADMIN_ALLOWED_ROLES
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: ADMIN_ALLOWED_ROLES
-            - name: PLATFORM_CONSOLE_ORIGINS
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: PLATFORM_CONSOLE_ORIGINS
-            - name: REDIS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: REDIS_URL
-            - name: STORAGE_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: STORAGE_ENDPOINT
-            - name: STORAGE_BUCKET
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: STORAGE_BUCKET
-            - name: STORAGE_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aggregation-secrets
-                  key: STORAGE_ACCESS_KEY
-            - name: STORAGE_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aggregation-secrets
-                  key: STORAGE_SECRET_KEY
-            - name: WHISPER_API_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: aggregation-config
-                  key: WHISPER_API_URL
-            - name: WORKER_CONCURRENCY
-              value: "5"
-            - name: LOG_LEVEL
-              value: "info"
-            - name: METRICS_PORT
-              value: "5002"
+            - {name: ROLE, value: media-executor}
+            - {name: METRICS_PORT, value: "5002"}
+            - {name: MEDIA_JOB_TIMEOUT_MS, value: "3600000"}
+            - {name: WORKER_CONCURRENCY, value: "2"}
           resources:
-            requests:
-              cpu: 200m
-              memory: 512Mi
-            limits:
-              cpu: 1000m
-              memory: 2Gi
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: metrics
-            initialDelaySeconds: 10
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: metrics
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
-          volumeMounts:
-            - name: media-temp
-              mountPath: /tmp/wahb-media
-            - name: config
-              mountPath: /config
-              readOnly: true
-      volumes:
-        - name: media-temp
-          emptyDir:
-            sizeLimit: 10Gi
-        - name: config
-          configMap:
-            name: aggregation-config
+            requests: {cpu: "1", memory: 2Gi, ephemeral-storage: 8Gi}
+            limits: {cpu: "4", memory: 8Gi, ephemeral-storage: 24Gi}
+          readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 20, periodSeconds: 15, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 30, periodSeconds: 30, timeoutSeconds: 5}
+          volumeMounts: [{name: media-scratch, mountPath: /tmp/wahb-media}]
+      volumes: [{name: media-scratch, emptyDir: {sizeLimit: 24Gi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-media-maintenance
+  labels: {app: aggregation, role: media-maintenance}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: aggregation, role: media-maintenance}}
+  template:
+    metadata:
+      labels: {app: aggregation, role: media-maintenance}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "5002", prometheus.io/path: /metrics}
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      containers:
+        - name: media-maintenance
+          image: ghcr.io/your-org/aggregation-service:latest
+          command: ["node", "dist/index.js", "media-maintenance"]
+          ports: [{name: metrics, containerPort: 5002}]
+          envFrom: [{configMapRef: {name: aggregation-config}}, {secretRef: {name: aggregation-secrets}}]
+          env: [{name: ROLE, value: media-maintenance}, {name: METRICS_PORT, value: "5002"}]
+          resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {cpu: 1, memory: 2Gi, ephemeral-storage: 8Gi}}
+          readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 15, periodSeconds: 15, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 25, periodSeconds: 30, timeoutSeconds: 5}
+          volumeMounts: [{name: scratch, mountPath: /tmp/wahb-media}]
+      volumes: [{name: scratch, emptyDir: {sizeLimit: 8Gi}}]
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: aggregation-service
-  labels:
-    app: aggregation-service
+  labels: {app: aggregation, role: intake-control}
 spec:
   type: ClusterIP
-  ports:
-    - port: 5002
-      targetPort: metrics
-      protocol: TCP
-      name: metrics
-  selector:
-    app: aggregation-service
+  selector: {app: aggregation, role: intake-control}
+  ports: [{name: metrics, port: 5002, targetPort: metrics}]
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -161,11 +162,12 @@ metadata:
   name: aggregation-config
 data:
   CMS_BASE_URL: "http://cms-service.default.svc.cluster.local/internal"
+  REDIS_URL: "redis://redis-master.default.svc.cluster.local:6379"
+  STORAGE_ENDPOINT: "https://your-storage.example"
+  STORAGE_BUCKET: "wahb-media"
   ADMIN_JWT_ISSUER: "cms-service"
   ADMIN_JWT_AUDIENCE: "platform-console"
   ADMIN_ALLOWED_ROLES: "admin,manager"
   PLATFORM_CONSOLE_ORIGINS: "https://wahb-console.salehspace.dev"
-  REDIS_URL: "redis://redis-master.default.svc.cluster.local:6379"
-  STORAGE_ENDPOINT: "https://your-storage.supabase.co/storage/v1"
-  STORAGE_BUCKET: "wahb-media"
-  WHISPER_API_URL: "http://whisper-service.default.svc.cluster.local:9000"
+  MEDIA_TEMP_DIR: "/tmp/wahb-media"
+  RESOURCE_DOMAIN: "aggregation"

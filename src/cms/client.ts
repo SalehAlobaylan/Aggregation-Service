@@ -49,6 +49,11 @@ import type {
   AtomizedChildResponse,
   ListAtomizationCandidatesResponse,
   AtomizationRepairResponse,
+  ArtifactManifest,
+  TranscriptionGeneration,
+  TranscriptionSegmentUnit,
+  AtomizationGeneration,
+  AtomizationChapterUnit,
 } from "./types.js";
 import {
   sourceRunDispatchClaimSchema,
@@ -426,9 +431,7 @@ export const cmsClient = {
       requestId,
     );
   },
-  async claimAtomizationWork(
-    requestId?: string,
-  ): Promise<{
+  async claimAtomizationWork(requestId?: string): Promise<{
     id: string;
     attemptId: string;
     claimToken: string;
@@ -485,6 +488,26 @@ export const cmsClient = {
       "POST",
       `/atomization-work/${encodeURIComponent(input.id)}/heartbeat`,
       { claim_token: input.claimToken },
+      requestId,
+    );
+  },
+  async deferAtomizationWork(
+    input: {
+      id: string;
+      claimToken: string;
+      retryAfterSec: number;
+      summary: string;
+    },
+    requestId?: string,
+  ): Promise<void> {
+    await makeProtectedRequest(
+      "POST",
+      `/atomization-work/${encodeURIComponent(input.id)}/defer`,
+      {
+        claim_token: input.claimToken,
+        retry_after_sec: input.retryAfterSec,
+        summary: input.summary,
+      },
       requestId,
     );
   },
@@ -1186,9 +1209,7 @@ export const cmsClient = {
   /**
    * Source-graph signals + ledger write-back (Slice 4).
    */
-  async getCorpusCitations(
-    requestId?: string,
-  ): Promise<{
+  async getCorpusCitations(requestId?: string): Promise<{
     data: { domain: string; count: number; recent_count: number }[];
   }> {
     return makeRequest("GET", "/intel/corpus-citations", undefined, requestId);
@@ -1798,6 +1819,213 @@ export const cmsClient = {
       "POST",
       `/content-items/${id}/atomization/runs`,
       data,
+      requestId,
+      parentSignal,
+    );
+  },
+
+  async createArtifactManifest(
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<ArtifactManifest> {
+    return makeProtectedRequest<ArtifactManifest>(
+      "POST",
+      "/artifact-manifests",
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async transitionArtifactManifest(
+    id: string,
+    state: string,
+    input: Record<string, unknown> = {},
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<ArtifactManifest> {
+    return makeProtectedRequest<ArtifactManifest>(
+      "POST",
+      `/artifact-manifests/${encodeURIComponent(id)}/${state.replace(/_/g, "-")}`,
+      { ...input, state },
+      requestId,
+      parentSignal,
+    );
+  },
+  async getArtifactManifest(
+    id: string,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<ArtifactManifest> {
+    return makeProtectedRequest<ArtifactManifest>(
+      "GET",
+      `/artifact-manifests/${encodeURIComponent(id)}`,
+      undefined,
+      requestId,
+      parentSignal,
+    );
+  },
+  async createTranscriptionGeneration(
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{ generation: TranscriptionGeneration }> {
+    return makeProtectedRequest<{ generation: TranscriptionGeneration }>(
+      "POST",
+      "/transcription-generations",
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async claimTranscriptionSegment(
+    requestId?: string,
+  ): Promise<{
+    unit: TranscriptionSegmentUnit;
+    generation: TranscriptionGeneration;
+  } | null> {
+    const raw = await makeProtectedRequest<unknown>(
+      "POST",
+      "/transcription-segments/claim",
+      {},
+      requestId,
+    );
+    if (!raw) return null;
+    const value = raw as {
+      unit: TranscriptionSegmentUnit;
+      generation: TranscriptionGeneration;
+    };
+    return value.unit && value.generation ? value : null;
+  },
+  async transitionTranscriptionSegment(
+    id: string,
+    state: string,
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<void> {
+    await makeProtectedRequest(
+      "POST",
+      `/transcription-segments/${encodeURIComponent(id)}/${state}`,
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async heartbeatTranscriptionSegment(
+    id: string,
+    claimToken: string,
+    requestId?: string,
+  ): Promise<void> {
+    await makeProtectedRequest(
+      "POST",
+      `/transcription-segments/${encodeURIComponent(id)}/heartbeat`,
+      { claim_token: claimToken },
+      requestId,
+    );
+  },
+  async finalizeTranscriptionGeneration(
+    id: string,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{ transcript_id: string }> {
+    return makeProtectedRequest<{ transcript_id: string }>(
+      "POST",
+      `/transcription-generations/${encodeURIComponent(id)}/finalize`,
+      {},
+      requestId,
+      parentSignal,
+    );
+  },
+  async createAtomizationGeneration(
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{ generation: AtomizationGeneration }> {
+    return makeProtectedRequest<{ generation: AtomizationGeneration }>(
+      "POST",
+      "/atomization-generations",
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async claimAtomizationChapterUnit(
+    requestId?: string,
+    generationId?: string,
+  ): Promise<{
+    unit: AtomizationChapterUnit;
+    generation: AtomizationGeneration;
+  } | null> {
+    const raw = await makeProtectedRequest<unknown>(
+      "POST",
+      "/atomization-chapter-units/claim",
+      generationId ? { generation_id: generationId } : {},
+      requestId,
+    );
+    if (!raw) return null;
+    const value = raw as {
+      unit: AtomizationChapterUnit;
+      generation: AtomizationGeneration;
+    };
+    return value.unit && value.generation ? value : null;
+  },
+  async transitionAtomizationChapterUnit(
+    id: string,
+    state: string,
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<void> {
+    await makeProtectedRequest(
+      "POST",
+      `/atomization-chapter-units/${encodeURIComponent(id)}/${state}`,
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async heartbeatAtomizationChapterUnit(
+    id: string,
+    claimToken: string,
+    requestId?: string,
+  ): Promise<void> {
+    await makeProtectedRequest(
+      "POST",
+      `/atomization-chapter-units/${encodeURIComponent(id)}/heartbeat`,
+      { claim_token: claimToken },
+      requestId,
+    );
+  },
+  async listAtomizationChapterUnits(
+    generationId: string,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{ units: AtomizationChapterUnit[] }> {
+    return makeProtectedRequest<{ units: AtomizationChapterUnit[] }>(
+      "GET",
+      `/atomization-generations/${encodeURIComponent(generationId)}/units`,
+      undefined,
+      requestId,
+      parentSignal,
+    );
+  },
+  async finalizeAtomizationGeneration(
+    generationId: string,
+    contentStage?: ContentStageCorrelation,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{
+    children: AtomizedChildResponse[];
+    generation: AtomizationGeneration;
+  }> {
+    return makeProtectedRequest<{
+      children: AtomizedChildResponse[];
+      generation: AtomizationGeneration;
+    }>(
+      "POST",
+      `/atomization-generations/${encodeURIComponent(generationId)}/finalize`,
+      contentStage ? { content_stage: contentStage } : {},
       requestId,
       parentSignal,
     );

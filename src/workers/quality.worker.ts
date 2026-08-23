@@ -20,6 +20,7 @@ import {
 } from '../queues/index.js';
 import { getQueue } from '../queues/index.js';
 import { reencodeOneItem, deleteOldVersion } from '../services/quality.service.js';
+import { withResourceLease } from '../runtime/resource-admission.js';
 
 const CLEANUP_GRACE_MS = 5 * 60 * 1000; // 5 min
 
@@ -34,8 +35,8 @@ const CLEANUP_GRACE_MS = 5 * 60 * 1000; // 5 min
 export const qualityWorker = createWorker({
     queueName: QUEUE_NAMES.QUALITY_REENCODE,
     concurrency: 1, // ffmpeg is CPU-heavy; one at a time per replica
-    timeoutMs: 30 * 60 * 1000, // 30 min — long videos can take a while
-    processor: async (job: Job, jobLogger): Promise<void> => {
+    timeoutMs: 60 * 60 * 1000,
+    processor: async (job: Job, jobLogger, signal): Promise<void> => {
         if (job.name === 'cleanup-old-version') {
             const data = job.data as QualityCleanupJob;
             jobLogger.info('Quality cleanup tick', {
@@ -55,14 +56,15 @@ export const qualityWorker = createWorker({
             contentRole: data.contentRole,
         });
 
-        const result = await reencodeOneItem({
+        const result = await withResourceLease('maintenance_encode', 'maintenance', () => reencodeOneItem({
             contentItemId: data.contentItemId,
             targetProfileId: data.targetProfileId,
             tenantId: data.tenantId,
             ruleId: data.ruleId,
             trigger: data.trigger,
             contentRole: data.contentRole,
-        });
+            signal,
+        }));
 
         if (!result.success) {
             if (result.nonRetryable) {

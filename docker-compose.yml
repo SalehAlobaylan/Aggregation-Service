@@ -1,44 +1,103 @@
 services:
-  # ============================================================================
-  # Core Services
-  # ============================================================================
-  aggregation:
+  # Explicit role topology. This file never starts the mixed `all` process.
+  aggregation-intake-control: &aggregation-common
     build: .
-    container_name: aggregation-service
-    environment:
-      - CMS_BASE_URL=http://host.docker.internal:8080/internal
-      - CMS_SERVICE_TOKEN=dev-service-token
-      - JWT_SECRET=dev-jwt-secret
-      - ADMIN_JWT_ISSUER=cms-service
-      - ADMIN_JWT_AUDIENCE=platform-console
-      - ADMIN_ALLOWED_ROLES=admin,manager
-      - PLATFORM_CONSOLE_ORIGINS=http://localhost:3005,http://localhost:3000
-      - REDIS_URL=redis://redis:6379
-      - STORAGE_ENDPOINT=http://minio:9000
-      - STORAGE_BUCKET=wahb-media
-      - STORAGE_ACCESS_KEY=minioadmin
-      - STORAGE_SECRET_KEY=minioadmin
-      - STORAGE_PUBLIC_URL=http://localhost:9000
-      # AI services live in Enrichment-Service; default points at host.
-      - ENRICHMENT_BASE_URL=http://host.docker.internal:5050
-      - ENRICHMENT_SERVICE_TOKEN=dev-service-token
-      - MEDIA_TEMP_DIR=/tmp/wahb-media
-      - WORKER_CONCURRENCY=5
-      - LOG_LEVEL=info
-      - METRICS_PORT=5002
-      - CB_FAILURE_THRESHOLD=5
-      - CB_RESET_TIMEOUT_MS=30000
+    command: ["node", "dist/index.js", "intake-control"]
+    container_name: aggregation-intake-control
+    environment: &aggregation-environment
+      CMS_BASE_URL: http://host.docker.internal:8080/internal
+      CMS_SERVICE_TOKEN: dev-service-token
+      JWT_SECRET: dev-jwt-secret
+      ADMIN_JWT_ISSUER: cms-service
+      ADMIN_JWT_AUDIENCE: platform-console
+      ADMIN_ALLOWED_ROLES: admin,manager
+      PLATFORM_CONSOLE_ORIGINS: http://localhost:3005,http://localhost:3000
+      REDIS_URL: redis://redis:6379
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_BUCKET: wahb-media
+      STORAGE_ACCESS_KEY: minioadmin
+      STORAGE_SECRET_KEY: minioadmin
+      STORAGE_PUBLIC_URL: http://localhost:9000
+      ENRICHMENT_BASE_URL: http://host.docker.internal:5050
+      ENRICHMENT_SERVICE_TOKEN: dev-service-token
+      MEDIA_TEMP_DIR: /tmp/wahb-media
+      LOG_LEVEL: info
+      METRICS_PORT: "5002"
     depends_on:
       redis:
         condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "5002:5002"
     volumes:
       - ./config:/config:ro
-      - media-temp:/tmp/wahb-media
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    tmpfs:
+      - /tmp/wahb-media:rw,size=2g
+
+  aggregation-news:
+    <<: *aggregation-common
+    command: ["node", "dist/index.js", "news"]
+    container_name: aggregation-news
+    environment: *aggregation-environment
+    ports: []
+    volumes:
+      - ./config:/config:ro
+    tmpfs:
+      - /tmp/wahb-media:rw,size=3g
+
+  aggregation-pods-control:
+    <<: *aggregation-common
+    command: ["node", "dist/index.js", "pods-control"]
+    container_name: aggregation-pods-control
+    environment: *aggregation-environment
+    ports: []
+    volumes:
+      - ./config:/config:ro
+    tmpfs:
+      - /tmp/wahb-media:rw,size=3g
+
+  aggregation-media-executor:
+    <<: *aggregation-common
+    command: ["node", "dist/index.js", "media-executor"]
+    container_name: aggregation-media-executor
+    environment:
+      <<: *aggregation-environment
+      WORKER_CONCURRENCY: "2"
+      MEDIA_JOB_TIMEOUT_MS: "3600000"
+    ports: []
+    volumes:
+      - ./config:/config:ro
+    tmpfs:
+      - /tmp/wahb-media:rw,size=24g
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 6G
+
+  aggregation-media-maintenance:
+    <<: *aggregation-common
+    command: ["node", "dist/index.js", "media-maintenance"]
+    container_name: aggregation-media-maintenance
+    environment: *aggregation-environment
+    ports: []
+    volumes:
+      - ./config:/config:ro
+    tmpfs:
+      - /tmp/wahb-media:rw,size=8g
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2G
 
   redis:
     image: redis:7-alpine
@@ -59,70 +118,31 @@ services:
     container_name: aggregation-minio
     command: server /data --console-address ":9001"
     environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     ports:
       - "9000:9000"
       - "9001:9001"
     volumes:
       - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   minio-init:
     image: minio/mc
     container_name: aggregation-minio-init
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
-      /bin/sh -c "
-      sleep 5;
-      mc alias set local http://minio:9000 minioadmin minioadmin;
+      /bin/sh -c "mc alias set local http://minio:9000 minioadmin minioadmin;
       mc mb local/wahb-media --ignore-existing;
-      mc anonymous set public local/wahb-media;
-      exit 0;
-      "
-
-  # ============================================================================
-  # Monitoring Stack (optional - use 'docker compose --profile monitoring up')
-  # ============================================================================
-  prometheus:
-    image: prom/prometheus:v2.48.0
-    container_name: aggregation-prometheus
-    profiles: ["monitoring"]
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
-      - ./monitoring/grafana-cloud-token:/etc/prometheus/grafana-cloud-token:ro
-      - prometheus-data:/prometheus
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:10.2.2
-    container_name: aggregation-grafana
-    profiles: ["monitoring"]
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    ports:
-      - "3002:3000"
-    volumes:
-      - ./monitoring/grafana/dashboard.json:/var/lib/grafana/dashboards/aggregation.json:ro
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana-data:/var/lib/grafana
-    depends_on:
-      - prometheus
-    restart: unless-stopped
+      mc anonymous set public local/wahb-media;"
 
 volumes:
   redis-data:
   minio-data:
-  media-temp:
-  prometheus-data:
-  grafana-data:
