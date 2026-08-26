@@ -3,19 +3,32 @@
  * controls delivery; this module controls whether an expensive effect may
  * begin.  A worker must release the lease only after its child has exited.
  */
-import { randomUUID } from 'crypto';
-import { getRedisConnection } from '../queues/redis.js';
-import { mediaPermitSaturation, resourcePermits, resourceDeferrals } from '../observability/metrics.js';
+import { randomUUID } from "crypto";
+import { getRedisConnection } from "../queues/redis.js";
+import {
+  mediaPermitSaturation,
+  resourcePermits,
+  resourceDeferrals,
+} from "../observability/metrics.js";
 
-export type WorkloadClass = 'software_encode' | 'hardware_encode' | 'light_media' | 'download_io' | 'maintenance_encode';
-export type WorkloadLane = 'required' | 'maintenance';
+export type WorkloadClass =
+  | "software_encode"
+  | "hardware_encode"
+  | "light_media"
+  | "download_io"
+  | "media_io_package"
+  | "maintenance_encode";
+export type WorkloadLane = "required" | "maintenance";
 
 const WEIGHT: Record<WorkloadClass, number> = {
-    software_encode: 2,
-    hardware_encode: 1,
-    light_media: 1,
-    download_io: 1,
-    maintenance_encode: 2,
+  software_encode: 2,
+  hardware_encode: 1,
+  light_media: 1,
+  download_io: 1,
+  // HLS packaging is predominantly temporary-storage, object I/O and
+  // validation. It must be admitted independently from CPU encoders.
+  media_io_package: 1,
+  maintenance_encode: 2,
 };
 
 // Two two-thread encoders on a local eight-core host. Production roles get a
@@ -24,26 +37,28 @@ const DEFAULT_COMPUTE_CAPACITY = 4;
 const LEASE_MS = 45_000;
 
 export class ResourceDeferredError extends Error {
-    readonly retryAfterSec = 30;
-    constructor(readonly workload: WorkloadClass) {
-        super(`resource capacity unavailable for ${workload}`);
-        this.name = 'ResourceDeferredError';
-    }
+  readonly retryAfterSec = 30;
+  constructor(readonly workload: WorkloadClass) {
+    super(`resource capacity unavailable for ${workload}`);
+    this.name = "ResourceDeferredError";
+  }
 }
 
 export interface ResourceLease {
-    id: string;
-    workload: WorkloadClass;
-    release(): Promise<void>;
-    heartbeat(): Promise<boolean>;
+  id: string;
+  workload: WorkloadClass;
+  release(): Promise<void>;
+  heartbeat(): Promise<boolean>;
 }
 
 function domain(): string {
-    // Infrastructure identity only; capacity/priority stay code policy.
-    return process.env.RESOURCE_DOMAIN?.trim() || 'local';
+  // Infrastructure identity only; capacity/priority stay code policy.
+  return process.env.RESOURCE_DOMAIN?.trim() || "local";
 }
 
-function key(): string { return `wahb:resource:${domain()}:compute`; }
+function key(): string {
+  return `wahb:resource:${domain()}:compute`;
+}
 
 const ACQUIRE = `
 local key = KEYS[1]
@@ -83,45 +98,73 @@ for _, value in ipairs(redis.call('HVALS', KEYS[1] .. ':weights')) do used = use
 return used
 `;
 
-export async function acquireResourceLease(workload: WorkloadClass, lane: WorkloadLane = 'required'): Promise<ResourceLease> {
-    const redis = getRedisConnection();
-    const id = `${process.pid}:${randomUUID()}`;
-    const now = Date.now();
-    const acquired = await redis.eval(ACQUIRE, 1, key(), now, DEFAULT_COMPUTE_CAPACITY, WEIGHT[workload], id, now + LEASE_MS, lane) as [number, number];
-    const used = Number(acquired[1] ?? 0);
-    mediaPermitSaturation.set(Math.min(1, used / DEFAULT_COMPUTE_CAPACITY));
-    if (acquired[0] !== 1) {
-        resourceDeferrals.labels(workload, lane).inc();
-        throw new ResourceDeferredError(workload);
-    }
-    resourcePermits.labels(workload, lane).inc(WEIGHT[workload]);
-    let released = false;
-    return {
+export async function acquireResourceLease(
+  workload: WorkloadClass,
+  lane: WorkloadLane = "required",
+): Promise<ResourceLease> {
+  const redis = getRedisConnection();
+  const id = `${process.pid}:${randomUUID()}`;
+  const now = Date.now();
+  const acquired = (await redis.eval(
+    ACQUIRE,
+    1,
+    key(),
+    now,
+    DEFAULT_COMPUTE_CAPACITY,
+    WEIGHT[workload],
+    id,
+    now + LEASE_MS,
+    lane,
+  )) as [number, number];
+  const used = Number(acquired[1] ?? 0);
+  mediaPermitSaturation.set(Math.min(1, used / DEFAULT_COMPUTE_CAPACITY));
+  if (acquired[0] !== 1) {
+    resourceDeferrals.labels(workload, lane).inc();
+    throw new ResourceDeferredError(workload);
+  }
+  resourcePermits.labels(workload, lane).inc(WEIGHT[workload]);
+  let released = false;
+  return {
+    id,
+    workload,
+    async heartbeat(): Promise<boolean> {
+      if (released) return false;
+      const ok = await redis.eval(
+        HEARTBEAT,
+        1,
+        key(),
         id,
-        workload,
-        async heartbeat(): Promise<boolean> {
-            if (released) return false;
-            const ok = await redis.eval(HEARTBEAT, 1, key(), id, Date.now() + LEASE_MS);
-            return Number(ok) === 1;
-        },
-        async release(): Promise<void> {
-            if (released) return;
-            released = true;
-            const remaining = Number(await redis.eval(RELEASE, 1, key(), id));
-            mediaPermitSaturation.set(Math.min(1, Math.max(0, remaining) / DEFAULT_COMPUTE_CAPACITY));
-            resourcePermits.labels(workload, lane).dec(WEIGHT[workload]);
-        },
-    };
+        Date.now() + LEASE_MS,
+      );
+      return Number(ok) === 1;
+    },
+    async release(): Promise<void> {
+      if (released) return;
+      released = true;
+      const remaining = Number(await redis.eval(RELEASE, 1, key(), id));
+      mediaPermitSaturation.set(
+        Math.min(1, Math.max(0, remaining) / DEFAULT_COMPUTE_CAPACITY),
+      );
+      resourcePermits.labels(workload, lane).dec(WEIGHT[workload]);
+    },
+  };
 }
 
-export async function withResourceLease<T>(workload: WorkloadClass, lane: WorkloadLane, effect: () => Promise<T>): Promise<T> {
-    const lease = await acquireResourceLease(workload, lane);
-    const heartbeat = setInterval(() => void lease.heartbeat().catch(() => undefined), LEASE_MS / 3);
-    heartbeat.unref();
-    try {
-        return await effect();
-    } finally {
-        clearInterval(heartbeat);
-        await lease.release();
-    }
+export async function withResourceLease<T>(
+  workload: WorkloadClass,
+  lane: WorkloadLane,
+  effect: () => Promise<T>,
+): Promise<T> {
+  const lease = await acquireResourceLease(workload, lane);
+  const heartbeat = setInterval(
+    () => void lease.heartbeat().catch(() => undefined),
+    LEASE_MS / 3,
+  );
+  heartbeat.unref();
+  try {
+    return await effect();
+  } finally {
+    clearInterval(heartbeat);
+    await lease.release();
+  }
 }

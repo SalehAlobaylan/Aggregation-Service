@@ -105,7 +105,11 @@ export interface PipelineRepairStageJob {
   claimToken: string;
   deterministicJobId: string;
   stage:
-    "media_download" | "media_transcode" | "media_thumbnail" | "text_embedding";
+    | "media_download"
+    | "media_transcode"
+    | "media_thumbnail"
+    | "media_delivery_generation"
+    | "text_embedding";
   tenantId: string;
   contentItemId: string;
   itemVersion: string;

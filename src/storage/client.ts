@@ -120,7 +120,7 @@ export function getStorageKey(
 export function getAttemptStorageKey(
   contentItemId: string,
   attemptId: string,
-  artifactType: "processed" | "thumbnail" | "analysis-audio",
+  artifactType: "source" | "processed" | "thumbnail" | "analysis-audio",
   extension: string,
 ): string {
   const safeAttempt = attemptId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -204,6 +204,7 @@ export interface ObjectMetadata {
   contentType?: string;
   etag?: string;
   checksumSha256?: string;
+  cacheControl?: string;
 }
 
 /** Read the provider metadata used to prove a manifest-owned object. */
@@ -224,6 +225,7 @@ export async function getObjectMetadata(
       contentType: head.ContentType,
       etag: head.ETag?.replace(/^"|"$/g, ""),
       checksumSha256: head.ChecksumSHA256,
+      cacheControl: head.CacheControl,
     };
   } catch (error) {
     if (isMissingObjectError(error)) return { exists: false, size: 0 };
@@ -265,6 +267,7 @@ export async function uploadFile(
   contentType?: string,
   tier: StorageTier = "primary",
   signal?: AbortSignal,
+  cacheControl?: string,
 ): Promise<string> {
   const { client, bucket } = bindingFor(tier);
   const maxRetries = 3;
@@ -290,6 +293,7 @@ export async function uploadFile(
         Body: fileStream,
         ContentType: mimeType,
         ContentLength: fileStats.size,
+        CacheControl: cacheControl,
       };
 
       try {

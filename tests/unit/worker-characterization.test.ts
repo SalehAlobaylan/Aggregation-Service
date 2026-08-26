@@ -41,7 +41,6 @@ const mocks = vi.hoisted(() => {
     cleanupTempFile: vi.fn(),
     isAllowedYouTubeUrl: vi.fn(),
     transcodeToMp4: vi.fn(),
-    audioToMp4: vi.fn(),
     extractThumbnail: vi.fn(),
     getMediaInfo: vi.fn(),
     containerExtension: vi.fn(),
@@ -104,7 +103,6 @@ vi.mock("../../src/media/downloader.js", () => ({
 
 vi.mock("../../src/media/transcoder.js", () => ({
   transcodeToMp4: mocks.transcodeToMp4,
-  audioToMp4: mocks.audioToMp4,
   extractThumbnail: mocks.extractThumbnail,
   getMediaInfo: mocks.getMediaInfo,
   containerExtension: mocks.containerExtension,

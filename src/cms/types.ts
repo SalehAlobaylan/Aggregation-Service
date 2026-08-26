@@ -108,9 +108,9 @@ export interface CreateContentItemRequest {
   author?: string | null;
   source_name: string;
   source_feed_url?: string | null;
-	tenant_id?: string;
-	content_source_id?: string;
-	source_run_request_id?: string;
+  tenant_id?: string;
+  content_source_id?: string;
+  source_run_request_id?: string;
   original_url: string;
 
   media_url?: string | null;
@@ -127,25 +127,25 @@ export interface CreateContentItemRequest {
 
 export interface CreateContentItemResponse {
   id: string;
-	tenant_id: string;
+  tenant_id: string;
   status: ContentStatus;
   created: boolean; // true if newly created, false if already existed
-	retired?: boolean; // identity is a Retention tombstone; never enqueue downstream work
+  retired?: boolean; // identity is a Retention tombstone; never enqueue downstream work
   created_at: string;
-	processing_generation: number;
-	disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
-	required_stages: string[];
-	active_stages: string[];
-	delivery_mode: "legacy" | "shadow" | "durable_required";
+  processing_generation: number;
+  disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
+  required_stages: string[];
+  active_stages: string[];
+  delivery_mode: "legacy" | "shadow" | "durable_required";
 }
 
 export interface ContentStageCorrelationRequest {
-	request_id: string;
-	attempt_id: string;
-	claim_token: string;
-	fence_token: string;
-	input_fingerprint: string;
-	producer_event_id: string;
+  request_id: string;
+  attempt_id: string;
+  claim_token: string;
+  fence_token: string;
+  input_fingerprint: string;
+  producer_event_id: string;
 }
 
 /**
@@ -187,6 +187,8 @@ export interface UpdateArtifactsRequest {
   playback_type?: "hls" | "mp4" | "audio" | string;
   fallback_playback_url?: string;
   has_video?: boolean;
+  visual_available?: boolean;
+  rendition_set_version?: number;
   media_renditions?: MediaRendition[];
   media_suitability?:
     | "audio_first_talking_head"
@@ -208,10 +210,19 @@ export interface UpdateArtifactsRequest {
   // CMS-issued item-version fence for an exact Pipeline repair. Normal
   // ingestion must not synthesize this value.
   expected_item_updated_at?: string;
-	content_stage?: ContentStageCorrelationRequest;
+  content_stage?: ContentStageCorrelationRequest;
 }
 
 export interface MediaRendition {
+  schema_version?: 1 | 2 | 3 | number;
+  id?: string;
+  role?:
+    | "native_audio"
+    | "progressive"
+    | "progressive_fallback"
+    | "hls_master"
+    | "hls_access_master"
+    | string;
   type: "hls" | "mp4" | "audio" | string;
   url: string;
   // The producing worker knows whether this exact rendition carries video.
@@ -221,6 +232,23 @@ export interface MediaRendition {
   width?: number;
   height?: number;
   bitrate_kbps?: number;
+  quality_tier?: "data_saver" | "standard" | "high" | string;
+  codec?: string;
+  container?: string;
+  cache_profile?: string;
+  manifest_id?: string;
+  package_manifest_id?: string;
+  adaptive?: boolean;
+  rendition_generation_id?: string;
+  rendition_digest?: string;
+  delivery_class?:
+    "audio_only" | "audio_first_visual" | "visual_dependent" | string;
+  codecs?: string;
+  fallback_rendition_id?: string;
+  policy_digest?: string;
+  probe_digest?: string;
+  validation_digest?: string;
+  validation_evidence?: Record<string, unknown>;
   is_primary?: boolean;
 }
 
@@ -279,8 +307,15 @@ export interface AtomizationChapter {
 }
 
 export type DurableUnitState =
-  | "queued" | "claimed" | "running" | "verifying" | "verified"
-  | "deferred" | "uncertain" | "failed" | "superseded";
+  | "queued"
+  | "claimed"
+  | "running"
+  | "verifying"
+  | "verified"
+  | "deferred"
+  | "uncertain"
+  | "failed"
+  | "superseded";
 
 export interface ArtifactManifest {
   id: string;
@@ -304,6 +339,69 @@ export interface ArtifactManifest {
   duration_ms?: number | null;
   state: string;
   recovery_class: string;
+}
+
+export interface MediaRenditionGeneration {
+  id: string;
+  tenant_id: string;
+  content_item_id: string;
+  generation_number: number;
+  route_digest: string;
+  probe_digest: string;
+  policy_digest: string;
+  rendition_digest?: string;
+  state:
+    | "planning"
+    | "running"
+    | "verifying"
+    | "active"
+    | "superseded"
+    | "failed"
+    | "uncertain";
+}
+
+export interface MediaDeliveryPolicy {
+  id?: string;
+  policy_digest?: string;
+  schema_version?: number;
+  primary_mode?: "audio" | "progressive" | "hls";
+  allow_passthrough?: boolean;
+  allow_remux?: boolean;
+  allow_hls?: boolean;
+  require_adaptive_hls?: boolean;
+  generate_audio_alternate?: boolean;
+  generate_progressive_fallback?: boolean;
+  max_delivery_height?: number;
+  hls_min_variants?: number;
+  rollout_state?: "shadow" | "active" | "disabled";
+  variants?: Array<{
+    rendition_type: string;
+    quality_tier: string;
+    priority: number;
+    required: boolean;
+    enabled: boolean;
+  }>;
+}
+
+export interface MediaHLSPackage {
+  id: string;
+  rendition_generation_id: string;
+  master_manifest_id: string;
+  progressive_manifest_id?: string | null;
+  variant_count: number;
+  state: string;
+  validation_digest?: string;
+}
+
+export interface MediaHLSAccessPoint {
+  id: string;
+  package_id: string;
+  quality_tier: "standard" | "high";
+  manifest_id: string;
+  max_height: number;
+  max_bandwidth_kbps: number;
+  validation_digest: string;
+  state: string;
 }
 
 export interface TranscriptionSegmentUnit {
@@ -375,6 +473,11 @@ export interface AtomizationInputResponse {
     duration_sec?: number | null;
     original_url?: string | null;
     has_video?: boolean | null;
+    source_manifest_id?: string | null;
+    source_manifest_url?: string | null;
+    source_manifest_key?: string | null;
+    source_manifest_content_type?: string | null;
+    source_manifest_storage_tier?: string | null;
   };
   policy: AtomizationPolicy;
   effective_policy?: AtomizationPolicy;
@@ -396,7 +499,7 @@ export interface AtomizedChildResponse {
   id: string;
   status: string;
   feed_visibility: string;
-  delivery_mode: 'legacy' | 'shadow' | 'durable_required';
+  delivery_mode: "legacy" | "shadow" | "durable_required";
 }
 
 export interface AtomizationCandidate {
@@ -799,7 +902,7 @@ export interface StartStorageOperationSagaRequest {
 export interface StorageOperationSaga {
   id: string;
   state: "prepared" | "object_applied" | "cms_committed" | string;
-	created: boolean;
+  created: boolean;
 }
 
 export interface CreateSweepRunRequest {
@@ -823,7 +926,7 @@ export interface CreateSweepRunRequest {
  */
 export interface LinkTranscriptRequest {
   transcript_id: string;
-	content_stage?: ContentStageCorrelationRequest;
+  content_stage?: ContentStageCorrelationRequest;
 }
 
 /**
@@ -832,7 +935,7 @@ export interface LinkTranscriptRequest {
 export interface UpdateEmbeddingRequest {
   embedding: number[];
   topic_tags?: string[];
-	content_stage?: ContentStageCorrelationRequest;
+  content_stage?: ContentStageCorrelationRequest;
 }
 
 /**
@@ -907,7 +1010,7 @@ export interface CirculationSourceClaim {
   url: string;
   fetch_interval_minutes: number;
   settings?: Record<string, unknown>;
-	source_run_request_id?: string;
+  source_run_request_id?: string;
 }
 
 export interface ClaimCirculationSourcesResponse {
@@ -932,7 +1035,7 @@ export interface ClaimMediaCirculationSourcesResponse {
 export interface ReportSourceRunRequest {
   tenant_id?: string;
   source_id: string;
-	source_run_request_id?: string;
+  source_run_request_id?: string;
   job_id: string;
   triggered_by: "schedule" | "manual";
   fetched?: number;

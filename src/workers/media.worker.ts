@@ -5,7 +5,7 @@
 import { Job } from "bullmq";
 import { createHash } from "crypto";
 import { join } from "path";
-import { stat } from "fs/promises";
+import { rm, stat } from "fs/promises";
 import { createWorker } from "./base-worker.js";
 import {
   QUEUE_NAMES,
@@ -31,7 +31,16 @@ import {
   containerExtension,
   containerMime,
   extractAudio,
+  remuxToMp4,
+  transcodeProgressive,
 } from "../media/transcoder.js";
+import {
+  createAndUploadAudioDeliveryLadder,
+  preferredAudioRendition,
+  type UploadedAudioLadderRendition,
+} from "../media/audio-ladder.js";
+import { planDeliveryRoute, snapshotDigest } from "../media/route-planner.js";
+import { createAndUploadAdaptiveHlsPackage } from "../media/hls-package.js";
 import {
   getAttemptStorageKey,
   getStorageKey,
@@ -207,9 +216,13 @@ export async function processMediaJob(
 
   // Track temp files for cleanup
   const tempFiles: string[] = [];
+  const tempDirectories: string[] = [];
   let localReservation: LocalReservation | undefined;
   let reservationHeartbeat: NodeJS.Timeout | undefined;
   let mediaArtifactManifestId: string | undefined;
+  let sourceArtifactUpload:
+    { url: string; manifestId: string; bytes: number } | undefined;
+  let renditionGenerationId: string | undefined;
   let thumbnailManifestId: string | undefined;
 
   try {
@@ -388,12 +401,12 @@ export async function processMediaJob(
         localReservation!.sourceDir,
       );
     } else {
-      // Podcast enclosure or direct URL
-      const extension = contentType === "PODCAST" ? "mp3" : "mp4";
+      // The URL suffix is only a temporary download hint. FFprobe, not the
+      // source label or URL, decides the persisted container and MIME type.
       downloadResult = await downloadHttp(
         sourceUrl,
         contentItemId,
-        extension,
+        undefined,
         signal,
         localReservation!.sourceDir,
       );
@@ -499,14 +512,191 @@ export async function processMediaJob(
       return; // stop here — no S3 writes, no AI enqueue
     }
 
+    const preliminarySuitability = classifyMediaSuitability({
+      contentType,
+      sourceType,
+      title: job.data.textContent?.title,
+      excerpt: job.data.textContent?.excerpt,
+      mediaInfo,
+      hasCaptions: Boolean(downloadResult.captions?.segments?.length),
+      categories: downloadResult.categories,
+      downloadKind: downloadRef?.mediaKind,
+    });
+    const policyResolution = await cmsClient.resolveMediaDeliveryPolicy(
+      {
+        tenant_id: tenantId,
+        source_type: sourceType,
+        media_kind: mediaInfo.visualAvailable ? "video" : "audio",
+        suitability: preliminarySuitability.verdict,
+        short_form: mediaInfo.duration <= 2400,
+      },
+      job.id,
+      signal,
+    );
+    // Snapshot only durable CMS policy data. A retry must never infer a new
+    // route from an environment value or the file extension.
+    const policySnapshot = policyResolution.policy;
+    const routeDecision = planDeliveryRoute({
+      probe: {
+        duration: mediaInfo.duration,
+        format: mediaInfo.format,
+        normalizedMime: mediaInfo.normalizedMime,
+        hasAudio: mediaInfo.hasAudio,
+        visualAvailable: mediaInfo.visualAvailable,
+        videoCodec: mediaInfo.videoCodec,
+        videoProfile: mediaInfo.videoProfile,
+        videoLevel: mediaInfo.videoLevel,
+        pixelFormat: mediaInfo.pixelFormat,
+        audioCodec: mediaInfo.audioCodec,
+        width: mediaInfo.width,
+        height: mediaInfo.height,
+        frameRate: mediaInfo.frameRate,
+        bitrateKbps: mediaInfo.bitrateKbps,
+        audioBitrateKbps: mediaInfo.audioBitrateKbps,
+        audioChannels: mediaInfo.audioChannels,
+        audioSampleRate: mediaInfo.audioSampleRate,
+        startTime: mediaInfo.startTime,
+        seekable: mediaInfo.seekable,
+        rotation: mediaInfo.rotation,
+        displayAspectRatio: mediaInfo.displayAspectRatio,
+        colorSpace: mediaInfo.colorSpace,
+        probeDigest: mediaInfo.probeDigest,
+      },
+      policy: policySnapshot,
+      suitability: preliminarySuitability.verdict,
+      durationSec: mediaInfo.duration,
+      trustedLongForm:
+        (contentType === "VIDEO" || contentType === "PODCAST") &&
+        mediaInfo.duration > 2400,
+    });
+    const routeSnapshot = {
+      route: routeDecision.route,
+      reasons: routeDecision.reasons,
+      expected: routeDecision.expected,
+      renditions: routeDecision.renditions,
+      route_digest: routeDecision.digest,
+      input_digest: mediaInfo.probeDigest,
+      resource_estimate: {
+        source_bytes: originalSourceBytes,
+        expected_renditions: routeDecision.renditions.length,
+      },
+    };
+    const probeSnapshot = {
+      duration: mediaInfo.duration,
+      format: mediaInfo.format,
+      normalized_mime: mediaInfo.normalizedMime,
+      has_audio: mediaInfo.hasAudio,
+      visual_available: mediaInfo.visualAvailable,
+      video_codec: mediaInfo.videoCodec,
+      video_profile: mediaInfo.videoProfile,
+      video_level: mediaInfo.videoLevel,
+      pixel_format: mediaInfo.pixelFormat,
+      audio_codec: mediaInfo.audioCodec,
+      width: mediaInfo.width,
+      height: mediaInfo.height,
+      frame_rate: mediaInfo.frameRate,
+      bitrate_kbps: mediaInfo.bitrateKbps,
+      audio_bitrate_kbps: mediaInfo.audioBitrateKbps,
+      audio_channels: mediaInfo.audioChannels,
+      audio_sample_rate: mediaInfo.audioSampleRate,
+      start_time: mediaInfo.startTime,
+      seekable: mediaInfo.seekable,
+      rotation: mediaInfo.rotation,
+      display_aspect_ratio: mediaInfo.displayAspectRatio,
+      color_space: mediaInfo.colorSpace,
+      probe_digest: mediaInfo.probeDigest,
+      streams: mediaInfo.streams,
+    };
+    const sourceExtension =
+      mediaInfo.visualAvailable && mediaInfo.format.includes("mp4")
+        ? "mp4"
+        : !mediaInfo.visualAvailable && mediaInfo.audioCodec === "aac"
+          ? "m4a"
+          : (downloadResult.filePath.split(".").pop() || "bin")
+              .replace(/[^a-zA-Z0-9]/g, "")
+              .toLowerCase() || "bin";
+    const sourceContentType =
+      mediaInfo.visualAvailable && mediaInfo.format.includes("mp4")
+        ? "video/mp4"
+        : !mediaInfo.visualAvailable && mediaInfo.audioCodec === "aac"
+          ? "audio/mp4"
+          : downloadedMime || "application/octet-stream";
+    sourceArtifactUpload = await uploadFileWithManifest(
+      {
+        tenantId,
+        contentItemId,
+        parentContentItemId: contentItemId,
+        artifactRole: "source",
+        key: getAttemptStorageKey(
+          contentItemId,
+          artifactAttemptId,
+          "source",
+          sourceExtension,
+        ),
+        filePath: downloadResult.filePath,
+        contentType: sourceContentType,
+        cacheControl: "public, max-age=31536000, immutable",
+        inputDigest: createHash("sha256")
+          .update(
+            `${contentItemId}:${sourceUrl}:${Math.floor(mediaInfo.duration)}:source`,
+          )
+          .digest("hex"),
+        fenceToken: job.data.contentStage?.fence_token,
+        attemptId: isUuid(job.data.contentStage?.attempt_id)
+          ? job.data.contentStage?.attempt_id
+          : undefined,
+        creatorRole: "aggregation-media-executor",
+      },
+      signal,
+    );
+    // Persist the pure decision after the immutable source is proven and
+    // before any delivery encode, remux, HLS package, or thumbnail work.
+    const generation = await cmsClient.createMediaRenditionGeneration(
+      {
+        tenant_id: tenantId,
+        content_item_id: contentItemId,
+        source_manifest_id: sourceArtifactUpload.manifestId,
+        route_decision: routeSnapshot,
+        route_digest: snapshotDigest(routeSnapshot),
+        probe_snapshot: probeSnapshot,
+        probe_digest: snapshotDigest(probeSnapshot),
+        policy_snapshot: policySnapshot,
+        policy_digest: snapshotDigest(policySnapshot),
+        attempt_id: isUuid(job.data.contentStage?.attempt_id)
+          ? job.data.contentStage?.attempt_id
+          : undefined,
+        fence_token: job.data.contentStage?.fence_token,
+      },
+      job.id,
+      signal,
+    );
+    renditionGenerationId = generation.id;
+    await cmsClient.transitionMediaRenditionGeneration(
+      renditionGenerationId,
+      "running",
+      { tenant_id: tenantId, fence_token: job.data.contentStage?.fence_token },
+      job.id,
+      signal,
+    );
+
     // 6. Transcode/process media
     let processedPath: string;
     let duration: number;
     let processedMimeType = "video/mp4";
     let isImageArtifact = false;
     let isAudioOnlyArtifact = false;
+    // A parent over the atomization limit is never a feed-delivery encode.
+    // The immutable source is its durable input; analysis audio and chapters
+    // are derived from it. Keeping this decision here (before transcode) is
+    // the invariant that prevents a multi-hour upload from consuming a full
+    // second encode just to create an artifact nobody may play in Pods.
+    const isLongParentSourceFlow =
+      (contentType === "VIDEO" || contentType === "PODCAST") &&
+      mediaInfo.duration > 2400 &&
+      downloadRef?.mediaKind !== "photo";
     let analysisAudioManifestId: string | undefined;
     let analysisAudioUrl: string | undefined;
+    let audioLadder: UploadedAudioLadderRendition[] = [];
 
     // Container is profile-driven. Image artifacts always pass through
     // and ignore the container choice.
@@ -522,7 +712,72 @@ export async function processMediaJob(
       duration = 0;
       processedMimeType = inferImageMimeType(downloadResult.format);
       isImageArtifact = true;
-    } else if (mediaInfo.hasVideo || contentType === "VIDEO") {
+    } else if (isLongParentSourceFlow) {
+      processedPath = downloadResult.filePath;
+      duration = mediaInfo.duration;
+      processedMimeType =
+        lookupMime(downloadResult.filePath) || "application/octet-stream";
+    } else if (routeDecision.route === "progressive_passthrough") {
+      // The planner admitted this only after the strict browser MP4 gate.
+      // Reusing it preserves fast-start/timestamps and avoids a pointless
+      // second visual encode for already-compliant source material.
+      processedPath = downloadResult.filePath;
+      duration = mediaInfo.duration;
+      processedMimeType = "video/mp4";
+    } else if (
+      routeDecision.route === "audio_transcode" ||
+      routeDecision.route === "audio_passthrough"
+    ) {
+      audioLadder = await withResourceLease("software_encode", "required", () =>
+        createAndUploadAudioDeliveryLadder({
+          tenantId,
+          contentItemId,
+          parentContentItemId: contentItemId,
+          attemptId: isUuid(job.data.contentStage?.attempt_id)
+            ? job.data.contentStage?.attempt_id
+            : undefined,
+          fenceToken: job.data.contentStage?.fence_token,
+          sourcePath: downloadResult.filePath,
+          sourceInfo: mediaInfo,
+          sourceArtifact: sourceArtifactUpload,
+          allowSourcePassthrough: routeDecision.route === "audio_passthrough",
+          outputDir: localReservation!.outputDir,
+          outputBaseName: `${contentItemId}-delivery-audio`,
+          storagePrefix: `content/${contentItemId}/attempts/${artifactAttemptId}`,
+          artifactRole: "delivery_audio",
+          creatorRole: "aggregation-media-executor",
+          inputDigest: mediaInfo.probeDigest ?? snapshotDigest(probeSnapshot),
+          signal,
+        }),
+      );
+      const preferred = preferredAudioRendition(audioLadder);
+      processedPath = preferred.localPath ?? downloadResult.filePath;
+      duration = mediaInfo.duration;
+      processedMimeType = preferred.mimeType;
+      isAudioOnlyArtifact = true;
+      for (const output of audioLadder)
+        if (!output.sourcePassthrough && output.localPath)
+          tempFiles.push(output.localPath);
+    } else if (routeDecision.route === "progressive_remux") {
+      const outPath = join(
+        localReservation!.outputDir,
+        `${contentItemId}_remux.mp4`,
+      );
+      const result = await withResourceLease("light_media", "required", () =>
+        remuxToMp4(downloadResult.filePath, outPath, { signal }),
+      );
+      processedPath = result.outputPath;
+      duration = result.duration;
+      processedMimeType = "video/mp4";
+      tempFiles.push(processedPath);
+    } else if (routeDecision.route === "adaptive_hls_transcode") {
+      // The adaptive package owns every delivery encode, including a
+      // stream-copied 360p progressive fallback. Feed it the proven source
+      // directly so we do not perform an unused full progressive encode.
+      processedPath = downloadResult.filePath;
+      duration = mediaInfo.duration;
+      processedMimeType = sourceContentType;
+    } else if (routeDecision.route === "progressive_transcode") {
       const outPath = join(
         localReservation!.outputDir,
         `${contentItemId}_processed.${outExt}`,
@@ -531,9 +786,15 @@ export async function processMediaJob(
         "software_encode",
         "required",
         () =>
-          transcodeToMp4(downloadResult.filePath, outPath, ingestProfile, {
-            signal,
-          }),
+          transcodeProgressive(
+            downloadResult.filePath,
+            outPath,
+            ingestProfile,
+            routeDecision.route === "adaptive_hls_transcode"
+              ? Math.min(720, mediaInfo.height ?? 720)
+              : undefined,
+            { signal },
+          ),
       );
       processedPath = result.outputPath;
       duration = result.duration;
@@ -544,8 +805,9 @@ export async function processMediaJob(
       // the entire episode just to add black pixels, wasting CPU and R2.
       processedPath = downloadResult.filePath;
       duration = mediaInfo.duration;
-      processedMimeType = String(
-        lookupMime(downloadResult.filePath) || "audio/mpeg",
+      processedMimeType = audioArtifactMime(
+        mediaInfo.audioCodec,
+        downloadResult.filePath,
       );
       isAudioOnlyArtifact = true;
     }
@@ -562,7 +824,7 @@ export async function processMediaJob(
     ) {
       const analysisPath = join(
         localReservation!.outputDir,
-        `${contentItemId}_analysis.mp3`,
+        `${contentItemId}_analysis.m4a`,
       );
       await withResourceLease("software_encode", "required", () =>
         extractAudio(processedPath, analysisPath, { signal }),
@@ -573,7 +835,7 @@ export async function processMediaJob(
         job.data.workAttemptId ??
         String(job.id ?? "attempt")
       ).replace(/[^a-zA-Z0-9_-]/g, "_");
-      const analysisKey = `content/${contentItemId}/attempts/${analysisAttempt}/analysis-audio.mp3`;
+      const analysisKey = `content/${contentItemId}/attempts/${analysisAttempt}/analysis-audio.m4a`;
       const analysisUpload = await uploadFileWithManifest(
         {
           tenantId,
@@ -582,7 +844,8 @@ export async function processMediaJob(
           artifactRole: "analysis_audio",
           key: analysisKey,
           filePath: analysisPath,
-          contentType: "audio/mpeg",
+          contentType: "audio/mp4",
+          cacheControl: "public, max-age=31536000, immutable",
           inputDigest: createHash("sha256")
             .update(`${contentItemId}:${Math.floor(duration)}:analysis-audio`)
             .digest("hex"),
@@ -642,6 +905,7 @@ export async function processMediaJob(
           key: thumbKey,
           filePath: thumbnailPath,
           contentType: "image/jpeg",
+          cacheControl: "public, max-age=31536000, immutable",
           inputDigest: createHash("sha256")
             .update(`${contentItemId}:thumbnail:${Math.floor(duration)}`)
             .digest("hex"),
@@ -674,39 +938,138 @@ export async function processMediaJob(
     }
 
     // 8. Upload processed artifact (key extension matches container).
+    const verifiedArtifactExtension =
+      isImageArtifact || isLongParentSourceFlow
+        ? artifactExtension
+        : isAudioOnlyArtifact
+          ? audioArtifactExtension(
+              mediaInfo.audioCodec,
+              downloadResult.filePath,
+            )
+          : outExt;
     const containerProcessedKey = isImageArtifact
       ? processedKey
       : // Keep the stable processed key for idempotency even when its payload
         // is audio. The authoritative playback_type/mime metadata—not a key
         // suffix—selects the client player.
         isAudioOnlyArtifact
-        ? processedKey
-        : getStorageKey(contentItemId, "processed", outExt);
-    const mediaUpload = await uploadFileWithManifest(
-      {
-        tenantId,
-        contentItemId,
-        parentContentItemId: contentItemId,
-        artifactRole: "source",
-        key: containerProcessedKey,
-        filePath: processedPath,
-        contentType: processedMimeType,
-        inputDigest: createHash("sha256")
-          .update(
-            `${contentItemId}:${sourceUrl}:${Math.floor(duration)}:${processedMimeType}`,
+        ? getAttemptStorageKey(
+            contentItemId,
+            artifactAttemptId,
+            "processed",
+            verifiedArtifactExtension,
           )
-          .digest("hex"),
-        fenceToken: job.data.contentStage?.fence_token,
-        attemptId: isUuid(job.data.contentStage?.attempt_id)
-          ? job.data.contentStage?.attempt_id
-          : undefined,
-        creatorRole: "aggregation-media-executor",
-      },
-      signal,
-    );
+        : getAttemptStorageKey(
+            contentItemId,
+            artifactAttemptId,
+            "processed",
+            verifiedArtifactExtension,
+          );
+    const primaryAudioUpload =
+      audioLadder.length > 0 ? preferredAudioRendition(audioLadder) : undefined;
+    const mediaUpload = primaryAudioUpload
+      ? {
+          url: primaryAudioUpload.url,
+          manifestId: primaryAudioUpload.manifestId,
+          bytes: primaryAudioUpload.bytes,
+        }
+      : (isLongParentSourceFlow ||
+            routeDecision.route === "progressive_passthrough" ||
+            routeDecision.route === "adaptive_hls_transcode") &&
+          sourceArtifactUpload
+        ? sourceArtifactUpload
+        : await uploadFileWithManifest(
+            {
+              tenantId,
+              contentItemId,
+              parentContentItemId: contentItemId,
+              artifactRole: isLongParentSourceFlow
+                ? "source"
+                : isAudioOnlyArtifact
+                  ? "delivery_audio"
+                  : "delivery_progressive",
+              key: containerProcessedKey,
+              filePath: processedPath,
+              contentType: processedMimeType,
+              cacheControl: "public, max-age=31536000, immutable",
+              inputDigest: createHash("sha256")
+                .update(
+                  `${contentItemId}:${sourceUrl}:${Math.floor(duration)}:${processedMimeType}`,
+                )
+                .digest("hex"),
+              fenceToken: job.data.contentStage?.fence_token,
+              attemptId: isUuid(job.data.contentStage?.attempt_id)
+                ? job.data.contentStage?.attempt_id
+                : undefined,
+              creatorRole: "aggregation-media-executor",
+            },
+            signal,
+          );
     const mediaUrl = mediaUpload.url;
     mediaArtifactManifestId = mediaUpload.manifestId;
     jobLogger.info("Processed media uploaded", { mediaUrl });
+
+    let hlsPackage:
+      Awaited<ReturnType<typeof createAndUploadAdaptiveHlsPackage>> | undefined;
+    // Visual media always receives a native audio alternate when the resolved
+    // policy requests it. This is independent of whether the visual primary is
+    // progressive or HLS and never manufactures a static video wrapper.
+    if (
+      !isLongParentSourceFlow &&
+      mediaInfo.visualAvailable &&
+      policySnapshot.generate_audio_alternate !== false
+    ) {
+      audioLadder = await withResourceLease("software_encode", "required", () =>
+        createAndUploadAudioDeliveryLadder({
+          tenantId,
+          contentItemId,
+          parentContentItemId: contentItemId,
+          attemptId: isUuid(job.data.contentStage?.attempt_id)
+            ? job.data.contentStage?.attempt_id
+            : undefined,
+          fenceToken: job.data.contentStage?.fence_token,
+          sourcePath: downloadResult.filePath,
+          sourceInfo: mediaInfo,
+          allowSourcePassthrough: false,
+          outputDir: localReservation!.outputDir,
+          outputBaseName: `${contentItemId}-delivery-audio`,
+          storagePrefix: `content/${contentItemId}/attempts/${artifactAttemptId}`,
+          artifactRole: "delivery_audio",
+          creatorRole: "aggregation-media-executor",
+          inputDigest: mediaInfo.probeDigest ?? snapshotDigest(probeSnapshot),
+          signal,
+        }),
+      );
+      for (const output of audioLadder)
+        if (output.localPath) tempFiles.push(output.localPath);
+    }
+    if (routeDecision.route === "adaptive_hls_transcode") {
+      const hlsDir = join(
+        localReservation!.hlsDir,
+        `${contentItemId}_delivery`,
+      );
+      hlsPackage = await withResourceLease("media_io_package", "required", () =>
+        createAndUploadAdaptiveHlsPackage({
+          tenantId,
+          contentItemId,
+          renditionGenerationId: renditionGenerationId!,
+          attemptId: isUuid(job.data.contentStage?.attempt_id)
+            ? job.data.contentStage?.attempt_id
+            : undefined,
+          fenceToken: job.data.contentStage?.fence_token,
+          sourcePath: processedPath,
+          outputDir: hlsDir,
+          storagePrefix: `content/${contentItemId}/attempts/${artifactAttemptId}`,
+          progressivePath: mediaUrl,
+          progressiveManifestId: mediaUpload.manifestId,
+          inputDigest: createHash("sha256")
+            .update(`${contentItemId}:${mediaInfo.probeDigest}:adaptive-hls`)
+            .digest("hex"),
+          signal,
+        }),
+      );
+      tempDirectories.push(hlsDir);
+    }
 
     let processedBytes = 0;
     try {
@@ -725,6 +1088,9 @@ export async function processMediaJob(
     // original_* fields as write-once, so re-runs don't clobber them.
     // originalSourceBytes was computed above during pre-flight.
     const originalBitrateKbps = mediaInfo.bitrateKbps ?? undefined;
+    const additionalAudioLadderBytes = audioLadder
+      .filter((audio) => audio.manifestId !== mediaUpload.manifestId)
+      .reduce((total, audio) => total + audio.bytes, 0);
 
     // Merge download-time YouTube signals (heatmap / sponsor segments /
     // categories) into the item's metadata. Omitted when absent so we
@@ -745,6 +1111,17 @@ export async function processMediaJob(
       }
       if (mediaArtifactManifestId)
         downloadMeta["media_artifact_manifest_id"] = mediaArtifactManifestId;
+      if (sourceArtifactUpload)
+        downloadMeta["source_artifact_manifest_id"] =
+          sourceArtifactUpload.manifestId;
+      if (renditionGenerationId)
+        downloadMeta["media_rendition_generation_id"] = renditionGenerationId;
+      if (isLongParentSourceFlow) {
+        downloadMeta["long_parent_source_manifest_id"] =
+          mediaArtifactManifestId;
+        downloadMeta["delivery_route"] = "source_only_long_form";
+        downloadMeta["parent_feed_playback_prohibited"] = true;
+      }
       if (thumbnailManifestId)
         downloadMeta["thumbnail_manifest_id"] = thumbnailManifestId;
     }
@@ -792,22 +1169,20 @@ export async function processMediaJob(
       contentItemId,
       {
         media_url: mediaUrl,
-        playback_url: mediaUrl,
-        playback_type: isAudioOnlyArtifact ? "audio" : "mp4",
-        fallback_playback_url: mediaUrl,
-        has_video: mediaInfo.hasVideo && !isAudioOnlyArtifact,
-        media_renditions: [
-          {
-            type: isAudioOnlyArtifact ? "audio" : "mp4",
-            url: mediaUrl,
-            has_video: mediaInfo.hasVideo && !isAudioOnlyArtifact,
-            mime_type: processedMimeType,
-            is_primary: true,
-          },
-        ],
+        // Public playback fields are projected solely by generation activation.
+        // This write records non-serving custody and suitability only.
+        has_video:
+          mediaInfo.visualAvailable &&
+          !isAudioOnlyArtifact &&
+          !isLongParentSourceFlow,
+        visual_available:
+          mediaInfo.visualAvailable &&
+          !isAudioOnlyArtifact &&
+          !isLongParentSourceFlow,
         thumbnail_url: thumbnailUrl,
         duration_sec: Math.floor(duration),
-        file_size_bytes: processedBytes + thumbnailBytes,
+        file_size_bytes:
+          processedBytes + thumbnailBytes + additionalAudioLadderBytes,
         original_size_bytes:
           originalSourceBytes > 0 ? originalSourceBytes : undefined,
         original_bitrate_kbps: originalBitrateKbps,
@@ -824,6 +1199,176 @@ export async function processMediaJob(
       signal,
     );
 
+    if (renditionGenerationId) {
+      const generationProbeDigest = snapshotDigest(probeSnapshot);
+      const rendition = (
+        role: string,
+        type: "source" | "audio" | "mp4" | "hls",
+        upload: { url: string; manifestId: string },
+        extra: Record<string, unknown> = {},
+      ) => ({
+        schema_version: 3,
+        id: createHash("sha256")
+          .update(`${renditionGenerationId}:${role}:${upload.manifestId}`)
+          .digest("hex"),
+        role,
+        type,
+        url: upload.url,
+        manifest_id: upload.manifestId,
+        rendition_generation_id: renditionGenerationId,
+        probe_digest: generationProbeDigest,
+        policy_digest: snapshotDigest(policySnapshot),
+        ...extra,
+      });
+      const preferredAudio =
+        audioLadder.length > 0
+          ? preferredAudioRendition(audioLadder)
+          : undefined;
+      const audioRenditions = audioLadder.map((audio) =>
+        rendition(
+          mediaInfo.visualAvailable ? "native_audio_alternate" : "native_audio",
+          "audio",
+          { url: audio.url, manifestId: audio.manifestId },
+          {
+            mime_type: audio.mimeType,
+            container: audio.container,
+            codec: audio.codec,
+            codecs: audio.codec === "aac" ? "mp4a.40.2" : audio.codec,
+            has_video: false,
+            bitrate_kbps: audio.bitrateKbps,
+            quality_tier: audio.tier,
+            is_primary:
+              isAudioOnlyArtifact &&
+              preferredAudio?.manifestId === audio.manifestId,
+            verification_evidence: {
+              measured_bitrate_kbps: audio.bitrateKbps,
+              maximum_bitrate_kbps: audio.maxBitrateKbps,
+              source_passthrough: audio.sourcePassthrough,
+            },
+          },
+        ),
+      );
+      let renditionSet: Array<Record<string, unknown>>;
+      if (isLongParentSourceFlow) {
+        renditionSet = [
+          rendition(
+            "source",
+            "source",
+            { url: mediaUrl, manifestId: mediaUpload.manifestId },
+            {
+              mime_type: processedMimeType,
+              serving: false,
+              quality_tier: "standard",
+            },
+          ),
+        ];
+      } else if (hlsPackage) {
+        const progressiveFallback = rendition(
+          "progressive_fallback",
+          "mp4",
+          {
+            url: hlsPackage.progressiveUrl,
+            manifestId: hlsPackage.progressiveManifestId,
+          },
+          {
+            mime_type: "video/mp4",
+            has_video: true,
+            height: 360,
+            bitrate_kbps: 600,
+            quality_tier: "data_saver",
+          },
+        );
+        const standardHls = rendition(
+          "hls_access_master",
+          "hls",
+          {
+            url: hlsPackage.standardMasterUrl,
+            manifestId: hlsPackage.standardMasterManifestId,
+          },
+          {
+            mime_type: "application/vnd.apple.mpegurl",
+            has_video: true,
+            quality_tier: "standard",
+            package_id: hlsPackage.packageId,
+            validation_digest: hlsPackage.validationDigest,
+            validation_evidence: hlsPackage.validationEvidence,
+            is_primary: true,
+            fallback_rendition_id: progressiveFallback.id,
+          },
+        );
+        renditionSet = [
+          standardHls,
+          rendition(
+            "hls_access_master",
+            "hls",
+            {
+              url: hlsPackage.highMasterUrl,
+              manifestId: hlsPackage.highMasterManifestId,
+            },
+            {
+              mime_type: "application/vnd.apple.mpegurl",
+              has_video: true,
+              quality_tier: "high",
+              package_id: hlsPackage.packageId,
+              validation_digest: hlsPackage.validationDigest,
+              fallback_rendition_id: progressiveFallback.id,
+            },
+          ),
+          progressiveFallback,
+          ...audioRenditions,
+        ];
+      } else if (isAudioOnlyArtifact && audioRenditions.length > 0) {
+        renditionSet = audioRenditions;
+      } else {
+        renditionSet = [
+          rendition(
+            isAudioOnlyArtifact ? "native_audio" : "progressive",
+            isAudioOnlyArtifact ? "audio" : "mp4",
+            { url: mediaUrl, manifestId: mediaUpload.manifestId },
+            {
+              mime_type: processedMimeType,
+              has_video: mediaInfo.visualAvailable && !isAudioOnlyArtifact,
+              quality_tier: "standard",
+              is_primary: true,
+            },
+          ),
+          ...audioRenditions,
+        ];
+      }
+      await cmsClient.transitionMediaRenditionGeneration(
+        renditionGenerationId,
+        "verifying",
+        {
+          tenant_id: tenantId,
+          fence_token: job.data.contentStage?.fence_token,
+          rendition_set: renditionSet,
+          terminal_proof: {
+            output_probe_digest: mediaInfo.probeDigest,
+            cms_artifacts_written: true,
+          },
+        },
+        job.id,
+        signal,
+      );
+      await cmsClient.activateMediaRenditionGeneration(
+        renditionGenerationId,
+        {
+          tenant_id: tenantId,
+          fence_token: job.data.contentStage?.fence_token,
+          terminal_proof: {
+            cms_artifacts_written: true,
+            active_manifest_ids: [
+              mediaUpload.manifestId,
+              ...audioLadder.map((audio) => audio.manifestId),
+              ...(hlsPackage?.manifestIds ?? []),
+            ].filter((id, index, values) => values.indexOf(id) === index),
+          },
+        },
+        job.id,
+        signal,
+      );
+    }
+
     jobLogger.info("CMS artifacts updated", {
       contentItemId,
       mediaUrl,
@@ -834,11 +1379,13 @@ export async function processMediaJob(
     // CMS playback metadata is now committed. Promote the verified manifests
     // to the active ownership state only after that fenced writeback succeeds;
     // a lost response leaves them recoverable/verified for the next retry.
-    for (const manifestId of [
+    for (const manifestId of new Set([
       mediaArtifactManifestId,
       thumbnailManifestId,
       analysisAudioManifestId,
-    ]) {
+      ...audioLadder.map((audio) => audio.manifestId),
+      ...(hlsPackage?.manifestIds ?? []),
+    ])) {
       if (!manifestId) continue;
       await cmsClient.transitionArtifactManifest(
         manifestId,
@@ -968,6 +1515,11 @@ export async function processMediaJob(
     for (const tempFile of tempFiles) {
       await cleanupTempFile(tempFile);
     }
+    await Promise.all(
+      tempDirectories.map((dir) =>
+        rm(dir, { recursive: true, force: true }).catch(() => undefined),
+      ),
+    );
   }
 }
 
@@ -1200,4 +1752,44 @@ function inferArtifactExtension(
     return "jpg";
   }
   return "mp4";
+}
+
+function audioArtifactExtension(
+  codec: string | undefined,
+  filePath: string,
+): string {
+  switch ((codec ?? "").toLowerCase()) {
+    case "aac":
+      return "m4a";
+    case "opus":
+      return "opus";
+    case "vorbis":
+      return "ogg";
+    case "flac":
+      return "flac";
+    case "mp3":
+      return "mp3";
+  }
+  const ext = filePath.split(".").pop()?.toLowerCase();
+  return ext && /^[a-z0-9]{2,8}$/.test(ext) ? ext : "m4a";
+}
+
+function audioArtifactMime(
+  codec: string | undefined,
+  filePath: string,
+): string {
+  switch (audioArtifactExtension(codec, filePath)) {
+    case "m4a":
+      return "audio/mp4";
+    case "opus":
+      return "audio/ogg";
+    case "ogg":
+      return "audio/ogg";
+    case "flac":
+      return "audio/flac";
+    case "mp3":
+      return "audio/mpeg";
+    default:
+      return String(lookupMime(filePath) || "audio/mpeg");
+  }
 }

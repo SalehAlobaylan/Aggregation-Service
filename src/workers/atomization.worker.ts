@@ -9,17 +9,21 @@ import { cmsClient, contentStageCorrelation } from "../cms/client.js";
 import { config } from "../config/index.js";
 import { downloadHttp, cleanupTempFile } from "../media/downloader.js";
 import {
-  createHlsVod,
+  createAdaptiveHlsPackage,
+  validateAdaptiveHlsPackage,
   cutMediaSegment,
   extractThumbnail,
   getMediaInfo,
 } from "../media/transcoder.js";
 import {
+  createAndUploadAudioDeliveryLadder,
+  preferredAudioRendition,
+  type UploadedAudioLadderRendition,
+} from "../media/audio-ladder.js";
+import {
   uploadFile,
   getStorageKey,
-  getPublicUrl,
   objectExists,
-  listContentObjects,
   type StorageTier,
 } from "../storage/client.js";
 import { uploadFileWithManifest } from "../storage/manifest.js";
@@ -154,9 +158,6 @@ export const atomizationWorker = createWorker({
         await report("completed", "planning");
         return;
       }
-      if (!input.item.media_url) {
-        throw new Error(`Parent ${contentItemId} has no media_url`);
-      }
       if (!input.transcript || input.segments.length === 0) {
         throw new Error(
           `Parent ${contentItemId} has no timestamped transcript yet`,
@@ -248,10 +249,7 @@ export const atomizationWorker = createWorker({
           30_000,
         );
         reservationHeartbeat.unref();
-        const parentMedia = await resolveParentMediaForAtomization(
-          input,
-          jobLogger,
-        );
+        const parentMedia = await resolveParentMediaForAtomization(input);
         const parentDownload = await downloadHttp(
           parentMedia.url,
           `${contentItemId}_atomize`,
@@ -261,6 +259,28 @@ export const atomizationWorker = createWorker({
         );
         tempFiles.push(parentDownload.filePath);
         const mediaInfo = await getMediaInfo(parentDownload.filePath);
+        const deliveryPolicy = (
+          await cmsClient.resolveMediaDeliveryPolicy(
+            {
+              tenant_id: input.item.tenant_id,
+              source_type: input.item.source,
+              media_kind: mediaInfo.visualAvailable ? "video" : "audio",
+              // Podcast episodes and talking-head parents are audio-first by
+              // default; only an explicitly HLS-active visual policy spends the
+              // ladder cost for a chapter.
+              suitability:
+                input.item.type === "PODCAST" ? "audio_first_show" : "unknown",
+              short_form: true,
+            },
+            job.id,
+            signal,
+          )
+        ).policy;
+        const chapterUsesAdaptiveHls =
+          mediaInfo.visualAvailable &&
+          deliveryPolicy.primary_mode === "hls" &&
+          deliveryPolicy.allow_hls !== false &&
+          deliveryPolicy.rollout_state === "active";
 
         const children: AtomizationChapter[] = [];
         const existingUnits = await cmsClient.listAtomizationChapterUnits(
@@ -306,19 +326,61 @@ export const atomizationWorker = createWorker({
             signal,
           );
           const chapter = chapters[i]!;
+          const audioOnly = !mediaInfo.visualAvailable;
           const clipPath = join(
             localReservation.outputDir,
-            `${contentItemId}_${attemptSuffix}_chapter_${i}.mp4`,
+            `${contentItemId}_${attemptSuffix}_chapter_${i}.${audioOnly ? "m4a" : "mp4"}`,
           );
           const startSec = chapter.start_ms / 1000;
           const durationSec = Math.max(
             1,
             (chapter.end_ms - chapter.start_ms) / 1000,
           );
-          const cut = await withResourceLease(
-            "software_encode",
-            "required",
-            () =>
+          let audioLadder: UploadedAudioLadderRendition[] = [];
+          const produceChapterAudioLadder = async () => {
+            audioLadder = await withResourceLease(
+              "software_encode",
+              "required",
+              () =>
+                createAndUploadAudioDeliveryLadder({
+                  tenantId: input.item.tenant_id,
+                  parentContentItemId: contentItemId,
+                  atomizationGenerationId: generationResponse.generation.id,
+                  atomizationChapterUnitId: unitId,
+                  attemptId: governed?.attemptId,
+                  fenceToken: unitClaim.unit.fence_token ?? undefined,
+                  sourcePath: parentDownload.filePath,
+                  sourceInfo: mediaInfo,
+                  allowSourcePassthrough: false,
+                  outputDir: localReservation!.outputDir,
+                  outputBaseName: `${contentItemId}-${attemptSuffix}-chapter-${i}-audio`,
+                  storagePrefix: `content/${unitArtifactPrefix}`,
+                  artifactRole: "delivery_audio",
+                  creatorRole: "aggregation-media-executor",
+                  inputDigest: createHash("sha256")
+                    .update(`${planDigest}:${i}:audio-ladder`)
+                    .digest("hex"),
+                  startSec,
+                  durationSec,
+                  signal,
+                }),
+            );
+            for (const audio of audioLadder) {
+              if (!audio.localPath) continue;
+              chapterTempFiles.push(audio.localPath);
+              tempFiles.push(audio.localPath);
+            }
+          };
+          let cut: { outputPath: string; duration: number };
+          if (audioOnly) {
+            await produceChapterAudioLadder();
+            const preferred = preferredAudioRendition(audioLadder);
+            cut = {
+              outputPath: preferred.localPath!,
+              duration: preferred.duration,
+            };
+          } else {
+            cut = await withResourceLease("software_encode", "required", () =>
               cutMediaSegment(
                 parentDownload.filePath,
                 clipPath,
@@ -327,9 +389,12 @@ export const atomizationWorker = createWorker({
                 undefined,
                 { signal },
               ),
-          );
-          chapterTempFiles.push(clipPath);
-          tempFiles.push(clipPath); // final safety net if this chapter throws
+            );
+            chapterTempFiles.push(clipPath);
+            tempFiles.push(clipPath); // final safety net if this chapter throws
+            if (deliveryPolicy.generate_audio_alternate !== false)
+              await produceChapterAudioLadder();
+          }
           if (governed && i === 0)
             await cmsClient.checkpointAtomizationWork(
               { ...governed, phase: "first_cut", proof: { chapter_index: 0 } },
@@ -337,82 +402,142 @@ export const atomizationWorker = createWorker({
             );
 
           currentPhase = "renditions";
-          const mp4Key = getStorageKey(
-            unitArtifactPrefix,
-            "processed",
-            "mp4",
-          );
-          const mp4Upload = await uploadFileWithManifest(
-            {
-              tenantId: input.item.tenant_id,
-              parentContentItemId: contentItemId,
-              atomizationGenerationId: generationResponse.generation.id,
-              atomizationChapterUnitId: unitId,
-              attemptId: governed?.attemptId,
-              artifactRole: "chapter_media",
-              key: mp4Key,
-              filePath: clipPath,
-              contentType: "video/mp4",
-              inputDigest: createHash("sha256")
-                .update(`${planDigest}:${i}`)
-                .digest("hex"),
-              fenceToken: unitClaim.unit.fence_token ?? undefined,
-              creatorRole: "aggregation-media-executor",
-            },
-            signal,
-          );
+          const preferredChapterAudio =
+            audioLadder.length > 0
+              ? preferredAudioRendition(audioLadder)
+              : undefined;
+          const mp4Upload = audioOnly
+            ? preferredChapterAudio!
+            : await uploadFileWithManifest(
+                {
+                  tenantId: input.item.tenant_id,
+                  parentContentItemId: contentItemId,
+                  atomizationGenerationId: generationResponse.generation.id,
+                  atomizationChapterUnitId: unitId,
+                  attemptId: governed?.attemptId,
+                  artifactRole: "delivery_progressive",
+                  key: getStorageKey(unitArtifactPrefix, "processed", "mp4"),
+                  filePath: clipPath,
+                  contentType: "video/mp4",
+                  inputDigest: createHash("sha256")
+                    .update(`${planDigest}:${i}`)
+                    .digest("hex"),
+                  fenceToken: unitClaim.unit.fence_token ?? undefined,
+                  creatorRole: "aggregation-media-executor",
+                },
+                signal,
+              );
           const mp4Url = mp4Upload.url;
-          const renditions: MediaRendition[] = [
-            {
-              type: "mp4",
-              url: mp4Url,
-              has_video: mediaInfo.hasVideo,
-              mime_type: "video/mp4",
-              is_primary: false,
-            },
-          ];
+          const renditions: MediaRendition[] = audioOnly
+            ? audioLadder.map((audio) => ({
+                schema_version: 2,
+                id: createHash("sha256")
+                  .update(
+                    `${generationResponse.generation.id}:${unitId}:audio:${audio.tier}:${audio.manifestId}`,
+                  )
+                  .digest("hex"),
+                role: "native_audio",
+                type: "audio",
+                url: audio.url,
+                has_video: false,
+                mime_type: audio.mimeType,
+                container: audio.container,
+                codec: audio.codec,
+                codecs: audio.codec === "aac" ? "mp4a.40.2" : audio.codec,
+                quality_tier: audio.tier,
+                bitrate_kbps: audio.bitrateKbps,
+                manifest_id: audio.manifestId,
+                is_primary:
+                  audio.manifestId === preferredChapterAudio?.manifestId,
+              }))
+            : [
+                {
+                  type: "mp4",
+                  url: mp4Url,
+                  has_video: true,
+                  mime_type: "video/mp4",
+                  quality_tier: "standard",
+                  manifest_id: mp4Upload.manifestId,
+                  is_primary: false,
+                },
+                ...audioLadder.map((audio) => ({
+                  schema_version: 2,
+                  id: createHash("sha256")
+                    .update(
+                      `${generationResponse.generation.id}:${unitId}:audio:${audio.tier}:${audio.manifestId}`,
+                    )
+                    .digest("hex"),
+                  role: "native_audio",
+                  type: "audio",
+                  url: audio.url,
+                  has_video: false,
+                  mime_type: audio.mimeType,
+                  container: audio.container,
+                  codec: audio.codec,
+                  codecs: audio.codec === "aac" ? "mp4a.40.2" : audio.codec,
+                  quality_tier: audio.tier,
+                  bitrate_kbps: audio.bitrateKbps,
+                  manifest_id: audio.manifestId,
+                  is_primary: false,
+                })),
+              ];
 
           let primaryUrl = mp4Url;
-          let primaryType = "mp4";
+          let primaryType = audioOnly ? "audio" : "mp4";
           let hlsUploadManifestIds: string[] = [];
           try {
-            const hlsDir = join(localReservation.hlsDir, `chapter_${i}`);
-            chapterTempDirs.push(hlsDir);
-            tempDirs.push(hlsDir); // final safety net if this chapter throws
-            const hls = await createHlsVod(clipPath, hlsDir, undefined, {
-              signal,
-            });
-            const hlsUpload = await uploadHlsDirectory(
-              hlsDir,
-              unitArtifactPrefix,
-              signal,
-              {
-                tenantId: input.item.tenant_id,
-                parentContentItemId: contentItemId,
-                atomizationGenerationId: generationResponse.generation.id,
-                atomizationChapterUnitId: unitId,
-                attemptId: governed?.attemptId,
-                inputDigest: createHash("sha256")
-                  .update(`${planDigest}:${i}:hls`)
-                  .digest("hex"),
-                fenceToken: unitClaim.unit.fence_token ?? undefined,
-              },
-            );
-            hlsUploadManifestIds = hlsUpload.manifestIds;
-            primaryUrl = hlsUpload.url || mp4Url;
-            primaryType = hlsUpload.url ? "hls" : "mp4";
-            if (hlsUpload.url) {
-              renditions.unshift({
-                type: "hls",
-                url: hlsUpload.url,
-                has_video: mediaInfo.hasVideo,
-                mime_type: "application/vnd.apple.mpegurl",
-                is_primary: true,
-              });
-            }
-            if (hls.duration > 0) {
-              chapter.end_ms =
-                chapter.start_ms + Math.round(hls.duration * 1000);
+            if (audioOnly) {
+              // The preferred Standard-or-lower native-audio rendition was
+              // marked above. Do not also promote the first (Data Saver) tier.
+            } else if (chapterUsesAdaptiveHls) {
+              const hlsDir = join(localReservation.hlsDir, `chapter_${i}`);
+              chapterTempDirs.push(hlsDir);
+              tempDirs.push(hlsDir); // final safety net if this chapter throws
+              const hls = await withResourceLease(
+                "media_io_package",
+                "required",
+                () => createAdaptiveHlsPackage(clipPath, hlsDir, { signal }),
+              );
+              const validation = await withResourceLease(
+                "media_io_package",
+                "required",
+                () => validateAdaptiveHlsPackage(hlsDir),
+              );
+              const hlsUpload = await withResourceLease(
+                "media_io_package",
+                "required",
+                () =>
+                  uploadHlsDirectory(hlsDir, unitArtifactPrefix, signal, {
+                    tenantId: input.item.tenant_id,
+                    parentContentItemId: contentItemId,
+                    atomizationGenerationId: generationResponse.generation.id,
+                    atomizationChapterUnitId: unitId,
+                    attemptId: governed?.attemptId,
+                    inputDigest: createHash("sha256")
+                      .update(`${planDigest}:${i}:hls`)
+                      .digest("hex"),
+                    fenceToken: unitClaim.unit.fence_token ?? undefined,
+                  }),
+              );
+              hlsUploadManifestIds = hlsUpload.manifestIds;
+              primaryUrl = hlsUpload.url || mp4Url;
+              primaryType = hlsUpload.url ? "hls" : "mp4";
+              if (hlsUpload.url) {
+                renditions.unshift({
+                  type: "hls",
+                  url: hlsUpload.url,
+                  has_video: mediaInfo.hasVideo,
+                  mime_type: "application/vnd.apple.mpegurl",
+                  validation_evidence: validation.evidence,
+                  is_primary: true,
+                });
+              }
+              if (hls.duration > 0) {
+                chapter.end_ms =
+                  chapter.start_ms + Math.round(hls.duration * 1000);
+              }
+            } else {
+              renditions[0]!.is_primary = true;
             }
           } catch (hlsError) {
             jobLogger.warn("HLS rendition failed; using MP4 fallback", {
@@ -431,7 +556,9 @@ export const atomizationWorker = createWorker({
               localReservation.outputDir,
               `${contentItemId}_${attemptSuffix}_chapter_${i}.jpg`,
             );
-            await extractThumbnail(clipPath, thumbPath, 1, 360, { signal });
+            await extractThumbnail(cut.outputPath, thumbPath, 1, 360, {
+              signal,
+            });
             chapterTempFiles.push(thumbPath);
             tempFiles.push(thumbPath); // final safety net if this chapter throws
             const thumbKey = getStorageKey(
@@ -483,7 +610,7 @@ export const atomizationWorker = createWorker({
             playback_url: primaryUrl,
             playback_type: primaryType,
             fallback_playback_url: mp4Url,
-            has_video: mediaInfo.hasVideo,
+            has_video: !audioOnly,
             media_renditions: renditions,
             transcript_segments: transcriptSegments,
             transcript_text: transcriptSegments
@@ -498,9 +625,12 @@ export const atomizationWorker = createWorker({
               claim_token: unitToken,
               result: children[children.length - 1],
               artifact_manifest_ids: [
-                mp4Upload.manifestId,
-                ...hlsUploadManifestIds,
-                ...(thumbManifestId ? [thumbManifestId] : []),
+                ...new Set([
+                  mp4Upload.manifestId,
+                  ...audioLadder.map((audio) => audio.manifestId),
+                  ...hlsUploadManifestIds,
+                  ...(thumbManifestId ? [thumbManifestId] : []),
+                ]),
               ],
             },
             job.id,
@@ -684,68 +814,9 @@ interface ResolvedParentMedia {
 }
 
 function storageTierFromInput(input: AtomizationInputResponse): StorageTier {
-  return input.item.storage_tier === "cold" ? "cold" : "primary";
-}
-
-function keyFromPublicUrl(url: string | null | undefined): string | undefined {
-  if (!url) return undefined;
-  const publicRoots = [
-    config.storagePublicUrl,
-    config.coldStoragePublicUrl,
-  ].filter((value): value is string => Boolean(value));
-  for (const root of publicRoots) {
-    const normalizedRoot = root.replace(/\/$/, "");
-    if (url.startsWith(`${normalizedRoot}/`)) {
-      return decodeURIComponent(
-        url.slice(normalizedRoot.length + 1).split("?")[0] ?? "",
-      );
-    }
-  }
-  try {
-    const parsed = new URL(url);
-    const path = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
-    const contentIndex = path.indexOf("content/");
-    return contentIndex >= 0 ? path.slice(contentIndex) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function versionedProcessedKey(contentItemId: string, version: number): string {
-  if (version > 1) {
-    return `content/${contentItemId}/processed.v${version}.mp4`;
-  }
-  return getStorageKey(contentItemId, "processed", "mp4");
-}
-
-function sourceMediaKeyCandidates(input: AtomizationInputResponse): string[] {
-  const keys = [
-    keyFromPublicUrl(input.item.media_url),
-    keyFromPublicUrl(input.item.playback_url),
-    keyFromPublicUrl(input.item.fallback_playback_url),
-  ];
-  const version = Math.max(1, input.item.media_version ?? 1);
-  for (let v = version; v >= 1; v -= 1) {
-    keys.push(versionedProcessedKey(input.item.id, v));
-  }
-  keys.push(getStorageKey(input.item.id, "processed", "mp4"));
-  return Array.from(new Set(keys.filter((key): key is string => Boolean(key))));
-}
-
-function processedVersionFromKey(key: string): number {
-  const match = key.match(/\/processed\.v(\d+)\.[^/]+$/);
-  if (!match) return key.includes("/processed.") ? 1 : 0;
-  return Number.parseInt(match[1]!, 10) || 0;
-}
-
-function fallbackObjectScore(key: string): number {
-  if (/\/processed\.v\d+\.(mp4|mov|m4v|webm)$/i.test(key)) {
-    return 1000 + processedVersionFromKey(key);
-  }
-  if (/\/processed\.(mp4|mov|m4v|webm)$/i.test(key)) return 900;
-  if (/\/original\.(mp4|mov|m4v|webm)$/i.test(key)) return 700;
-  if (/\/audio\.(m4a|mp3|aac|wav|opus)$/i.test(key)) return 500;
-  return 0;
+  return input.item.source_manifest_storage_tier === "cold"
+    ? "cold"
+    : "primary";
 }
 
 function extensionFromKeyOrUrl(value: string): string {
@@ -755,107 +826,28 @@ function extensionFromKeyOrUrl(value: string): string {
   return ext && /^[a-z0-9]+$/i.test(ext) ? ext.toLowerCase() : "mp4";
 }
 
-function playbackTypeFromExtension(extension: string): "mp4" | "audio" {
-  return ["m4a", "mp3", "aac", "wav", "opus"].includes(extension)
-    ? "audio"
-    : "mp4";
-}
-
 async function resolveParentMediaForAtomization(
   input: AtomizationInputResponse,
-  jobLogger: {
-    warn: (message: string, data?: Record<string, unknown>) => void;
-  },
 ): Promise<ResolvedParentMedia> {
-  const directUrl = input.item.media_url;
-  if (!directUrl) {
-    throw new Error(`Parent ${input.item.id} has no media_url`);
+  const directUrl = input.item.source_manifest_url;
+  const manifestKey = input.item.source_manifest_key;
+  if (!directUrl || !manifestKey || !input.item.source_manifest_id) {
+    throw new Error(`Parent ${input.item.id} has no verified source manifest`);
   }
 
   const tier = storageTierFromInput(input);
-  for (const key of sourceMediaKeyCandidates(input)) {
-    if (await objectExists(key, tier)) {
-      const url = getPublicUrl(key, tier);
-      if (url !== directUrl) {
-        jobLogger.warn("Resolved stale parent media URL before atomization", {
-          contentItemId: input.item.id,
-          storedUrl: directUrl,
-          resolvedUrl: url,
-          key,
-          tier,
-        });
-        await refreshCmsParentMediaArtifact(input, url, tier, jobLogger);
-      }
-      return { url, key, tier, extension: extensionFromKeyOrUrl(key) };
-    }
-  }
-
-  const fallback = (await listContentObjects(input.item.id, tier))
-    .map((obj) => obj.Key ?? "")
-    .filter(Boolean)
-    .map((key) => ({ key, score: fallbackObjectScore(key) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key))[0];
-
-  if (fallback) {
-    const url = getPublicUrl(fallback.key, tier);
-    jobLogger.warn(
-      "Resolved parent media URL from storage listing before atomization",
-      {
-        contentItemId: input.item.id,
-        storedUrl: directUrl,
-        resolvedUrl: url,
-        key: fallback.key,
-        tier,
-      },
-    );
-    await refreshCmsParentMediaArtifact(input, url, tier, jobLogger);
+  if (await objectExists(manifestKey, tier)) {
     return {
-      url,
-      key: fallback.key,
+      url: directUrl,
+      key: manifestKey,
       tier,
-      extension: extensionFromKeyOrUrl(fallback.key),
+      extension: extensionFromKeyOrUrl(manifestKey),
     };
   }
 
-  jobLogger.warn(
-    "Could not verify parent media in storage before atomization; using CMS media_url",
-    {
-      contentItemId: input.item.id,
-      mediaUrl: directUrl,
-      tier,
-    },
+  throw new Error(
+    `Verified source manifest object is unavailable for ${input.item.id}`,
   );
-  return { url: directUrl, tier, extension: extensionFromKeyOrUrl(directUrl) };
-}
-
-async function refreshCmsParentMediaArtifact(
-  input: AtomizationInputResponse,
-  resolvedUrl: string,
-  tier: StorageTier,
-  jobLogger: {
-    warn: (message: string, data?: Record<string, unknown>) => void;
-  },
-): Promise<void> {
-  try {
-    await cmsClient.updateArtifacts(input.item.id, {
-      media_url: resolvedUrl,
-      playback_url: resolvedUrl,
-      fallback_playback_url: resolvedUrl,
-      playback_type: playbackTypeFromExtension(
-        extensionFromKeyOrUrl(resolvedUrl),
-      ),
-      storage_tier: tier,
-    });
-  } catch (error) {
-    jobLogger.warn(
-      "Resolved parent media but failed to refresh CMS artifact URLs",
-      {
-        contentItemId: input.item.id,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-    );
-  }
 }
 
 async function uploadHlsDirectory(
@@ -875,9 +867,17 @@ async function uploadHlsDirectory(
   const files = await readdir(dir);
   let playlistUrl: string | undefined;
   const manifestIds: string[] = [];
-  const uploadable: Array<{ file: string; path: string; contentType: string }> =
-    [];
+  const uploadable: Array<{
+    file: string;
+    path: string;
+    contentType: string;
+    cacheControl: string;
+  }> = [];
   for (const file of files) {
+    // The progressive fallback is uploaded as its own rendition, never as an
+    // HLS segment. (The current chapter MP4 remains the compatibility
+    // fallback while old active generations coexist.)
+    if (file === "fallback.mp4") continue;
     const path = join(dir, file);
     if (!(await stat(path)).isFile()) continue;
     uploadable.push({
@@ -885,12 +885,33 @@ async function uploadHlsDirectory(
       path,
       contentType: file.endsWith(".m3u8")
         ? "application/vnd.apple.mpegurl"
-        : "video/mp2t",
+        : file.endsWith(".m4s")
+          ? "video/iso.segment"
+          : file.endsWith("_init.mp4")
+            ? "video/mp4"
+            : "application/octet-stream",
+      cacheControl: file.endsWith(".m3u8")
+        ? "no-cache, max-age=0, must-revalidate"
+        : "public, max-age=31536000, immutable",
     });
   }
 
-  for (let i = 0; i < uploadable.length; i += HLS_UPLOAD_CONCURRENCY) {
-    const batch = uploadable.slice(i, i + HLS_UPLOAD_CONCURRENCY);
+  // The master is the package identity. Upload and verify it first, then bind
+  // every owned playlist/init/segment manifest to that immutable identity.
+  uploadable.sort(
+    (left, right) =>
+      Number(right.file === "master.m3u8") -
+      Number(left.file === "master.m3u8"),
+  );
+  let packageManifestId: string | undefined;
+  for (let i = 0; i < uploadable.length;) {
+    // Keep the package root out of the concurrent first batch so children
+    // cannot be persisted with a missing package_manifest_id.
+    const size =
+      i === 0 && uploadable[0]?.file === "master.m3u8"
+        ? 1
+        : HLS_UPLOAD_CONCURRENCY;
+    const batch = uploadable.slice(i, i + size);
     const urls = await Promise.all(
       batch.map(async (item) => {
         const key = `content/${keyPrefix}/hls/${item.file}`;
@@ -898,10 +919,20 @@ async function uploadHlsDirectory(
           ? await uploadFileWithManifest(
               {
                 ...manifestContext,
-                artifactRole: "chapter_hls",
+                artifactRole:
+                  item.file === "master.m3u8"
+                    ? "hls_master"
+                    : item.file.endsWith(".m3u8")
+                      ? "hls_playlist"
+                      : item.file.endsWith("_init.mp4")
+                        ? "hls_init"
+                        : "hls_segment",
+                packageManifestId:
+                  item.file === "master.m3u8" ? undefined : packageManifestId,
                 key,
                 filePath: item.path,
                 contentType: item.contentType,
+                cacheControl: item.cacheControl,
                 creatorRole: "aggregation-media-executor",
               },
               signal,
@@ -915,14 +946,19 @@ async function uploadHlsDirectory(
             item.contentType,
             "primary",
             signal,
+            item.cacheControl,
           ));
         return { file: item.file, url, manifestId: manifestUpload?.manifestId };
       }),
     );
     for (const item of urls) {
-      if (item.file.endsWith(".m3u8")) playlistUrl = item.url;
-      if (item.manifestId) manifestIds.push(item.manifestId);
+      if (item.file === "master.m3u8") playlistUrl = item.url;
+      if (item.manifestId) {
+        manifestIds.push(item.manifestId);
+        if (item.file === "master.m3u8") packageManifestId = item.manifestId;
+      }
     }
+    i += size;
   }
   return { url: playlistUrl, manifestIds };
 }

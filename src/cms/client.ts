@@ -54,6 +54,7 @@ import type {
   TranscriptionSegmentUnit,
   AtomizationGeneration,
   AtomizationChapterUnit,
+  MediaRenditionGeneration,
 } from "./types.js";
 import {
   sourceRunDispatchClaimSchema,
@@ -543,6 +544,7 @@ export const cmsClient = {
       | "media_download"
       | "media_transcode"
       | "media_thumbnail"
+      | "media_delivery_generation"
       | "text_embedding";
     contentItemId: string;
     itemVersion: string;
@@ -580,6 +582,7 @@ export const cmsClient = {
           "media_download",
           "media_transcode",
           "media_thumbnail",
+          "media_delivery_generation",
           "text_embedding",
         ]),
         content_item_id: z.string().uuid(),
@@ -1865,6 +1868,117 @@ export const cmsClient = {
       parentSignal,
     );
   },
+  async resolveMediaDeliveryPolicy(
+    params: {
+      tenant_id: string;
+      source_type: string;
+      media_kind: "audio" | "video";
+      suitability?: string;
+      short_form?: boolean;
+    },
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{
+    policy: import("./types.js").MediaDeliveryPolicy;
+    matched_on: string;
+  }> {
+    const query = new URLSearchParams({
+      tenant_id: params.tenant_id,
+      source_type: params.source_type,
+      media_kind: params.media_kind,
+    });
+    if (params.suitability) query.set("suitability", params.suitability);
+    if (params.short_form === false) query.set("short_form", "false");
+    return makeProtectedRequest(
+      "GET",
+      `/media-delivery/policies/resolve?${query.toString()}`,
+      undefined,
+      requestId,
+      parentSignal,
+    );
+  },
+  async createMediaRenditionGeneration(
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<MediaRenditionGeneration> {
+    return makeProtectedRequest<MediaRenditionGeneration>(
+      "POST",
+      "/media-rendition-generations",
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async transitionMediaRenditionGeneration(
+    id: string,
+    state: "running" | "verifying" | "failed" | "uncertain",
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<MediaRenditionGeneration> {
+    return makeProtectedRequest<MediaRenditionGeneration>(
+      "POST",
+      `/media-rendition-generations/${encodeURIComponent(id)}/${state}`,
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async activateMediaRenditionGeneration(
+    id: string,
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<MediaRenditionGeneration> {
+    return makeProtectedRequest<MediaRenditionGeneration>(
+      "POST",
+      `/media-rendition-generations/${encodeURIComponent(id)}/activate`,
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async createMediaHLSPackage(
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<import("./types.js").MediaHLSPackage> {
+    return makeProtectedRequest(
+      "POST",
+      "/media-hls-packages",
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async verifyMediaHLSPackage(
+    id: string,
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<import("./types.js").MediaHLSPackage> {
+    return makeProtectedRequest(
+      "POST",
+      `/media-hls-packages/${encodeURIComponent(id)}/verify`,
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
+  async createMediaHLSAccessPoint(
+    input: Record<string, unknown>,
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<import("./types.js").MediaHLSAccessPoint> {
+    return makeProtectedRequest(
+      "POST",
+      "/media-hls-access-points",
+      input,
+      requestId,
+      parentSignal,
+    );
+  },
   async createTranscriptionGeneration(
     input: Record<string, unknown>,
     requestId?: string,
@@ -1878,9 +1992,7 @@ export const cmsClient = {
       parentSignal,
     );
   },
-  async claimTranscriptionSegment(
-    requestId?: string,
-  ): Promise<{
+  async claimTranscriptionSegment(requestId?: string): Promise<{
     unit: TranscriptionSegmentUnit;
     generation: TranscriptionGeneration;
   } | null> {

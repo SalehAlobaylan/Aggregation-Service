@@ -25,7 +25,18 @@ export interface ManifestUploadInput {
     | "chapter_media"
     | "chapter_hls"
     | "thumbnail"
-    | "transcript_segment";
+    | "transcript_segment"
+    | "playback_audio"
+    | "playback_mp4"
+    | "delivery_audio"
+    | "delivery_progressive"
+    | "hls_master"
+    | "hls_access_master"
+    | "hls_playlist"
+    | "hls_init"
+    | "hls_segment";
+  packageManifestId?: string;
+  cacheControl?: string;
   key: string;
   filePath: string;
   contentType: string;
@@ -64,7 +75,13 @@ function normalizeEtag(value: string | undefined): string {
 
 function verifyProviderMetadata(
   metadata: Awaited<ReturnType<typeof getObjectMetadata>>,
-  expected: { bytes: number; contentType: string; md5?: string; etag?: string },
+  expected: {
+    bytes: number;
+    contentType: string;
+    cacheControl?: string;
+    md5?: string;
+    etag?: string;
+  },
 ): void {
   if (!metadata.exists || metadata.size !== expected.bytes) {
     throw new Error(
@@ -76,6 +93,14 @@ function verifyProviderMetadata(
   if (expectedType && providerType && expectedType !== providerType) {
     throw new Error(
       `manifest provider content-type mismatch: expected ${expectedType}, got ${providerType}`,
+    );
+  }
+  if (
+    expected.cacheControl &&
+    (metadata.cacheControl ?? "").trim() !== expected.cacheControl.trim()
+  ) {
+    throw new Error(
+      `manifest provider cache-control mismatch for ${expected.bytes} bytes`,
     );
   }
   const providerEtag = normalizeEtag(metadata.etag);
@@ -118,11 +143,13 @@ export async function uploadFileWithManifest(
       transcription_segment_unit_id: input.transcriptionSegmentUnitId,
       attempt_id: input.attemptId,
       artifact_role: input.artifactRole,
+      package_manifest_id: input.packageManifestId,
       storage_tier: tier,
       bucket,
       object_key: input.key,
       public_url: url,
       content_type: input.contentType,
+      cache_control: input.cacheControl,
       size_bytes: bytes,
       sha256: digest.sha256,
       creator_role: input.creatorRole,
@@ -139,6 +166,7 @@ export async function uploadFileWithManifest(
       verifyProviderMetadata(metadata, {
         bytes,
         contentType: input.contentType,
+        cacheControl: input.cacheControl,
         md5: undefined,
         etag: manifest.etag ?? undefined,
       });
@@ -156,11 +184,13 @@ export async function uploadFileWithManifest(
       input.contentType,
       tier,
       signal,
+      input.cacheControl,
     );
     const metadata = await getObjectMetadata(input.key, tier, signal);
     verifyProviderMetadata(metadata, {
       bytes,
       contentType: input.contentType,
+      cacheControl: input.cacheControl,
       md5: digest.md5,
     });
     await cmsClient.transitionArtifactManifest(
