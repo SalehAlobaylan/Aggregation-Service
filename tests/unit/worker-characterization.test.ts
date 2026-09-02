@@ -128,6 +128,7 @@ vi.mock("../../src/runtime/local-reservations.js", () => ({
 
 vi.mock("../../src/runtime/resource-admission.js", () => ({
   ResourceDeferredError: class ResourceDeferredError extends Error {},
+  mergeAbortSignals: (first?: AbortSignal, second?: AbortSignal) => second ?? first,
   withResourceLease: async (
     _workload: string,
     _lane: string,
@@ -161,7 +162,8 @@ vi.mock("../../src/cms/upsert.js", () => ({
 const { createLegacyMediaWorker } =
   await import("../../src/workers/media.worker.js");
 createLegacyMediaWorker();
-await import("../../src/workers/normalize.worker.js");
+const { createNormalizeWorker } = await import("../../src/workers/normalize.worker.js");
+createNormalizeWorker();
 
 const mediaQueueName = "media-queue";
 const normalizeQueueName = "normalize-queue";

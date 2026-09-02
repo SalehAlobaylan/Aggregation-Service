@@ -23,6 +23,8 @@ export interface LocalReservation {
   outputDir: string;
   hlsDir: string;
   metadataDir: string;
+  /** Aborts owned media work when the Redis scratch lease disappears. */
+  signal?: AbortSignal;
   heartbeat(): Promise<boolean>;
   release(): Promise<void>;
 }
@@ -145,33 +147,33 @@ export async function reserveLocalScratch(
     throw error;
   }
   const metaKey = `${reservationKeyValue}:meta`;
-  await redis.hset(metaKey, {
-    attempt_id: safeAttempt,
-    content_id: metadata.contentId ?? "",
-    resource_domain_id:
-      metadata.resourceDomainId ??
-      process.env.RESOURCE_DOMAIN?.trim() ??
-      "local",
-    expected_bytes: String(Math.max(1, Math.ceil(requestedBytes))),
-    current_free_bytes: String(Math.max(0, Math.floor(available))),
-    already_reserved_bytes: String(Number(result?.[1] ?? 0)),
-    owner_role: metadata.ownerRole ?? process.env.ROLE?.trim() ?? "aggregation",
-    process_id: String(process.pid),
-  });
-  await redis.pexpire(metaKey, RESERVATION_TTL_MS);
+  try {
+    await redis.hset(metaKey, {
+      attempt_id: safeAttempt,
+      content_id: metadata.contentId ?? "",
+      resource_domain_id:
+        metadata.resourceDomainId ??
+        process.env.RESOURCE_DOMAIN?.trim() ??
+        "local",
+      expected_bytes: String(Math.max(1, Math.ceil(requestedBytes))),
+      current_free_bytes: String(Math.max(0, Math.floor(available))),
+      already_reserved_bytes: String(Number(result?.[1] ?? 0)),
+      owner_role: metadata.ownerRole ?? process.env.ROLE?.trim() ?? "aggregation",
+      process_id: String(process.pid),
+    });
+    await redis.pexpire(metaKey, RESERVATION_TTL_MS);
+  } catch (error) {
+    await redis.eval(RELEASE, 3, totalKey(), reservationKeyValue, attemptKey(safeAttempt), id).catch(() => undefined);
+    await redis.del(metaKey).catch(() => undefined);
+    await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
   let released = false;
-  return {
-    id,
-    attemptId: safeAttempt,
-    root,
-    sourceDir,
-    outputDir,
-    hlsDir,
-    metadataDir,
-    async heartbeat(): Promise<boolean> {
-      if (released) return false;
-      await redis.pexpire(metaKey, RESERVATION_TTL_MS);
-      return Number(await redis.eval(
+  const reservationAbort = new AbortController();
+  const renew = async (): Promise<boolean> => {
+    if (released) return false;
+    try {
+      const ok = Number(await redis.eval(
         HEARTBEAT,
         3,
         totalKey(),
@@ -180,13 +182,46 @@ export async function reserveLocalScratch(
         RESERVATION_TTL_MS,
         id,
       )) === 1;
+      if (ok) await redis.pexpire(metaKey, RESERVATION_TTL_MS);
+      if (!ok && !reservationAbort.signal.aborted) {
+        reservationAbort.abort(new Error("local scratch reservation lease lost"));
+      }
+      return ok;
+    } catch {
+      if (!reservationAbort.signal.aborted) {
+        reservationAbort.abort(new Error("local scratch reservation heartbeat failed"));
+      }
+      return false;
+    }
+  };
+  // Reservation ownership is self-renewing. Callers still receive heartbeat()
+  // for explicit checks, but a long encode must not silently lose its disk
+  // budget merely because no worker phase happened inside the TTL window.
+  const heartbeatTimer = setInterval(() => void renew(), RESERVATION_TTL_MS / 3);
+  heartbeatTimer.unref();
+  return {
+    id,
+    attemptId: safeAttempt,
+    root,
+    sourceDir,
+    outputDir,
+    hlsDir,
+    metadataDir,
+    signal: reservationAbort.signal,
+    async heartbeat(): Promise<boolean> {
+      return renew();
     },
     async release(): Promise<void> {
       if (released) return;
       released = true;
-      await redis.eval(RELEASE, 3, totalKey(), reservationKeyValue, attemptKey(safeAttempt), id);
-      await redis.del(metaKey);
-      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+      clearInterval(heartbeatTimer);
+      if (!reservationAbort.signal.aborted) reservationAbort.abort(new Error("local scratch reservation released"));
+      try {
+        await redis.eval(RELEASE, 3, totalKey(), reservationKeyValue, attemptKey(safeAttempt), id);
+        await redis.del(metaKey);
+      } finally {
+        await rm(root, { recursive: true, force: true }).catch(() => undefined);
+      }
     },
   };
 }

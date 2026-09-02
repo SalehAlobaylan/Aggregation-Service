@@ -11,7 +11,7 @@ const VERIFICATION_INTERVAL_MS = 10_000;
 // This worker has no provider client and cannot retry a source effect. CMS
 // chooses one already-uncertain task, rebuilds authoritative read evidence,
 // and writes the fenced reconciliation event itself.
-export const sourceRunVerificationWorker = createWorker({
+export const createSourceRunVerificationWorker = () => createWorker({
   queueName: QUEUE_NAMES.SOURCE_RUN_VERIFICATION,
   concurrency: 1,
   shouldDeadLetter: () => false,

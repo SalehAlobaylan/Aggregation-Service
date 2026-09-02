@@ -6,34 +6,27 @@ import { getRedisConnection } from './redis.js';
 import { QUEUE_NAMES, type QueueName } from './schemas.js';
 import { logger } from '../observability/logger.js';
 import { queueDepth, dlqSize, maintenanceQueueDepth, mediaEligibleWorkAge } from '../observability/metrics.js';
+import { resolveRoleTopology, type WorkerRole } from '../runtime/role-topology.js';
 
 // Store references to all queues
 const queues = new Map<QueueName, Queue>();
-export type QueueRuntimeRole = 'all' | 'intake-control' | 'news' | 'pods-control' | 'media-executor' | 'media-maintenance';
-
-const ROLE_QUEUES: Record<QueueRuntimeRole, readonly QueueName[]> = {
-    all: Object.values(QUEUE_NAMES),
-    'intake-control': [
-        QUEUE_NAMES.FETCH, QUEUE_NAMES.NORMALIZE, QUEUE_NAMES.AI,
-        QUEUE_NAMES.ATOMIZATION_SWEEP, QUEUE_NAMES.DISCOVERY,
-        QUEUE_NAMES.DISCOVERY_SWEEP, QUEUE_NAMES.SOURCE_GRAPH,
-        QUEUE_NAMES.NEWS_CIRCULATION, QUEUE_NAMES.MEDIA_CIRCULATION,
-        QUEUE_NAMES.SOURCE_RUN_DISPATCH, QUEUE_NAMES.SOURCE_RUN_VERIFICATION,
-        QUEUE_NAMES.LIFECYCLE_RECEIPTS, QUEUE_NAMES.DLQ,
-    ],
-    news: [QUEUE_NAMES.NEWS_ENRICHMENT, QUEUE_NAMES.NEWS_OPTIONAL, QUEUE_NAMES.NEWS_STAGE_DLQ],
-    'pods-control': [QUEUE_NAMES.PODS_COMPLETION, QUEUE_NAMES.PODS_OPTIONAL, QUEUE_NAMES.PODS_ATOMIZATION, QUEUE_NAMES.PODS_STAGE_DLQ],
-    'media-executor': [QUEUE_NAMES.MEDIA, QUEUE_NAMES.PODS_MEDIA, QUEUE_NAMES.ATOMIZATION, QUEUE_NAMES.AI, QUEUE_NAMES.PODS_STAGE_DLQ, QUEUE_NAMES.DLQ],
-    'media-maintenance': [QUEUE_NAMES.STORAGE_SWEEP, QUEUE_NAMES.RECONCILE, QUEUE_NAMES.QUALITY_REENCODE, QUEUE_NAMES.PIPELINE_REPAIR, QUEUE_NAMES.DLQ],
-};
+export type QueueRuntimeRole = WorkerRole;
+let initializedRole: QueueRuntimeRole | null = null;
 
 /**
  * Initialize all queues
  */
 export function initializeQueues(role: QueueRuntimeRole = 'all'): Map<QueueName, Queue> {
+    if (initializedRole) {
+        if (initializedRole !== role) {
+            throw new Error(`Queues already initialized for ${initializedRole}; cannot initialize ${role}`);
+        }
+        return queues;
+    }
     const connection = getRedisConnection();
+    const topology = resolveRoleTopology(role);
 
-	for (const queueName of ROLE_QUEUES[role]) {
+	for (const queueName of topology.queueClients) {
 		const durableStageQueue = new Set<string>([
 			QUEUE_NAMES.NEWS_ASSET,
 			QUEUE_NAMES.NEWS_ENRICHMENT,
@@ -43,6 +36,7 @@ export function initializeQueues(role: QueueRuntimeRole = 'all'): Map<QueueName,
 			QUEUE_NAMES.PODS_OPTIONAL,
 			QUEUE_NAMES.PODS_ATOMIZATION,
 		]).has(queueName);
+		const legacyAIQueue = queueName === QUEUE_NAMES.AI;
         const queue = new Queue(queueName, {
             connection,
             defaultJobOptions: {
@@ -51,7 +45,10 @@ export function initializeQueues(role: QueueRuntimeRole = 'all'): Map<QueueName,
                 attempts: durableStageQueue ? 1 : 3,
                 backoff: {
                     type: 'exponential',
-                    delay: 1000,
+					// Legacy AI work can outlive an Enrichment admission window.
+					// A one-second retry loop turns temporary saturation into a DLQ
+					// storm; durable stages defer through CMS instead.
+					delay: legacyAIQueue ? 30_000 : 1000,
                 },
                 removeOnComplete: {
                     age: 3600, // Keep completed jobs for 1 hour
@@ -66,6 +63,8 @@ export function initializeQueues(role: QueueRuntimeRole = 'all'): Map<QueueName,
         queues.set(queueName, queue);
         logger.info(`Queue initialized: ${queueName}`);
     }
+
+    initializedRole = role;
 
     return queues;
 }
@@ -82,6 +81,14 @@ export function getQueue(name: QueueName): Queue | undefined {
  */
 export function getAllQueues(): Map<QueueName, Queue> {
     return queues;
+}
+
+export function getInitializedQueueNames(): QueueName[] {
+    return [...queues.keys()];
+}
+
+export function getInitializedQueueRole(): QueueRuntimeRole | null {
+    return initializedRole;
 }
 
 /**
@@ -129,6 +136,7 @@ export async function closeQueues(): Promise<void> {
         logger.info(`Queue closed: ${name}`);
     }
     queues.clear();
+    initializedRole = null;
 }
 
 // Re-export schemas

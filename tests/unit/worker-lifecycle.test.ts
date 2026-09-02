@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => {
     on: ReturnType<typeof vi.fn>;
     pause: ReturnType<typeof vi.fn>;
     resume: ReturnType<typeof vi.fn>;
+    run: ReturnType<typeof vi.fn>;
   }> = [];
 
   const Worker = vi.fn(function WorkerMock(
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => {
       on: ReturnType<typeof vi.fn>;
       pause: ReturnType<typeof vi.fn>;
       resume: ReturnType<typeof vi.fn>;
+      run: ReturnType<typeof vi.fn>;
     },
     queueName: string,
   ) {
@@ -25,6 +27,7 @@ const mocks = vi.hoisted(() => {
       on: vi.fn(),
       pause: vi.fn().mockResolvedValue(undefined),
       resume: vi.fn().mockResolvedValue(undefined),
+      run: vi.fn(() => new Promise<void>(() => undefined)),
     };
     Object.assign(this, worker);
     workerInstances.push(this);
@@ -54,6 +57,8 @@ const mocks = vi.hoisted(() => {
       debug: vi.fn(),
     })),
     metric: { labels, inc: vi.fn(), observe: vi.fn(), set: vi.fn() },
+    queueRole: "all",
+    queueNames: [] as string[],
   };
 });
 
@@ -115,6 +120,8 @@ vi.mock("../../src/queues/index.js", async () => {
   return {
     ...actual,
     getQueue: vi.fn(() => undefined),
+    getInitializedQueueRole: vi.fn(() => mocks.queueRole),
+    getInitializedQueueNames: vi.fn(() => mocks.queueNames.length ? mocks.queueNames : Object.values(actual.QUEUE_NAMES)),
   };
 });
 
@@ -168,16 +175,20 @@ vi.mock("../../src/services/storage.service.js", () => ({
 
 vi.mock("../../src/workers/op-metrics-flush.worker.js", () => ({
   startOpMetricsFlush: vi.fn(),
+  stopOpMetricsFlush: vi.fn(),
 }));
 
 vi.mock("../../src/services/cloudflare-analytics.service.js", () => ({
   startCloudflareAnalyticsPuller: vi.fn(),
+  stopCloudflareAnalyticsPuller: vi.fn(),
 }));
 
 describe("worker lifecycle", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.workerInstances.length = 0;
+    mocks.queueRole = "all";
+    mocks.queueNames = [];
   });
 
   it("does not construct BullMQ workers when route and registry modules are imported", async () => {
@@ -204,6 +215,63 @@ describe("worker lifecycle", () => {
     expect(workers.getAllWorkers()).toEqual([]);
     for (const worker of mocks.workerInstances) {
       expect(worker.close).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("constructs and runs exactly the consumers declared for every explicit role", async () => {
+    const workers = await import("../../src/workers/index.js");
+    const { resolveRoleTopology, WORKER_ROLES } = await import("../../src/runtime/role-topology.js");
+
+    for (const role of WORKER_ROLES.filter((candidate) => candidate !== "all")) {
+      mocks.queueRole = role;
+      mocks.queueNames = [...resolveRoleTopology(role).queueClients];
+      await workers.startWorkers(role);
+      const expected = resolveRoleTopology(role).consumerQueues;
+      expect(workers.getAllWorkers().map((worker) => worker.name)).toEqual(expected);
+      expect(workers.getAllWorkers().every((worker) => mocks.workerInstances.includes(worker as never))).toBe(true);
+      for (const worker of workers.getAllWorkers()) {
+        expect((worker as unknown as { run: ReturnType<typeof vi.fn> }).run).toHaveBeenCalledTimes(1);
+      }
+      await workers.closeWorkers();
+      expect(workers.getAllWorkers()).toEqual([]);
+    }
+  });
+
+  it("rejects a conflicting role while preserving same-role startup idempotency", async () => {
+    const workers = await import("../../src/workers/index.js");
+    mocks.queueRole = "news";
+    mocks.queueNames = [...(await import("../../src/runtime/role-topology.js")).resolveRoleTopology("news").queueClients];
+    await workers.startWorkers("news");
+    const constructed = mocks.Worker.mock.calls.length;
+    await workers.startWorkers("news");
+    expect(mocks.Worker).toHaveBeenCalledTimes(constructed);
+    await expect(workers.startWorkers("media-executor")).rejects.toThrow("already active");
+    await workers.closeWorkers();
+  });
+
+  it("coalesces concurrent shutdown calls and closes each worker once", async () => {
+    const workers = await import("../../src/workers/index.js");
+    mocks.queueRole = "news";
+    mocks.queueNames = [...(await import("../../src/runtime/role-topology.js")).resolveRoleTopology("news").queueClients];
+    await workers.startWorkers("news");
+    await Promise.all([workers.closeWorkers(), workers.closeWorkers()]);
+    for (const worker of mocks.workerInstances) expect(worker.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a partially constructed cohort when a later factory fails", async () => {
+    const workers = await import("../../src/workers/index.js");
+    const { WORKER_DESCRIPTORS } = await import("../../src/runtime/role-topology.js");
+    const original = WORKER_DESCRIPTORS.normalize.loadFactory;
+    WORKER_DESCRIPTORS.normalize.loadFactory = async () => { throw new Error("factory unavailable"); };
+    mocks.queueRole = "intake-control";
+    mocks.queueNames = [...(await import("../../src/runtime/role-topology.js")).resolveRoleTopology("intake-control").queueClients];
+    try {
+      await expect(workers.startWorkers("intake-control")).rejects.toThrow("factory unavailable");
+      expect(workers.getAllWorkers()).toEqual([]);
+      expect(mocks.workerInstances).toHaveLength(1);
+      expect(mocks.workerInstances[0]?.close).toHaveBeenCalledTimes(1);
+    } finally {
+      WORKER_DESCRIPTORS.normalize.loadFactory = original;
     }
   });
 });

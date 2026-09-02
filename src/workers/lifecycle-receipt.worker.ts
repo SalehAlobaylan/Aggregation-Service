@@ -8,7 +8,7 @@ import { isDependencyDeferral } from '../observability/job-projection.js';
 // Delivery is intentionally a separate worker. A source executor may only
 // finish after this retained job has obtained CMS acknowledgement; retries
 // replay the identical event key and exact payload digest.
-export const lifecycleReceiptWorker = createWorker({
+export const createLifecycleReceiptWorker = () => createWorker({
   queueName: QUEUE_NAMES.LIFECYCLE_RECEIPTS,
   shouldDeadLetter: (job) => !('trigger' in (job.data as LifecycleReceiptJob | LifecycleReceiptActionJob)),
   shouldDeferFailure: (job, error) => 'trigger' in (job.data as LifecycleReceiptJob | LifecycleReceiptActionJob) && isDependencyDeferral(error),

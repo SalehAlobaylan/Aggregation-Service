@@ -1,58 +1,83 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({
-    isRedisConnected: vi.fn(),
-    ping: vi.fn(),
-    getWorkerLiveness: vi.fn(),
-    mandatoryWorkersHealthy: vi.fn(),
-    getAllWorkers: vi.fn(),
-}));
+const mocks = vi.hoisted(() => ({ localRoleReadiness: vi.fn() }));
+vi.mock("../../src/runtime/role-readiness.js", () => ({ localRoleReadiness: mocks.localRoleReadiness }));
+vi.mock("../../src/config/index.js", () => ({ config: { storageEndpoint: "" } }));
+vi.mock("../../src/observability/logger.js", () => ({ logger: { debug: vi.fn() } }));
 
-vi.mock('../../src/queues/redis.js', () => ({ isRedisConnected: mocks.isRedisConnected }));
-vi.mock('../../src/cms/client.js', () => ({
-    cmsClient: {
-        ping: mocks.ping,
-        // Deliberately present and OPEN-looking: readiness must not consult it.
-        getCircuitBreaker: () => ({ getState: () => 1 }),
-    },
-}));
-vi.mock('../../src/config/index.js', () => ({ config: { storageEndpoint: '' } }));
-vi.mock('../../src/observability/logger.js', () => ({ logger: { debug: vi.fn() } }));
-vi.mock('../../src/workers/index.js', () => ({ getAllWorkers: mocks.getAllWorkers }));
-vi.mock('../../src/workers/worker-liveness.js', () => ({
-    getWorkerLiveness: mocks.getWorkerLiveness,
-    mandatoryWorkersHealthy: mocks.mandatoryWorkersHealthy,
-}));
+import { readyRoutes } from "../../src/server/routes/ready.js";
 
-import { readyRoutes } from '../../src/server/routes/ready.js';
+const baseReadiness = {
+  schema_version: "aggregation-role-readiness/v1",
+  topology_schema_version: "aggregation-role-topology/v1",
+  topology_digest: "a".repeat(64),
+  instance_id: "instance",
+  role: "intake-control",
+  started_at: "2026-08-29T00:00:00.000Z",
+  heartbeat_at: "2026-08-29T00:00:01.000Z",
+  pod_ready: true,
+  owner_ready: true,
+  registry_lease_current: true,
+  draining: false,
+  dependencies: { redis: "connected", cms: "reachable", workers: "healthy" },
+  workers: {},
+  worker_ownership: {
+    expected: ["fetch-queue"], registered: ["fetch-queue"], missing: [], unexpected: [],
+    required_queue_clients: ["fetch-queue"], initialized_queue_clients: ["fetch-queue"],
+    missing_queue_clients: [], unexpected_queue_clients: [],
+  },
+  reasons: [],
+};
 
-describe('Aggregation readiness', () => {
-    beforeEach(() => {
-        vi.clearAllMocks();
-        mocks.isRedisConnected.mockResolvedValue(true);
-        mocks.ping.mockResolvedValue(true);
-        mocks.mandatoryWorkersHealthy.mockReturnValue(true);
-        mocks.getWorkerLiveness.mockReturnValue({});
-        mocks.getAllWorkers.mockReturnValue([
-            'fetch-queue', 'normalize-queue', 'source-run-dispatch-queue',
-            'source-run-verification-queue', 'lifecycle-receipts-queue',
-            'pipeline-repair-queue', 'atomization-queue', 'atomization-sweep-queue',
-        ].map((name) => ({ name })));
+async function invokeReady() {
+  let handler: ((request: unknown, reply: { status: (code: number) => unknown; send: (body: unknown) => unknown }) => Promise<unknown>) | undefined;
+  const fastify = { get: (_path: string, registered: typeof handler) => { handler = registered; } };
+  await readyRoutes(fastify as never);
+  let statusCode = 200;
+  const reply = {
+    status(code: number) { statusCode = code; return reply; },
+    send(body: unknown) { return body; },
+  };
+  const body = await handler?.({}, reply);
+  return { statusCode, body };
+}
+
+describe("Aggregation role-local readiness", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.localRoleReadiness.mockResolvedValue(baseReadiness);
+  });
+
+  it("returns 200 only for the exact ready role", async () => {
+    await expect(invokeReady()).resolves.toMatchObject({
+      statusCode: 200,
+      body: {
+        status: "ready", role: "intake-control", pod_ready: true, owner_ready: true,
+        dependencies: { redis: "connected", cms: "reachable", workers: "healthy", storage: "configured" },
+      },
     });
+  });
 
-    it('uses cycle-free CMS liveness and independent worker proof', async () => {
-        let handler: ((request: unknown, reply: { send: (body: unknown) => unknown }) => Promise<unknown>) | undefined;
-        const fastify = {
-            get: (_path: string, registered: typeof handler) => { handler = registered; },
-        };
-        await readyRoutes(fastify as never);
-        const send = vi.fn((body) => body);
-        const result = await handler?.({}, { send });
+  it.each([
+    ["missing consumer", { pod_ready: false, dependencies: { redis: "connected", cms: "reachable", workers: "missing" } }],
+    ["stale worker", { pod_ready: false, dependencies: { redis: "connected", cms: "reachable", workers: "stale" } }],
+    ["CMS outage", { pod_ready: false, owner_ready: true, dependencies: { redis: "connected", cms: "unreachable", workers: "healthy" } }],
+    ["lost distributed lease", { pod_ready: false, owner_ready: true, registry_lease_current: false }],
+  ])("returns 503 for %s", async (_label, override) => {
+    mocks.localRoleReadiness.mockResolvedValue({ ...baseReadiness, ...override });
+    await expect(invokeReady()).resolves.toMatchObject({ statusCode: 503, body: { status: "not_ready" } });
+  });
 
-        expect(mocks.ping).toHaveBeenCalledTimes(1);
-        expect(result).toMatchObject({
-            status: 'ready',
-            dependencies: { redis: 'connected', cms: 'reachable', workers: 'healthy' },
-        });
+  it("keeps owner proof cycle-free when only CMS is unavailable", async () => {
+    mocks.localRoleReadiness.mockResolvedValue({
+      ...baseReadiness,
+      pod_ready: false,
+      owner_ready: true,
+      dependencies: { redis: "connected", cms: "unreachable", workers: "healthy" },
     });
+    await expect(invokeReady()).resolves.toMatchObject({
+      statusCode: 503,
+      body: { pod_ready: false, owner_ready: true },
+    });
+  });
 });

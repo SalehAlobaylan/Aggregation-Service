@@ -1,6 +1,5 @@
 import { EventEmitter } from 'node:events';
-import assert from 'node:assert/strict';
-import test from 'node:test';
+import { expect, test } from 'vitest';
 import { mandatoryWorkersHealthy, registerWorkerLiveness, workerHeartbeatStaleMs, workerLivenessTestUtils } from '../worker-liveness.js';
 
 class FakeWorker extends EventEmitter {
@@ -18,11 +17,11 @@ test('worker liveness fails closed until every mandatory worker emitted a ready 
         const second = new FakeWorker('second');
         registerWorkerLiveness(first as never);
         registerWorkerLiveness(second as never);
-        assert.equal(mandatoryWorkersHealthy(['first', 'second']), false);
+        expect(mandatoryWorkersHealthy(['first', 'second'])).toBe(false);
         first.emit('ready');
         second.emit('ready');
-        assert.equal(mandatoryWorkersHealthy(['first', 'second']), true);
-        assert.equal(mandatoryWorkersHealthy(['first', 'second'], Date.now() + workerHeartbeatStaleMs + 1), false);
+        expect(mandatoryWorkersHealthy(['first', 'second'])).toBe(true);
+        expect(mandatoryWorkersHealthy(['first', 'second'], Date.now() + workerHeartbeatStaleMs + 1)).toBe(false);
         first.emit('closed');
         second.emit('closed');
 });

@@ -169,7 +169,7 @@ function evaluateModerationDecision(
     return { decision: 'auto_approved', reason: 'rules_passed' };
 }
 
-export const normalizeWorker = createWorker({
+export const createNormalizeWorker = () => createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings, sourceRunRequestId, tenantId: jobTenantId, operatorPlanId, operatorStepId, idempotencyKey } = job.data;
@@ -210,6 +210,7 @@ export const normalizeWorker = createWorker({
         let moderationRejected = 0;
         let mediaEnqueued = 0;
         let aiEnqueued = 0;
+		let legalDurationCandidates = 0;
 
         for (const rawItem of rawItems || []) {
             try {
@@ -241,6 +242,9 @@ export const normalizeWorker = createWorker({
                     });
                     continue;
                 }
+				if (normalized.type === 'VIDEO' || normalized.type === 'PODCAST') {
+					legalDurationCandidates++;
+				}
 
                 const filterDecision = shouldSkipByFilters(normalized, item, sourceFilters);
                 if (filterDecision.skip) {
@@ -320,9 +324,14 @@ export const normalizeWorker = createWorker({
                 }
 
                 // Upsert to CMS
-				const { contentItemId, created, retired, status: cmsStatus, disposition, deliveryMode } = await upsertContentItem(normalized, job.id, {
+				const { contentItemId, created, retired, status: cmsStatus, disposition, deliveryMode, nextRequiredStages, lifecycleReconciliationRequired } = await upsertContentItem(normalized, job.id, {
 					tenantId, contentSourceId: sourceId, sourceRunRequestId, operatorPlanId, operatorStepId, idempotencyKey,
 				});
+				// Older CMS deployments omit the additive compatibility fields. Treat
+				// that response as legacy-unknown and preserve the established handoff;
+				// never let an undefined optional field suppress required work.
+				const missingStages = Array.isArray(nextRequiredStages) ? nextRequiredStages : [];
+				const lifecycleNeedsReconciliation = lifecycleReconciliationRequired === true;
 				if (contentItemId) cmsUpserted++;
 				if (moderation.decision === 'auto_rejected') {
 					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'moderation_rejected');
@@ -341,9 +350,28 @@ export const normalizeWorker = createWorker({
 					});
 					continue;
 				}
-				if (!created && (cmsStatus === 'READY' || cmsStatus === 'ARCHIVED')) {
+				if (normalized.type === 'VIDEO' || normalized.type === 'PODCAST') {
+					// Metadata-first Pods discovery never owns media effects. If CMS has
+					// not enabled durable scheduling yet, retain the preview row and wait
+					// for the control plane instead of falling back to a direct BullMQ
+					// download that could bypass manual acquisition approval.
+					if (created) processed++; else duplicates++;
+					jobLogger.warn('Pods metadata retained while durable media scheduling is unavailable', {
+						contentItemId, disposition, deliveryMode, status: cmsStatus,
+					});
+					continue;
+				}
+				// In compatibility mode CMS still selects the exact missing owner
+				// stages. A duplicate with a complete lifecycle is a true no-op;
+				// Redis/dedup state never decides this.
+				if (!created && (cmsStatus === 'READY' || cmsStatus === 'ARCHIVED') && missingStages.length === 0 && !lifecycleNeedsReconciliation) {
 					duplicates++;
 					jobLogger.info('Skipping unchanged terminal compatibility item', { contentItemId, disposition, status: cmsStatus });
+					continue;
+				}
+				if (!created && cmsStatus === 'FAILED' && missingStages.length === 0 && lifecycleNeedsReconciliation) {
+					duplicates++;
+					jobLogger.info('Deferring artifact-complete FAILED item to lifecycle reconciliation', { contentItemId, disposition });
 					continue;
 				}
 
@@ -365,12 +393,19 @@ export const normalizeWorker = createWorker({
                     const telegramMediaKind = (normalized.metadata as Record<string, unknown>)?.mediaKind as string | undefined;
 
                     // Items that need the full media pipeline (download → transcode → thumbnail → AI)
-                    const requiresMediaJob =
-                        normalized.type === 'VIDEO' ||
-                        normalized.type === 'PODCAST' ||
-                        (normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
+					const hasStageDisposition = missingStages.length > 0;
+					const mediaStageRequired = !hasStageDisposition || missingStages.includes('pods_media_artifacts');
+					const transcriptStageRequired = !hasStageDisposition || missingStages.includes('pods_transcript');
+					const atomizationStageRequired = missingStages.includes('pods_atomization');
+					const embeddingStageRequired = !hasStageDisposition || missingStages.includes('news_text_embedding') || missingStages.includes('pods_text_embedding');
+					const requiresMediaJob =
+						normalized.type === 'VIDEO' ||
+						normalized.type === 'PODCAST' ||
+						(normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
+					const runMediaPipeline = requiresMediaJob && mediaStageRequired;
+					const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
 
-                    if (requiresMediaJob && normalized.status !== 'ARCHIVED') {
+					if (runMediaPipeline && normalized.status !== 'ARCHIVED') {
                         // A claimed ready URL with unknown duration still needs
                         // authoritative probing; otherwise manual/import paths
                         // can bypass the Media duration gate entirely.
@@ -378,28 +413,36 @@ export const normalizeWorker = createWorker({
                         // FFprobe gate. `mediaReady` is only a transport hint;
                         // neither it nor a provider-supplied duration proves
                         // that the referenced bytes satisfy the feed contract.
-                        const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady) &&
-                            normalized.type !== 'VIDEO' &&
-                            normalized.type !== 'PODCAST' &&
-                            typeof normalized.durationSec === 'number';
-                        const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
+						const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady) &&
+							normalized.type !== 'VIDEO' &&
+							normalized.type !== 'PODCAST' &&
+							typeof normalized.durationSec === 'number';
 
-                        if (mediaReady && normalized.mediaUrl) {
-                            const aiQueue = getQueue(QUEUE_NAMES.AI);
-                            if (!aiQueue) throw new Error('AI queue unavailable for required handoff');
-                            await aiQueue.add(
-                                    `ai-manual-${normalized.type}-${contentItemId}`,
-                                    {
-                                        contentItemId,
-                                        tenantId,
-                                        contentType: normalized.type,
-                                        operations: ['transcript', 'embedding'],
+						if (mediaReady && normalized.mediaUrl) {
+							const aiQueue = getQueue(QUEUE_NAMES.AI);
+							if (!aiQueue) throw new Error('AI queue unavailable for required handoff');
+							const operations: ('transcript' | 'embedding')[] = [];
+							if (transcriptStageRequired) operations.push('transcript');
+							if (embeddingStageRequired) operations.push('embedding');
+							if (operations.length === 0) {
+								jobLogger.debug('Media-ready item has no missing AI stage', { contentItemId });
+								continue;
+							}
+							await aiQueue.add(
+									`ai-manual-${normalized.type}-${contentItemId}`,
+									{
+										contentItemId,
+										tenantId,
+										contentType: normalized.type,
+										operations,
                                         textContent: {
                                             title: normalized.title,
                                             excerpt: normalized.excerpt || undefined,
                                             bodyText: normalized.bodyText || undefined,
                                         },
                                         mediaUrl: normalized.mediaUrl,
+                                        transcriptionUrl: normalized.mediaUrl,
+                                        durationSec: normalized.durationSec,
                                     },
                                     // Deterministic id coalesces duplicate AI jobs on re-ingest.
                                     { priority: aiPriorityForContentType(normalized.type), jobId: `ai-${contentItemId}` }
@@ -410,7 +453,7 @@ export const normalizeWorker = createWorker({
                                     contentItemId,
                                     type: normalized.type,
                             });
-                        } else {
+					} else {
                             const mediaQueue = getQueue(QUEUE_NAMES.MEDIA);
                             if (!mediaQueue) throw new Error('Media queue unavailable for required handoff');
                                 const downloadRef = (normalized.metadata as Record<string, unknown>)?.telegramDownloadRef as TelegramDownloadRef | undefined;
@@ -451,7 +494,53 @@ export const normalizeWorker = createWorker({
                                 mediaEnqueued++;
                                 jobLogger.debug('Enqueued media job', { contentItemId, type: normalized.type });
                         }
-                    } else if (normalized.status !== 'ARCHIVED') {
+					} else if (normalized.status !== 'ARCHIVED' && transcriptStageRequired && requiresMediaJob) {
+						// A compatibility response can identify a missing transcript after
+						// Media has already verified the artifact. Route only that owner
+						// stage through the established Media-backed AI contract; never
+						// requeue the whole media download.
+						if (!sourceUrl) throw new Error(`Transcript stage has no durable media URL for ${contentItemId}`);
+						const aiQueue = getQueue(QUEUE_NAMES.AI);
+						if (!aiQueue) throw new Error('AI queue unavailable for transcript handoff');
+						const operations: ('transcript' | 'embedding')[] = ['transcript'];
+						if (embeddingStageRequired) operations.push('embedding');
+						await aiQueue.add(
+							`ai-transcript-${normalized.type}-${contentItemId}`,
+							{
+								contentItemId,
+								tenantId,
+								contentType: normalized.type,
+								operations,
+								textContent: {
+									title: normalized.title,
+									excerpt: normalized.excerpt || undefined,
+									bodyText: normalized.bodyText || undefined,
+								},
+								mediaUrl: sourceUrl,
+								transcriptionUrl: sourceUrl,
+								durationSec: normalized.durationSec,
+							},
+							{ priority: aiPriorityForContentType(normalized.type), jobId: `ai-${contentItemId}` },
+						);
+						aiEnqueued++;
+						jobLogger.debug('Enqueued missing transcript stage without re-downloading media', { contentItemId, operations });
+					} else if (normalized.status !== 'ARCHIVED' && atomizationStageRequired) {
+						// Atomization is a separate, policy-gated owner stage. A
+						// compatibility repair may request only this stage after the
+						// parent transcript and media artifacts already exist.
+						const atomizationQueue = getQueue(QUEUE_NAMES.ATOMIZATION);
+						if (!atomizationQueue) throw new Error('Atomization queue unavailable for required handoff');
+						const atomizationJobId = `atomize-${contentItemId}`;
+						const existingAtomizationJob = await atomizationQueue.getJob(atomizationJobId);
+						if (!existingAtomizationJob) {
+							await atomizationQueue.add(
+								'atomize-content-stage',
+								{ contentItemId, reason: 'compatibility-missing-stage' },
+								{ priority: 3, jobId: atomizationJobId, removeOnComplete: { age: 3600, count: 200 }, removeOnFail: { age: 86400 } },
+							);
+						}
+						jobLogger.debug('Enqueued missing atomization stage', { contentItemId });
+					} else if (normalized.status !== 'ARCHIVED' && embeddingStageRequired) {
                         // Every non-media item requires an embedding before it can be READY.
                         const aiQueue = getQueue(QUEUE_NAMES.AI);
                         if (!aiQueue) throw new Error('AI queue unavailable for required handoff');
@@ -509,17 +598,19 @@ export const normalizeWorker = createWorker({
 				envelope: durableEnvelope, stage: 'normalize', eventType: 'normalize_terminal',
 				outcome: failed > 0 ? 'provider_failed' : processed > 0 ? 'new_items' : 'no_change', sequence: 1,
 				pageId: job.data.sourceRunPageId, batchId: job.data.sourceRunBatchId,
-				payload: { processed, duplicates, cms_upserted: cmsUpserted, filtered, failed, moderation_approved: moderationApproved, moderation_review: moderationReview, moderation_rejected: moderationRejected, media_enqueued: mediaEnqueued, ai_enqueued: aiEnqueued },
+				payload: { processed, duplicates, cms_upserted: cmsUpserted, legal_duration_candidates: legalDurationCandidates, filtered, failed, moderation_approved: moderationApproved, moderation_review: moderationReview, moderation_rejected: moderationRejected, media_enqueued: mediaEnqueued, ai_enqueued: aiEnqueued },
 			}));
 			return;
 		}
-        await reportNormalizeRun(tenantId, sourceId, sourceRunRequestId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
+		await reportNormalizeRun(tenantId, sourceId, sourceRunRequestId, fetchJobId, triggeredBy, processed, duplicates, filtered, failed, {
             sourceType,
             moderationApproved,
             moderationReview,
             moderationRejected,
             mediaEnqueued,
             aiEnqueued,
+			legalDurationCandidates,
+			materializedItems: cmsUpserted,
         });
 		} finally {
 			heartbeat?.stop();
@@ -568,7 +659,7 @@ async function reportNormalizeRun(
 ): Promise<void> {
     if (!fetchJobId || !isUuid(sourceId)) return;
     try {
-        await cmsClient.reportSourceRun({
+		await cmsClient.reportSourceRun({
             tenant_id: tenantId,
             source_id: sourceId,
 			source_run_request_id: sourceRunRequestId,
@@ -577,8 +668,10 @@ async function reportNormalizeRun(
             accepted,
             duplicates,
             filtered,
-            failed,
-            finished_at: new Date().toISOString(),
+			failed,
+			legal_duration_candidates: typeof metadata.legalDurationCandidates === 'number' ? metadata.legalDurationCandidates : undefined,
+			materialized_items: typeof metadata.materializedItems === 'number' ? metadata.materializedItems : undefined,
+			finished_at: new Date().toISOString(),
 			metadata: { ...metadata, stage: 'normalize' },
         }, fetchJobId);
     } catch {

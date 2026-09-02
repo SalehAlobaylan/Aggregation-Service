@@ -1,7 +1,7 @@
 import type { Job } from 'bullmq';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type ContentStageJob } from '../queues/index.js';
-import { cmsClient, contentStageCorrelation } from '../cms/client.js';
+import { cmsClient, contentStageCorrelation, isStaleContentStageDeliveryError } from '../cms/client.js';
 import { buildEmbeddingText } from '../ai/embeddings.js';
 import { EnrichmentRequestError, generateEmbeddingViaEnrichment, generateMetadataViaEnrichment } from '../ai/enrichment-client.js';
 import { createLogger } from '../observability/logger.js';
@@ -15,8 +15,10 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 	}
 	const correlation = contentStageCorrelation(claim);
 	let heartbeat: NodeJS.Timeout | undefined;
+	let stageBegun = false;
 	try {
 		await cmsClient.beginContentStage(claim, job.id);
+		stageBegun = true;
 		heartbeat = setInterval(() => void cmsClient.heartbeatContentStage(claim, job.id).catch(() => undefined), 15_000);
 		heartbeat.unref();
 		const text = claim.stage === 'pods_caption_reembedding'
@@ -42,6 +44,10 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 		}
 		jobLogger.info('Durable embedding effect persisted; CMS verification owns completion', { requestId: claim.request_id, lane: claim.lane });
 	} catch (error) {
+		if (!stageBegun && isStaleContentStageDeliveryError(error)) {
+			jobLogger.info('Discarded stale or non-claimable content-stage delivery', { requestId: claim.request_id });
+			return;
+		}
 		if (error instanceof EnrichmentRequestError && error.status === 429) {
 			await cmsClient.deferContentStage(claim, error.retryAfterSeconds ?? 1, 'Enrichment lane capacity deferred', job.id);
 			return;

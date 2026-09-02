@@ -52,6 +52,17 @@ interface LocalDigest {
   md5: string;
 }
 
+export interface ManifestUploadReceipt {
+  url: string;
+  manifestId: string;
+  bytes: number;
+  sha256: string;
+  providerEtag?: string;
+  providerChecksumSha256?: string;
+  providerContentType?: string;
+  providerCacheControl?: string;
+}
+
 async function digestFile(filePath: string): Promise<LocalDigest> {
   const sha256 = createHash("sha256");
   const md5 = createHash("md5");
@@ -90,7 +101,7 @@ function verifyProviderMetadata(
   }
   const expectedType = normalizeContentType(expected.contentType);
   const providerType = normalizeContentType(metadata.contentType);
-  if (expectedType && providerType && expectedType !== providerType) {
+  if (expectedType && providerType !== expectedType) {
     throw new Error(
       `manifest provider content-type mismatch: expected ${expectedType}, got ${providerType}`,
     );
@@ -104,6 +115,9 @@ function verifyProviderMetadata(
     );
   }
   const providerEtag = normalizeEtag(metadata.etag);
+  if (!providerEtag && !metadata.checksumSha256) {
+    throw new Error(`manifest provider returned no checksum for ${expected.bytes} bytes`);
+  }
   // PutObject is single-part in this path, so a plain MD5 ETag is an exact
   // provider-side checksum. Multipart-style ETags are recorded but not used
   // as a false checksum assertion.
@@ -122,7 +136,7 @@ function verifyProviderMetadata(
 export async function uploadFileWithManifest(
   input: ManifestUploadInput,
   signal?: AbortSignal,
-): Promise<{ url: string; manifestId: string; bytes: number }> {
+): Promise<ManifestUploadReceipt> {
   const tier = input.tier ?? "primary";
   const bucket =
     tier === "cold"
@@ -176,7 +190,16 @@ export async function uploadFileWithManifest(
       ) {
         throw new Error(`existing manifest ETag mismatch for ${input.key}`);
       }
-      return { url, manifestId: manifest.id, bytes: metadata.size };
+      return {
+        url,
+        manifestId: manifest.id,
+        bytes: metadata.size,
+        sha256: manifest.sha256 ?? "",
+        providerEtag: metadata.etag,
+        providerChecksumSha256: metadata.checksumSha256,
+        providerContentType: metadata.contentType,
+        providerCacheControl: metadata.cacheControl,
+      };
     }
     await uploadFile(
       input.key,
@@ -235,7 +258,16 @@ export async function uploadFileWithManifest(
       producerEventId,
       signal,
     );
-    return { url, manifestId: manifest.id, bytes };
+    return {
+      url,
+      manifestId: manifest.id,
+      bytes,
+      sha256: digest.sha256,
+      providerEtag: metadata.etag,
+      providerChecksumSha256: metadata.checksumSha256,
+      providerContentType: metadata.contentType,
+      providerCacheControl: metadata.cacheControl,
+    };
   } catch (error) {
     await cmsClient
       .transitionArtifactManifest(
@@ -259,7 +291,7 @@ export async function uploadFileWithManifest(
 /** Register an already-uploaded object during idempotent repair. */
 export async function registerExistingObjectWithManifest(
   input: Omit<ManifestUploadInput, "filePath">,
-): Promise<{ url: string; manifestId: string; bytes: number }> {
+): Promise<ManifestUploadReceipt> {
   const tier = input.tier ?? "primary";
   const bucket =
     tier === "cold"
@@ -301,7 +333,16 @@ export async function registerExistingObjectWithManifest(
       contentType: input.contentType,
       etag: manifest.etag ?? undefined,
     });
-    return { url, manifestId: manifest.id, bytes: metadata.size };
+    return {
+      url,
+      manifestId: manifest.id,
+      bytes: metadata.size,
+      sha256: "",
+      providerEtag: metadata.etag,
+      providerChecksumSha256: metadata.checksumSha256,
+      providerContentType: metadata.contentType,
+      providerCacheControl: metadata.cacheControl,
+    };
   }
   await cmsClient.transitionArtifactManifest(
     manifest.id,
@@ -334,5 +375,14 @@ export async function registerExistingObjectWithManifest(
     },
     producerEventId,
   );
-  return { url, manifestId: manifest.id, bytes: metadata.size };
+  return {
+    url,
+    manifestId: manifest.id,
+    bytes: metadata.size,
+    sha256: "",
+    providerEtag: metadata.etag,
+    providerChecksumSha256: metadata.checksumSha256,
+    providerContentType: metadata.contentType,
+    providerCacheControl: metadata.cacheControl,
+  };
 }

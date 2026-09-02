@@ -14,7 +14,7 @@ import { isDependencyDeferral } from '../observability/job-projection.js';
 const REPEATABLE_NAME = 'atomization-cms-claim-repeatable';
 const INTERVAL_MS = 10_000;
 
-export const atomizationSweepWorker = createWorker({
+export const createAtomizationSweepWorker = () => createWorker({
   queueName: QUEUE_NAMES.ATOMIZATION_SWEEP,
   concurrency: 1,
   shouldDeadLetter: () => false,

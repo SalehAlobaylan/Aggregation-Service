@@ -14,7 +14,7 @@ import { sourceAdmissionMode } from '../services/source-admission-mode.js';
 
 const REPEATABLE_NAME = 'news-circulation-repeatable';
 
-export const newsCirculationWorker = createWorker({
+export const createNewsCirculationWorker = () => createWorker({
     queueName: QUEUE_NAMES.NEWS_CIRCULATION,
 	timeoutMs: 120_000,
 	processor: async (job: Job<NewsCirculationJob>, jobLogger, signal): Promise<void> => {
@@ -97,27 +97,27 @@ export async function syncNewsCirculationSweeper(): Promise<void> {
     }
 
     const policy = await cmsClient.getCirculationPolicy('default');
-    const repeatables = await queue.getRepeatableJobs().catch(() => []);
-    await Promise.all(
-        repeatables
-            .filter((entry) => entry.name === REPEATABLE_NAME)
-            .map((entry) => queue.removeRepeatableByKey(entry.key).catch(() => undefined))
-    );
-
 	const admissionMode = sourceAdmissionMode(policy);
 	if (admissionMode === 'durable') {
+		const repeatables = await queue.getRepeatableJobs();
+		await Promise.all(repeatables.filter((entry) => entry.name === REPEATABLE_NAME).map((entry) => queue.removeRepeatableByKey(entry.key)));
 		logger.info('news circulation: durable CMS source-run admission owns the lane');
 		return;
 	}
 
 	const intervalMinutes = Math.max(1, policy.source_claim_interval_minutes || 15);
+	const every = intervalMinutes * 60_000;
 	await queue.add(
 		REPEATABLE_NAME,
 		{ trigger: 'auto', tenantId: 'default' } satisfies NewsCirculationJob,
 		{
-			repeat: { every: intervalMinutes * 60_000 },
+			repeat: { every },
 			jobId: REPEATABLE_NAME,
 		}
 	);
+	const installed = await queue.getRepeatableJobs();
+	await Promise.all(installed
+		.filter((entry) => entry.name === REPEATABLE_NAME && Number(entry.every) !== every)
+		.map((entry) => queue.removeRepeatableByKey(entry.key)));
 	logger.info('news circulation: registered compatibility source claim', { intervalMinutes });
 }

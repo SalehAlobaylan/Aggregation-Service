@@ -3,7 +3,17 @@
  * Downloads media from YouTube (yt-dlp) and HTTP sources
  */
 import { createWriteStream } from "fs";
-import { mkdir, readFile, rename, unlink, stat, writeFile } from "fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  unlink,
+  stat,
+  writeFile,
+} from "fs/promises";
 import { join, basename } from "path";
 import { Transform } from "stream";
 import { pipeline } from "stream/promises";
@@ -23,6 +33,7 @@ import {
   type SponsorSegment,
 } from "./captions.js";
 import type { TranscriptChapter } from "../cms/types.js";
+import { getMediaInfo, type MediaInfo } from "./transcoder.js";
 
 export interface DownloadResult {
   filePath: string;
@@ -65,7 +76,7 @@ export const MAX_MEDIA_DOWNLOAD_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
 // increases transfer, disk, and encode pressure before those pixels are thrown
 // away by the transcoder.
 export const YOUTUBE_VIDEO_FORMAT =
-  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]";
+  "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4][vcodec^=avc1]/bestvideo[height<=720][vcodec!*=av01][vcodec!*=av1]+bestaudio/best[height<=720][vcodec!*=av01][vcodec!*=av1]";
 export const YOUTUBE_FORCE_OVERWRITE_ARGS = ["--force-overwrites"] as const;
 const MAX_YTDLP_BUF = 4 * 1024 * 1024; // Tail keeps --print-json and recent logs.
 const MEDIA_RESPONSE_TIMEOUT_MS = 30_000;
@@ -150,6 +161,116 @@ export interface CachedYouTubeFallback {
   url: string;
   extension: string;
   height: number;
+  videoCodec: string;
+  formatId?: string;
+}
+
+export type YouTubeFailureClass =
+  | "bot_challenge"
+  | "attestation_required"
+  | "authentication_required"
+  | "credential_expired"
+  | "rate_limited"
+  | "unavailable"
+  | "unknown";
+
+export class YouTubeAccessDeferredError extends Error {
+  readonly retryAfterSec: number;
+  readonly failureClass: YouTubeFailureClass;
+
+  constructor(
+    failureClass:
+      | "bot_challenge"
+      | "attestation_required"
+      | "authentication_required"
+      | "credential_expired"
+      | "rate_limited",
+    message: string,
+  ) {
+    super(message);
+    this.name = "YouTubeAccessDeferredError";
+    this.failureClass = failureClass;
+    this.retryAfterSec = failureClass === "rate_limited" ? 15 * 60 : 30 * 60;
+  }
+}
+
+const YOUTUBE_CHALLENGE_PATTERNS = [
+  /sign in to confirm (?:that )?you(?:'|’)re not a bot/i,
+  /sign in to confirm you/i,
+  /confirm (?:that )?you(?:'|’)re not a bot/i,
+  /use --cookies(?:-from-browser)?/i,
+  /cookies are needed/i,
+];
+
+const YOUTUBE_ATTESTATION_PATTERNS = [
+  /proof[- ]of[- ]origin|po token/i,
+  /http error 403|403 forbidden/i,
+  /no supported javascript runtime/i,
+  /javascript (?:challenge|runtime).*(?:failed|unavailable|not available)/i,
+  /challenge solver/i,
+];
+
+export function classifyYouTubeFailure(message: string): YouTubeFailureClass {
+  if (/cookies?.*(?:expired|no longer valid)|expired cookies?/i.test(message))
+    return "credential_expired";
+  if (YOUTUBE_CHALLENGE_PATTERNS.some((pattern) => pattern.test(message)))
+    return "bot_challenge";
+  if (YOUTUBE_ATTESTATION_PATTERNS.some((pattern) => pattern.test(message)))
+    return "attestation_required";
+  if (/login required|members-only|age.?restricted|confirm your age/i.test(message))
+    return "authentication_required";
+  if (/too many requests|http error 429|rate.?limit/i.test(message))
+    return "rate_limited";
+  if (/video unavailable|private video|removed by the uploader|copyright/i.test(message))
+    return "unavailable";
+  return "unknown";
+}
+
+export function buildYtDlpProviderArgs(
+  providerUrl?: string | null,
+): string[] {
+  const args = ["--js-runtimes", "node"];
+  if (!providerUrl) return args;
+  return [
+    ...args,
+    "--extractor-args",
+    "youtube:player-client=mweb",
+    "--extractor-args",
+    `youtubepot-bgutilhttp:base_url=${providerUrl}`,
+  ];
+}
+
+export function youtubeVideoId(rawUrl: string): string | undefined {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "youtu.be") return parsed.pathname.split("/").filter(Boolean)[0];
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+      const queryID = parsed.searchParams.get("v")?.trim();
+      if (queryID) return queryID;
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      if (["shorts", "embed", "live"].includes(parts[0] ?? "")) return parts[1];
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function isAv1Codec(codec: string): boolean {
+  const normalized = codec.toLowerCase();
+  return normalized.includes("av01") || normalized === "av1";
+}
+
+function signedURLHasUsefulLifetime(rawUrl: string, now: Date): boolean {
+  try {
+    const expires = new URL(rawUrl).searchParams.get("expire");
+    if (!expires) return true;
+    const expiresAtMs = Number(expires) * 1000;
+    return Number.isFinite(expiresAtMs) && expiresAtMs > now.getTime() + 5 * 60_000;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -159,9 +280,17 @@ export interface CachedYouTubeFallback {
  */
 export function selectCachedYouTubeFallback(
   metadata: unknown,
+  expectedVideoId?: string,
+  now: Date = new Date(),
 ): CachedYouTubeFallback | undefined {
   if (!metadata || typeof metadata !== "object") return undefined;
-  const formats = (metadata as { formats?: unknown }).formats;
+  const root = metadata as { id?: unknown; formats?: unknown };
+  if (
+    expectedVideoId &&
+    (typeof root.id !== "string" || root.id !== expectedVideoId)
+  )
+    return undefined;
+  const formats = root.formats;
   if (!Array.isArray(formats)) return undefined;
 
   const candidates = formats.flatMap((value): CachedYouTubeFallback[] => {
@@ -172,8 +301,12 @@ export function selectCachedYouTubeFallback(
       typeof format.ext === "string" ? format.ext.toLowerCase() : "";
     const height = Number(format.height ?? 0);
     const size = Number(format.filesize ?? format.filesize_approx ?? 0);
+    const videoCodec =
+      typeof format.vcodec === "string" ? format.vcodec.toLowerCase() : "";
+    const formatId =
+      typeof format.format_id === "string" ? format.format_id : undefined;
     const hasVideo =
-      typeof format.vcodec === "string" && format.vcodec !== "none";
+      videoCodec !== "" && videoCodec !== "none";
     const hasAudio =
       typeof format.acodec === "string" && format.acodec !== "none";
     let protocolAllowed = false;
@@ -187,25 +320,31 @@ export function selectCachedYouTubeFallback(
       !protocolAllowed ||
       !hasVideo ||
       !hasAudio ||
+      isAv1Codec(videoCodec) ||
       !Number.isFinite(height) ||
       height <= 0 ||
       height > 720 ||
       (size > 0 && size > MAX_MEDIA_DOWNLOAD_BYTES) ||
-      !["mp4", "webm"].includes(extension)
+      !["mp4", "webm"].includes(extension) ||
+      !signedURLHasUsefulLifetime(url, now)
     ) {
       return [];
     }
-    return [{ url, extension, height }];
+    return [{ url, extension, height, videoCodec, formatId }];
   });
 
   return candidates.sort((a, b) => {
     if (a.height !== b.height) return b.height - a.height;
+    const aH264 = a.videoCodec.startsWith("avc1") || a.videoCodec === "h264";
+    const bH264 = b.videoCodec.startsWith("avc1") || b.videoCodec === "h264";
+    if (aH264 !== bH264) return Number(bH264) - Number(aH264);
     return Number(b.extension === "mp4") - Number(a.extension === "mp4");
   })[0];
 }
 
 async function readCachedYouTubeFallback(
   contentItemId: string,
+  expectedVideoId?: string,
   tempDir = config.mediaTempDir,
 ): Promise<CachedYouTubeFallback | undefined> {
   try {
@@ -213,10 +352,118 @@ async function readCachedYouTubeFallback(
       getTempPath(contentItemId, "info.json", tempDir),
       "utf8",
     );
-    return selectCachedYouTubeFallback(JSON.parse(raw));
+    return selectCachedYouTubeFallback(JSON.parse(raw), expectedVideoId);
   } catch {
     return undefined;
   }
+}
+
+interface YouTubeSourceEvidence {
+  videoId: string;
+  fileName: string;
+}
+
+function youtubeSourceEvidencePath(
+  contentItemId: string,
+  tempDir: string,
+): string {
+  return getTempPath(contentItemId, "youtube-source.json", tempDir);
+}
+
+async function hasSameItemYouTubeEvidence(
+  contentItemId: string,
+  expectedVideoId: string | undefined,
+  filePath: string,
+  tempDir: string,
+): Promise<boolean> {
+  if (!expectedVideoId) return false;
+  try {
+    const evidence = JSON.parse(
+      await readFile(youtubeSourceEvidencePath(contentItemId, tempDir), "utf8"),
+    ) as Partial<YouTubeSourceEvidence>;
+    if (
+      evidence.videoId === expectedVideoId &&
+      evidence.fileName === basename(filePath)
+    )
+      return true;
+  } catch {
+    // A pre-sidecar attempt may still have exact yt-dlp metadata below.
+  }
+  try {
+    const metadata = JSON.parse(
+      await readFile(getTempPath(contentItemId, "info.json", tempDir), "utf8"),
+    ) as { id?: unknown };
+    return metadata.id === expectedVideoId;
+  } catch {
+    return false;
+  }
+}
+
+async function persistYouTubeSourceEvidence(
+  contentItemId: string,
+  videoId: string,
+  filePath: string,
+  tempDir: string,
+): Promise<void> {
+  await writeFile(
+    youtubeSourceEvidencePath(contentItemId, tempDir),
+    JSON.stringify({ videoId, fileName: basename(filePath) } satisfies YouTubeSourceEvidence),
+    { encoding: "utf8", mode: 0o600 },
+  );
+}
+
+async function validateYouTubeCookieSource(): Promise<string | undefined> {
+  if (!config.youtubeCookiesFile) return undefined;
+  const cookieFile = await stat(config.youtubeCookiesFile).catch(() => undefined);
+  if (!cookieFile?.isFile() || cookieFile.size <= 0) {
+    throw new YouTubeAccessDeferredError(
+      "authentication_required",
+      "YouTube cookie credential is configured but is not a readable non-empty file",
+    );
+  }
+  if (cookieFile.size > 10 * 1024 * 1024) {
+    throw new YouTubeAccessDeferredError(
+      "authentication_required",
+      "YouTube cookie credential exceeds the bounded credential size",
+    );
+  }
+  const sample = (await readFile(config.youtubeCookiesFile))
+    .subarray(0, 4096)
+    .toString("utf8")
+    .replace(/^\uFEFF/, "");
+  const header = sample.split(/\r?\n/, 1)[0]?.trim().toLowerCase();
+  if (
+    header !== "# netscape http cookie file" &&
+    header !== "# http cookie file"
+  ) {
+    throw new YouTubeAccessDeferredError(
+      "authentication_required",
+      "YouTube cookie credential is not a Netscape-format cookie jar",
+    );
+  }
+  return config.youtubeCookiesFile;
+}
+
+async function assertYouTubeSourceProfile(
+  result: DownloadResult,
+  signal?: AbortSignal,
+): Promise<DownloadResult> {
+  const info = await getMediaInfo(result.filePath, { signal });
+  const failure = youtubeSourceProfileFailure(info);
+  if (failure) throw new Error(failure);
+  return { ...result, duration: result.duration ?? info.duration };
+}
+
+export function youtubeSourceProfileFailure(
+  info: Pick<MediaInfo, "hasVideo" | "hasAudio" | "duration" | "height" | "videoCodec">,
+): string | undefined {
+  if (!info.hasVideo || !info.hasAudio || info.duration <= 0)
+    return "YouTube source is not valid muxed audio/video media";
+  if (!info.height || info.height > 720)
+    return `YouTube source violates 720p ingest ceiling: ${info.height ?? "unknown"}`;
+  if (info.videoCodec && isAv1Codec(info.videoCodec))
+    return `YouTube source uses prohibited AV1 ingest codec: ${info.videoCodec}`;
+  return undefined;
 }
 
 export function isAllowedYouTubeUrl(rawUrl: string): boolean {
@@ -246,33 +493,88 @@ interface YtDlpRunOptions {
   signal?: AbortSignal;
 }
 
+const YTDLP_NO_PROGRESS_TIMEOUT_MS = 5 * 60_000;
+
 async function runYtDlp(
   args: string[],
   url: string,
   options: YtDlpRunOptions = {},
 ): Promise<{ stdout: string; stderr: string }> {
   const timeoutMs = options.timeoutMs ?? config.mediaJobTimeoutMs;
+  const cookieSource = await validateYouTubeCookieSource();
+  let cookieScratchDir: string | undefined;
+  let effectiveArgs = args;
+  if (cookieSource) {
+    await ensureTempDir();
+    cookieScratchDir = await mkdtemp(join(config.mediaTempDir, "yt-auth-"));
+    const cookieCopy = join(cookieScratchDir, "cookies.txt");
+    try {
+      await copyFile(cookieSource, cookieCopy);
+    } catch {
+      await rm(cookieScratchDir, { recursive: true, force: true }).catch(
+        () => undefined,
+      );
+      cookieScratchDir = undefined;
+      throw new YouTubeAccessDeferredError(
+        "authentication_required",
+        "YouTube cookie credential could not be prepared for extraction",
+      );
+    }
+    // yt-dlp may update its cookie jar. Every invocation receives a private
+    // copy so concurrent workers cannot corrupt or mutate the mounted secret.
+    effectiveArgs = ["--cookies", cookieCopy, ...args];
+  }
+  effectiveArgs = [
+    ...buildYtDlpProviderArgs(config.youtubePoTokenProviderUrl),
+    "--newline",
+    "--progress-template",
+    "download:wahb-progress:%(progress.downloaded_bytes)s",
+    ...effectiveArgs,
+  ];
   let stdout = "";
   let stderr = "";
-  const result = await runManagedProcess({
-    label: "yt-dlp",
-    args,
-    timeoutMs,
-    signal: options.signal,
-    onStdout: (chunk) => {
-      stdout = boundedAppend(stdout, chunk.toString(), MAX_YTDLP_BUF);
-    },
-    onStderr: (chunk) => {
-      stderr = boundedAppend(stderr, chunk.toString(), MAX_YTDLP_BUF);
-    },
-  });
-  if (result.code !== 0) {
-    // URLs can contain signed credentials, so keep them out of the error
-    // payload and logs while preserving bounded diagnostic output.
-    logger.error("yt-dlp failed", { code: result.code, stderr });
-    throw new Error(`yt-dlp exited with code ${result.code}: ${stderr}`);
+  let progressBuffer = "";
+  let downloadedBytes = 0;
+  const downloadedByteProgress = (chunk: Buffer): boolean => {
+    progressBuffer = boundedAppend(progressBuffer, chunk.toString(), 4096);
+    let advanced = false;
+    for (const match of progressBuffer.matchAll(/wahb-progress:(\d+)/g)) {
+      const next = Number(match[1]);
+      if (Number.isFinite(next) && next > downloadedBytes) {
+        downloadedBytes = next;
+        advanced = true;
+      }
+    }
+    const lastNewline = progressBuffer.lastIndexOf("\n");
+    if (lastNewline >= 0) progressBuffer = progressBuffer.slice(lastNewline + 1);
+    return advanced;
+  };
+  try {
+    const result = await runManagedProcess({
+      label: "yt-dlp",
+      args: effectiveArgs,
+      timeoutMs,
+      noProgressTimeoutMs: YTDLP_NO_PROGRESS_TIMEOUT_MS,
+      signal: options.signal,
+      onProgress: (chunk) => downloadedByteProgress(chunk),
+      onStdout: (chunk) => {
+        stdout = boundedAppend(stdout, chunk.toString(), MAX_YTDLP_BUF);
+      },
+      onStderr: (chunk) => {
+        stderr = boundedAppend(stderr, chunk.toString(), MAX_YTDLP_BUF);
+      },
+    });
+    if (result.code !== 0) {
+      // URLs can contain signed credentials, so keep them out of the error
+      // payload and logs while preserving bounded diagnostic output.
+      logger.error("yt-dlp failed", { code: result.code, stderr });
+      throw new Error(`yt-dlp exited with code ${result.code}: ${stderr}`);
+    }
+    return { stdout, stderr };
+  } finally {
+    if (cookieScratchDir)
+      await rm(cookieScratchDir, { recursive: true, force: true }).catch(() => undefined);
   }
-  return { stdout, stderr };
 }
 
 /**
@@ -286,15 +588,43 @@ export async function downloadYouTube(
 ): Promise<DownloadResult> {
   await ensureTempDir(tempDir);
   await assertAllowedYouTubeUrl(url);
+  // Validate credential material before parking a reusable source. A bad
+  // secret mount must not strand the previous attempt in backup state.
+  await validateYouTubeCookieSource();
 
   const outputTemplate = getTempPath(contentItemId, "%(ext)s", tempDir);
-  const outputPath = getTempPath(contentItemId, "mp4", tempDir); // Expected output
-  const existingDownload = await findExistingYouTubeDownload(
+  const expectedVideoId = youtubeVideoId(url);
+  const foundExistingDownload = await findExistingYouTubeDownload(
     contentItemId,
     tempDir,
   );
+  let existingDownload: DownloadResult | undefined;
+  if (foundExistingDownload) {
+    try {
+      if (
+        !(await hasSameItemYouTubeEvidence(
+          contentItemId,
+          expectedVideoId,
+          foundExistingDownload.filePath,
+          tempDir,
+        ))
+      )
+        throw new Error("prior source lacks exact same-video evidence");
+      existingDownload = await assertYouTubeSourceProfile(foundExistingDownload, signal);
+    } catch (error) {
+      logger.warn("Discarding incompatible prior YouTube source", {
+        contentItemId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await unlink(foundExistingDownload.filePath).catch(() => undefined);
+      await unlink(youtubeSourceEvidencePath(contentItemId, tempDir)).catch(
+        () => undefined,
+      );
+    }
+  }
   const cachedFallback = await readCachedYouTubeFallback(
     contentItemId,
+    expectedVideoId,
     tempDir,
   );
   const backupPath = existingDownload
@@ -341,6 +671,11 @@ export async function downloadYouTube(
     try {
       // Parse JSON output from yt-dlp
       const metadata = JSON.parse(stdout.trim().split("\n").pop() || "{}");
+      if (
+        typeof metadata.id !== "string" ||
+        (expectedVideoId && metadata.id !== expectedVideoId)
+      )
+        throw new Error("yt-dlp metadata does not match requested YouTube video");
 
       // Find the actual downloaded file
       const actualPath = getTempPath(
@@ -370,7 +705,7 @@ export async function downloadYouTube(
         sponsorSegments: sponsorSegments?.length ?? 0,
       });
 
-      return {
+      const validated = await assertYouTubeSourceProfile({
         filePath: actualPath,
         format: metadata.ext || "mp4",
         duration: metadata.duration,
@@ -381,17 +716,110 @@ export async function downloadYouTube(
         heatmap,
         sponsorSegments,
         categories,
-      };
+      }, signal);
+      await persistYouTubeSourceEvidence(
+        contentItemId,
+        metadata.id,
+        validated.filePath,
+        tempDir,
+      );
+      return validated;
     } catch (parseError) {
-      // Fallback if JSON parsing fails
-      logger.warn("Failed to parse yt-dlp output, using defaults", {
+      logger.error("Failed to validate yt-dlp output", {
         parseError,
       });
-      return {
-        filePath: outputPath,
-        format: "mp4",
-      };
+      throw parseError;
     }
+  };
+
+  const recoverProviderAccess = async (
+    failure: unknown,
+  ): Promise<DownloadResult | undefined> => {
+    const message = failure instanceof Error ? failure.message : String(failure);
+    const failureClass = classifyYouTubeFailure(message);
+    if (
+      failureClass !== "bot_challenge" &&
+      failureClass !== "attestation_required" &&
+      failureClass !== "authentication_required" &&
+      failureClass !== "credential_expired" &&
+      failureClass !== "rate_limited"
+    )
+      return undefined;
+    const restoredDownload = await restoreExistingDownload();
+    if (restoredDownload) {
+      logger.warn(
+        "YouTube challenged fresh download; reusing validated same-item source",
+        { contentItemId, format: restoredDownload.format },
+      );
+      return restoredDownload;
+    }
+    if (cachedFallback) {
+      logger.warn(
+        "YouTube challenged extraction; downloading bounded same-item cached format",
+        {
+          contentItemId,
+          format: cachedFallback.extension,
+          formatId: cachedFallback.formatId,
+          height: cachedFallback.height,
+          videoCodec: cachedFallback.videoCodec,
+        },
+      );
+      try {
+        const fallbackDownload = await downloadHttp(
+          cachedFallback.url,
+          contentItemId,
+          cachedFallback.extension,
+          signal,
+          tempDir,
+        );
+        try {
+          const validated = await assertYouTubeSourceProfile(
+            fallbackDownload,
+            signal,
+          );
+          if (!expectedVideoId)
+            throw new Error("cached YouTube fallback lacks requested video identity");
+          await persistYouTubeSourceEvidence(
+            contentItemId,
+            expectedVideoId,
+            validated.filePath,
+            tempDir,
+          );
+          return validated;
+        } catch (fallbackError) {
+          await unlink(fallbackDownload.filePath).catch(() => undefined);
+          throw fallbackError;
+        }
+      } catch (fallbackError) {
+        const fallbackMessage =
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError);
+        const fallbackClass = classifyYouTubeFailure(fallbackMessage);
+        if (
+          fallbackClass === "rate_limited" ||
+          fallbackClass === "attestation_required"
+        ) {
+          throw new YouTubeAccessDeferredError(
+            fallbackClass === "rate_limited"
+              ? "rate_limited"
+              : "attestation_required",
+            "Cached YouTube media URL is no longer usable; fresh provider access is required",
+          );
+        }
+        throw fallbackError;
+      }
+    }
+    throw new YouTubeAccessDeferredError(
+      failureClass,
+      failureClass === "rate_limited"
+        ? "YouTube rate-limited media extraction; no proven same-item fallback is available"
+        : failureClass === "attestation_required"
+          ? "YouTube requires a working JavaScript/PO-token attestation provider; no proven same-item fallback is available"
+          : failureClass === "credential_expired"
+            ? "YouTube cookie credentials expired; refresh them before retrying this item"
+          : "YouTube access requires a fresh authenticated cookie jar; no proven same-item fallback is available",
+    );
   };
 
   try {
@@ -422,41 +850,16 @@ export async function downloadYouTube(
         await discardExistingBackup();
         return result;
       } catch (subtitleRetryError) {
+        const recovered = await recoverProviderAccess(subtitleRetryError);
+        if (recovered) return recovered;
         await restoreExistingDownload();
         throw subtitleRetryError;
       }
     }
 
-    const restoredDownload = await restoreExistingDownload();
-    if (message.includes("Sign in to confirm you")) {
-      if (restoredDownload) {
-        logger.warn(
-          "YouTube challenged fresh download; reusing validated same-item source",
-          {
-            contentItemId,
-            format: restoredDownload.format,
-          },
-        );
-        return restoredDownload;
-      }
-      if (cachedFallback) {
-        logger.warn(
-          "YouTube challenged extraction; downloading bounded same-item cached format",
-          {
-            contentItemId,
-            format: cachedFallback.extension,
-            height: cachedFallback.height,
-          },
-        );
-        return downloadHttp(
-          cachedFallback.url,
-          contentItemId,
-          cachedFallback.extension,
-          signal,
-          tempDir,
-        );
-      }
-    }
+    const recovered = await recoverProviderAccess(err);
+    if (recovered) return recovered;
+    await restoreExistingDownload();
     throw err;
   }
 }
@@ -490,7 +893,33 @@ export async function downloadYouTubeAudio(
     url,
   ];
 
-  const { stdout } = await runYtDlp(args, url, { signal });
+  let stdout: string;
+  try {
+    ({ stdout } = await runYtDlp(args, url, { signal }));
+  } catch (error) {
+    const failureClass = classifyYouTubeFailure(
+      error instanceof Error ? error.message : String(error),
+    );
+    if (
+      failureClass === "bot_challenge" ||
+      failureClass === "attestation_required" ||
+      failureClass === "authentication_required" ||
+      failureClass === "credential_expired" ||
+      failureClass === "rate_limited"
+    ) {
+      throw new YouTubeAccessDeferredError(
+        failureClass,
+        failureClass === "rate_limited"
+          ? "YouTube rate-limited audio extraction"
+          : failureClass === "attestation_required"
+            ? "YouTube audio extraction requires a working JavaScript/PO-token attestation provider"
+            : failureClass === "credential_expired"
+              ? "YouTube audio extraction requires refreshed cookie credentials"
+            : "YouTube audio extraction requires a fresh authenticated cookie jar",
+      );
+    }
+    throw error;
+  }
   try {
     const metadata = JSON.parse(stdout.trim().split("\n").pop() || "{}");
 
@@ -802,6 +1231,12 @@ export async function cleanupTempFile(filePath: string): Promise<void> {
     logger.debug("Cleaned up temp file", { filePath });
   } catch (error) {
     logger.warn("Failed to cleanup temp file", { filePath, error });
+  }
+  const extensionIndex = filePath.lastIndexOf(".");
+  if (extensionIndex > 0) {
+    await unlink(
+      `${filePath.slice(0, extensionIndex)}.youtube-source.json`,
+    ).catch(() => undefined);
   }
 }
 

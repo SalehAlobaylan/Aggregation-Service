@@ -79,6 +79,9 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
             concurrency,
             stalledInterval: config.stalledIntervalMs,
             maxStalledCount: config.maxStalledCount,
+            // Role startup validates the complete worker cohort before any
+            // BullMQ blocking connection is allowed to consume work.
+            autorun: false,
         }
     );
 

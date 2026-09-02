@@ -9,6 +9,7 @@
     "dev:intake": "tsx watch src/index.ts intake-control",
     "dev:news": "tsx watch src/index.ts news",
     "dev:pods-control": "tsx watch src/index.ts pods-control",
+    "dev:legacy-drain": "tsx watch src/index.ts legacy-drain",
     "dev:media-executor": "tsx src/index.ts media-executor",
     "dev:media-maintenance": "tsx watch src/index.ts media-maintenance",
     "build": "tsc",
@@ -16,6 +17,7 @@
     "start:intake": "node dist/index.js intake-control",
     "start:news": "node dist/index.js news",
     "start:pods-control": "node dist/index.js pods-control",
+    "start:legacy-drain": "node dist/index.js legacy-drain",
     "start:media-executor": "node dist/index.js media-executor",
     "start:media-maintenance": "node dist/index.js media-maintenance",
     "typecheck": "tsc --noEmit",
@@ -32,7 +34,9 @@
     "test:ai": "tsx src/scripts/test-ai-job.ts",
     "telegram:auth": "tsx src/scripts/telegram-auth.ts",
     "retry-failed": "tsx src/scripts/retry-failed.ts",
-    "retry-pending": "tsx src/scripts/retry-pending.ts"
+    "retry-pending": "tsx src/scripts/retry-pending.ts",
+    "setup:youtube-runtime": "./scripts/setup-youtube-runtime.sh",
+    "youtube:qualify": "tsx src/scripts/youtube-qualify.ts"
   },
   "keywords": [
     "wahb",
@@ -77,6 +81,6 @@
     "vitest": "^4.0.18"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

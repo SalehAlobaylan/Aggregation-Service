@@ -26,8 +26,8 @@ describe('lifecycle receipt worker', () => {
   })
 
   it('retains, delivers, then marks only the exact receipt as acknowledged', async () => {
-    const { lifecycleReceiptWorker } = await import('../../src/workers/lifecycle-receipt.worker.js')
-    const worker = lifecycleReceiptWorker as unknown as { processor: (job: unknown) => Promise<void> }
+    const { createLifecycleReceiptWorker } = await import('../../src/workers/lifecycle-receipt.worker.js')
+    const worker = createLifecycleReceiptWorker() as unknown as { processor: (job: unknown) => Promise<void> }
     await worker.processor({ id: 'receipt-job-1', data: { receipt } })
     expect(mocks.cmsClient.retainSourceRunReceipt).toHaveBeenCalledWith(receipt, 'receipt-job-1')
     expect(mocks.cmsClient.deliverSourceRunReceipt).toHaveBeenCalledWith(receipt, 'receipt-job-1')
@@ -37,8 +37,8 @@ describe('lifecycle receipt worker', () => {
 
   it('does not mark a receipt delivered when CMS delivery is unavailable', async () => {
     mocks.cmsClient.deliverSourceRunReceipt.mockRejectedValueOnce(new Error('CMS unavailable'))
-    const { lifecycleReceiptWorker } = await import('../../src/workers/lifecycle-receipt.worker.js')
-    const worker = lifecycleReceiptWorker as unknown as { processor: (job: unknown) => Promise<void> }
+    const { createLifecycleReceiptWorker } = await import('../../src/workers/lifecycle-receipt.worker.js')
+    const worker = createLifecycleReceiptWorker() as unknown as { processor: (job: unknown) => Promise<void> }
     await expect(worker.processor({ id: 'receipt-job-2', data: { receipt } })).rejects.toThrow('CMS unavailable')
     expect(mocks.cmsClient.markSourceRunReceiptDelivered).not.toHaveBeenCalled()
   })

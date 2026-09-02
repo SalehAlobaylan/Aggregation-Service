@@ -12,12 +12,26 @@ import { getRedisConnection, closeRedisConnection } from './queues/redis.js';
 import { initializeQueues, closeQueues } from './queues/index.js';
 import { startWorkers, closeWorkers, type WorkerRole } from './workers/index.js';
 import { startServer, stopServer } from './server/index.js';
+import { isWorkerRole } from './runtime/role-topology.js';
+import { startRoleReadinessPublisher, stopRoleReadinessPublisher } from './runtime/role-readiness.js';
+
+let shutdownPromise: Promise<void> | null = null;
+
+export function resolveRequestedRole(argvRole = process.argv[2], environmentRole = process.env.ROLE): WorkerRole {
+	const requested = argvRole ?? 'all';
+	if (!isWorkerRole(requested)) throw new Error(`Unknown Aggregation role: ${requested}`);
+	if (environmentRole && environmentRole !== requested) {
+		throw new Error(`Aggregation role mismatch: command requested ${requested}, ROLE declares ${environmentRole}`);
+	}
+	if (requested === 'all' && process.env.NODE_ENV === 'production') {
+		throw new Error('The mixed Aggregation role is disabled in production; select an explicit role');
+	}
+	process.env.ROLE = requested;
+	return requested;
+}
 
 async function main(): Promise<void> {
-	const requestedRole = (process.argv[2] ?? 'all') as WorkerRole;
-	if (!['all', 'intake-control', 'news', 'pods-control', 'media-executor', 'media-maintenance'].includes(requestedRole)) {
-		throw new Error(`Unknown Aggregation role: ${requestedRole}`);
-	}
+	const requestedRole = resolveRequestedRole();
     logger.info('Starting Aggregation Service...', { role: requestedRole });
     logger.info('Configuration loaded', getRedactedConfig(config));
     logger.info('Connection targets', {
@@ -42,6 +56,10 @@ async function main(): Promise<void> {
         logger.info('Starting workers...');
         await startWorkers(requestedRole);
 
+		// Publish only after the complete role cohort has passed exact ownership
+		// validation. CMS consumes these leases as cycle-free owner evidence.
+		await startRoleReadinessPublisher(requestedRole);
+
 		// Every explicit role exposes its own liveness/readiness surface. The
 		// role deployments do not share a process or pod, so the per-container
 		// port remains isolated while orchestration can probe every role.
@@ -57,9 +75,20 @@ async function main(): Promise<void> {
 
 // Graceful shutdown handler
 async function shutdown(signal: string): Promise<void> {
+    if (shutdownPromise) return shutdownPromise;
+    const promise = performShutdown(signal);
+    shutdownPromise = promise;
+    return promise;
+}
+
+async function performShutdown(signal: string): Promise<void> {
     logger.info(`Received ${signal}, shutting down gracefully...`);
 
     try {
+        // Withdraw distributed owner evidence before closing the HTTP surface
+        // or workers. A killed process is covered by the bounded Redis TTL.
+		await stopRoleReadinessPublisher();
+
         // Stop accepting new work
 		await stopServer().catch(() => undefined);
 
@@ -81,8 +110,8 @@ async function shutdown(signal: string): Promise<void> {
 }
 
 // Register shutdown handlers
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {

@@ -170,6 +170,13 @@ export async function createAndUploadAdaptiveHlsPackage(input: {
       manifest_id: uploaded.manifestId,
       url: uploaded.url,
       content_type: details.contentType,
+      provider_head_verified: true,
+      provider_size_bytes: uploaded.bytes,
+      provider_etag: uploaded.providerEtag,
+      provider_checksum_sha256: uploaded.providerChecksumSha256,
+      provider_content_type: uploaded.providerContentType,
+      provider_cache_control: uploaded.providerCacheControl,
+      cache_control: details.cacheControl,
     });
   }
   if (
@@ -201,9 +208,22 @@ export async function createAndUploadAdaptiveHlsPackage(input: {
     input.signal,
   );
   manifestIds.push(progressive.manifestId);
+  const progressiveEvidence = {
+    ...(await fileEvidence(input.outputDir, "fallback.mp4")),
+    manifest_id: progressive.manifestId,
+    url: progressive.url,
+    content_type: "video/mp4",
+    provider_head_verified: true,
+    provider_size_bytes: progressive.bytes,
+    provider_etag: progressive.providerEtag,
+    provider_checksum_sha256: progressive.providerChecksumSha256,
+    provider_content_type: progressive.providerContentType,
+    provider_cache_control: progressive.providerCacheControl,
+    cache_control: "public, max-age=31536000, immutable",
+  };
   const evidence = {
     ...validation.evidence,
-    files: evidenceFiles,
+    files: [...evidenceFiles, progressiveEvidence],
     master_manifest_id: masterManifestId,
     progressive_manifest_id: progressive.manifestId,
     source_digest: input.inputDigest,

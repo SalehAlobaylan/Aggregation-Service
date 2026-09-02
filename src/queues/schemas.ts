@@ -52,6 +52,9 @@ export interface FetchJob {
   /** Internal routing context for a CMS-admitted fetch page; not evidence. */
   sourceRunCoordinatorUnitId?: string;
   sourceRunPageId?: string;
+  /** Compatibility-only bounded continuation counters. */
+  providerCallsSoFar?: number;
+  observedBytesSoFar?: number;
 }
 
 export interface LifecycleReceiptJob {
@@ -185,8 +188,11 @@ export interface AIJob {
     excerpt?: string;
     bodyText?: string;
   };
-  mediaPath?: string; // For transcript generation
-  mediaUrl?: string; // For transcript generation via remote URL
+  mediaUrl?: string; // CMS-approved playback URL
+  /** Preferred durable audio URL for STT, usually an analysis-audio artifact. */
+  transcriptionUrl?: string;
+  /** Authoritatively verified duration from Media/CMS; never probe just to route STT. */
+  durationSec?: number;
   // Hero image / video thumbnail URL — when set, the AI worker also runs
   // CLIP image embedding via Enrichment (best-effort, non-blocking).
   heroImageUrl?: string;

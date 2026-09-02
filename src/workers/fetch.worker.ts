@@ -9,7 +9,7 @@ import { QUEUE_NAMES, type FetchJob } from '../queues/index.js';
 import { fetchFromSource, type SourceConfig } from '../fetchers/index.js';
 import { getQueue } from '../queues/index.js';
 import { cmsClient } from '../cms/client.js';
-import { sourceRunExecutionEnvelopeSchema, sourceRunManifestChildDigest, type SourceRunExecutionEnvelope } from '../contracts/source-runs.js';
+import { sourceRunExecutionEnvelopeSchema, sourceRunManifestChildDigest, sourceRunQueueJobId, type SourceRunExecutionEnvelope } from '../contracts/source-runs.js';
 import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 import type { RawFetchedItem } from '../fetchers/types.js';
@@ -145,7 +145,7 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
             fetchJobId: job.id || envelope.unitJobId, triggeredBy: 'schedule', sourceSettings: settings,
             sourceRunRequestId: envelope.sourceRunRequestId, tenantId: envelope.tenantId,
             sourceRun: childEnvelope, sourceRunPageId: pageId, sourceRunBatchId: batchId,
-        }, { jobId: childEnvelope.unitJobId, priority: 1 });
+        }, { jobId: sourceRunQueueJobId(childEnvelope.unitJobId), priority: 1 });
         childKeys.push(unitKey);
     }
 
@@ -162,7 +162,7 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
         const nextEnvelope = durableEnvelope(envelope, next, nextLease);
         const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
         if (!fetchQueue) throw new Error('fetch queue is unavailable for source-run continuation');
-        await fetchQueue.add('source-run-fetch-page', { ...job.data, config: { ...config, cursor: result.cursor, fetchedSoFar: totalFetchedSoFar, providerCallsSoFar, observedBytesSoFar }, triggeredAt: new Date().toISOString(), sourceRun: nextEnvelope, sourceRunPageId: nextPageId }, { jobId: nextEnvelope.unitJobId, priority: 1, delay: 1000 });
+        await fetchQueue.add('source-run-fetch-page', { ...job.data, config: { ...config, cursor: result.cursor, fetchedSoFar: totalFetchedSoFar, providerCallsSoFar, observedBytesSoFar }, triggeredAt: new Date().toISOString(), sourceRun: nextEnvelope, sourceRunPageId: nextPageId }, { jobId: sourceRunQueueJobId(nextEnvelope.unitJobId), priority: 1, delay: 1000 });
     }
 
 		heartbeat.assertCurrent();
@@ -187,7 +187,7 @@ function parseDeferredObservationMap(value: unknown): Map<string, string> | unde
 	return new Map(entries as Array<[string, string]>);
 }
 
-export const fetchWorker = createWorker({
+export const createFetchWorker = () => createWorker({
     queueName: QUEUE_NAMES.FETCH,
     processor: async (job: Job<FetchJob>, jobLogger, signal): Promise<void> => {
 		if (job.data.sourceRun) {
@@ -223,23 +223,25 @@ export const fetchWorker = createWorker({
             settings: (config.settings as Record<string, unknown>) || {},
         };
 
-        // Fetch content from source
+        // Compatibility requests carry explicit page/byte counters so a
+		// Shorts-only listing cannot recurse forever while trying to fill the
+		// accepted-item cap.
         let result: Awaited<ReturnType<typeof fetchFromSource>>;
+		const previousProviderCalls = getNonNegativeInteger(job.data.providerCallsSoFar) ?? 0;
+		const previousObservedBytes = getNonNegativeInteger(job.data.observedBytesSoFar) ?? 0;
         try {
             result = await fetchFromSource(sourceConfig, config.cursor as string | undefined, signal);
 		} catch (error) {
 			await reportFetchRun(tenantId, sourceId, sourceRunRequestId, job.id, triggeredBy, startedAt, 0, 1, {
-				sourceType,
-				recovery: sourceSettings.recovery,
+				sourceType, recovery: sourceSettings.recovery,
 				error: error instanceof Error ? error.message : String(error),
-			}, signal);
+			}, { terminal: true, hasMore: false, outcome: 'provider_failure', providerCalls: previousProviderCalls + 1, observedBytes: previousObservedBytes }, signal);
             throw error;
         }
-		await reportFetchRun(tenantId, sourceId, sourceRunRequestId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
-			sourceType,
-			recovery: sourceSettings.recovery,
-			reason: result.metadata.reason,
-        }, signal);
+		const providerCalls = previousProviderCalls + 1;
+		const observedBytes = previousObservedBytes + Buffer.byteLength(JSON.stringify(result.items), 'utf8');
+		const providerCallCap = getPositiveInteger(sourceSettings.max_provider_calls) ?? 8;
+		const byteCap = getPositiveInteger(sourceSettings.max_bytes) ?? 64 * 1024 * 1024;
 
         const remainingAllowed =
             typeof configuredMaxResults === 'number' && configuredMaxResults > 0
@@ -286,12 +288,21 @@ export const fetchWorker = createWorker({
             typeof configuredMaxResults === 'number' && configuredMaxResults > 0
                 ? totalFetchedSoFar >= configuredMaxResults
                 : false;
+		const reachedProviderCallCap = providerCalls >= providerCallCap;
+		const reachedByteCap = observedBytes >= byteCap;
+		const canContinue = Boolean(result.hasMore && result.cursor && !reachedMaxResults && !reachedProviderCallCap && !reachedByteCap);
 
         // If we got items, enqueue normalize job
         if (itemsForThisRun.length > 0) {
             const normalizeQueue = getQueue(QUEUE_NAMES.NORMALIZE);
+			if (!normalizeQueue) {
+				await reportFetchRun(tenantId, sourceId, sourceRunRequestId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, 1, {
+					sourceType, recovery: sourceSettings.recovery, reason: 'normalize_queue_unavailable',
+				}, { terminal: true, hasMore: false, outcome: 'downstream_unavailable', providerCalls, observedBytes, accepted: 0, filtered: result.metadata.skipped }, signal);
+				throw new Error('normalize queue is unavailable for compatibility fetch');
+			}
 
-            if (normalizeQueue) {
+			if (normalizeQueue) {
                 await normalizeQueue.add(
                     `normalize-${sourceType}-${sourceId}-${Date.now()}`,
                     {
@@ -325,7 +336,7 @@ export const fetchWorker = createWorker({
         }
 
         // If there's more content to fetch, enqueue continuation job
-        if (result.hasMore && result.cursor && !reachedMaxResults) {
+        if (canContinue) {
             const fetchQueue = getQueue(QUEUE_NAMES.FETCH);
 
             if (fetchQueue) {
@@ -341,6 +352,13 @@ export const fetchWorker = createWorker({
                         },
                         triggeredBy,
                         triggeredAt: new Date().toISOString(),
+						sourceRunRequestId,
+						tenantId,
+						operatorPlanId,
+						operatorStepId,
+						idempotencyKey,
+						providerCallsSoFar: providerCalls,
+						observedBytesSoFar: observedBytes,
                     },
                     {
                         delay: 1000, // Small delay to avoid hammering source
@@ -356,14 +374,33 @@ export const fetchWorker = createWorker({
                     configuredMaxResults,
                 });
             }
-        } else if (reachedMaxResults) {
-            jobLogger.info('Reached configured max_results, stopping pagination', {
+        } else if (result.hasMore && result.cursor) {
+			jobLogger.info('Reached compatibility fetch budget, stopping pagination', {
                 sourceId,
                 sourceType,
                 fetchedSoFar: totalFetchedSoFar,
                 configuredMaxResults,
+				providerCalls,
+				providerCallCap,
+				observedBytes,
+				byteCap,
             });
         }
+
+		const terminal = !canContinue;
+		const budgetTruncated = Boolean(result.hasMore && result.cursor && terminal);
+		const outcome = result.metadata.errors > 0 && itemsForThisRun.length === 0
+			? 'provider_failure'
+			: budgetTruncated
+				? 'budget_truncated'
+				: itemsForThisRun.length > 0
+					? 'legal_candidates'
+					: result.metadata.skipped > 0
+						? 'filtered_short_or_invalid'
+						: 'no_change';
+		await reportFetchRun(tenantId, sourceId, sourceRunRequestId, job.id, triggeredBy, startedAt, result.metadata.totalFetched, result.metadata.errors, {
+			sourceType, recovery: sourceSettings.recovery, reason: result.metadata.reason,
+		}, { terminal, hasMore: canContinue, outcome, providerCalls, observedBytes, accepted: itemsForThisRun.length, filtered: result.metadata.skipped }, signal);
     },
 });
 
@@ -415,6 +452,7 @@ async function reportFetchRun(
     fetched: number,
     failed: number,
     metadata: Record<string, unknown>,
+	outcome: { terminal: boolean; hasMore: boolean; outcome: string; providerCalls: number; observedBytes: number; accepted?: number; filtered?: number },
     signal?: AbortSignal,
 ): Promise<void> {
     if (!jobId || !isUuid(sourceId)) return;
@@ -427,7 +465,14 @@ async function reportFetchRun(
             job_id: jobId,
             triggered_by: triggeredBy,
             fetched,
+			accepted: outcome.accepted ?? 0,
+			filtered: outcome.filtered ?? 0,
             failed,
+			terminal: outcome.terminal,
+			has_more: outcome.hasMore,
+			outcome: outcome.outcome,
+			provider_calls: outcome.providerCalls,
+			observed_bytes: outcome.observedBytes,
             started_at: startedAt.toISOString(),
             finished_at: finishedAt.toISOString(),
             duration_ms: finishedAt.getTime() - startedAt.getTime(),

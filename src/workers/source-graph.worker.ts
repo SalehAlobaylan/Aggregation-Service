@@ -16,7 +16,7 @@ import { logger } from '../observability/logger.js';
 
 const REPEATABLE_NAME = 'source-graph-repeatable';
 
-export const sourceGraphWorker = createWorker({
+export const createSourceGraphWorker = () => createWorker({
     queueName: QUEUE_NAMES.SOURCE_GRAPH,
     concurrency: 1, // graph build crawls + resolves; keep it gentle
     timeoutMs: 10 * 60_000,

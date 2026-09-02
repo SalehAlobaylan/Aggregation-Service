@@ -8,7 +8,7 @@ import { QUEUE_NAMES, type DiscoveryJob } from '../queues/index.js';
 import { runDiscovery } from '../services/discovery/discovery.service.js';
 import { cmsClient } from '../cms/client.js';
 
-export const discoveryWorker = createWorker({
+export const createDiscoveryWorker = () => createWorker({
     queueName: QUEUE_NAMES.DISCOVERY,
     concurrency: 1, // discovery is bursty + hits external APIs; keep it gentle
     processor: async (job: Job<DiscoveryJob>, jobLogger): Promise<void> => {

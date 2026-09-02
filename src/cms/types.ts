@@ -136,6 +136,9 @@ export interface CreateContentItemResponse {
   disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
   required_stages: string[];
   active_stages: string[];
+  /** Compatibility-mode owner work selected by CMS, not Redis. */
+  next_required_stages?: string[];
+  lifecycle_reconciliation_required?: boolean;
   delivery_mode: "legacy" | "shadow" | "durable_required";
 }
 
@@ -327,6 +330,8 @@ export interface ArtifactManifest {
   transcription_generation_id?: string | null;
   transcription_segment_unit_id?: string | null;
   attempt_id?: string | null;
+  producer_event_id: string;
+  fence_token?: string | null;
   artifact_role: string;
   storage_tier: string;
   bucket: string;
@@ -624,6 +629,8 @@ export interface InternalContentItem {
   media_suitability?: string;
   media_suitability_confidence?: number | null;
   media_suitability_reasons?: unknown;
+  /** True when the current CMS row has a persisted dense text embedding. */
+  has_embedding?: boolean;
 }
 
 // =============================================================================
@@ -668,9 +675,10 @@ export interface QualityProfile {
 }
 
 export interface ResolveProfileResponse {
-  profile: QualityProfile;
+  profile: QualityProfile | null;
   /** tenant+source | tenant | source | global */
   matched_on: string;
+  used_default?: boolean;
 }
 
 export interface UpdateContentItemQualityRequest {
@@ -1046,5 +1054,16 @@ export interface ReportSourceRunRequest {
   started_at?: string;
   finished_at?: string;
   duration_ms?: number;
+  legal_duration_candidates?: number;
+  materialized_items?: number;
+  verified_media?: number;
+  ready_visible_units?: number;
+  public_returns?: number;
+  first_page_returns?: number;
+  terminal?: boolean;
+  has_more?: boolean;
+  outcome?: string;
+  provider_calls?: number;
+  observed_bytes?: number;
   metadata?: Record<string, unknown>;
 }

@@ -9,7 +9,7 @@ import {
 import { cmsClient } from "../cms/client.js";
 
 /** The stage queue admits one attempt into the established cut executor. */
-export const podsAtomizationStageWorker = createWorker({
+export const createPodsAtomizationStageWorker = () => createWorker({
   queueName: QUEUE_NAMES.PODS_ATOMIZATION,
   concurrency: 1,
   deadLetterQueueName: QUEUE_NAMES.PODS_STAGE_DLQ,

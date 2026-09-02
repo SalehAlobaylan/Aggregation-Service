@@ -84,7 +84,18 @@ const cmsCircuitBreaker = new CircuitBreaker({
 });
 
 const CMS_REQUEST_TIMEOUT_MS = 10_000;
+// Content ingest is a transactional CMS operation: it resolves durable source
+// lineage and reconciles the content-stage manifest before replying. Against a
+// remote PostgreSQL database that can legitimately take longer than the short
+// control-plane deadline, especially while several normalize batches arrive in
+// parallel. Keep the general deadline strict, but allow the idempotent ingest
+// operation enough time to return its authoritative disposition.
+const CMS_CONTENT_INGEST_TIMEOUT_MS = 60_000;
 const CMS_CIRCULATION_CLAIM_TIMEOUT_MS = 60_000;
+// A durable content-stage claim performs tenant fairness, dependency, fence,
+// and fingerprint checks in one transaction. Remote PostgreSQL can exceed the
+// generic control-plane deadline while a newly activated lane drains backlog.
+const CMS_CONTENT_STAGE_CLAIM_TIMEOUT_MS = 60_000;
 const CMS_MAX_SUCCESS_BODY_BYTES = 2 << 20;
 const CMS_MAX_ERROR_BODY_BYTES = 16 << 10;
 
@@ -96,6 +107,10 @@ export class CMSRequestError extends Error {
     super(`CMS request failed with status ${status}`);
     this.name = "CMSRequestError";
   }
+}
+
+export function isStaleContentStageDeliveryError(error: unknown): boolean {
+  return error instanceof CMSRequestError && (error.status === 404 || error.status === 409);
 }
 
 async function readBoundedText(
@@ -179,11 +194,12 @@ export function contentStageCorrelation(
   };
 }
 
-async function contentStageTransition(
+async function contentStageTransition<T = void>(
   claim: ContentStageClaim,
   action:
     | "begin"
     | "heartbeat"
+    | "checkpoint"
     | "accepted"
     | "deferred"
     | "uncertain"
@@ -191,8 +207,8 @@ async function contentStageTransition(
     | "atomization-not-required",
   extra: Record<string, unknown>,
   requestId?: string,
-): Promise<void> {
-  await makeProtectedRequest<void>(
+): Promise<T> {
+  return makeProtectedRequest<T>(
     "POST",
     `/content-stages/${encodeURIComponent(claim.request_id)}/${action}`,
     {
@@ -295,12 +311,18 @@ export const cmsClient = {
   async claimContentStage(
     lane: "news" | "pods",
     requestId?: string,
+    stages?: string[],
   ): Promise<ContentStageClaim | null> {
+    const query = stages?.length
+      ? `?stages=${encodeURIComponent(stages.join(","))}`
+      : "";
     const raw = await makeProtectedRequest<unknown>(
       "POST",
-      `/content-stages/${lane}/claim`,
+      `/content-stages/${lane}/claim${query}`,
       {},
       requestId,
+      undefined,
+      CMS_CONTENT_STAGE_CLAIM_TIMEOUT_MS,
     );
     if (raw === undefined || raw === null) return null;
     return z
@@ -384,8 +406,27 @@ export const cmsClient = {
   async heartbeatContentStage(
     claim: ContentStageClaim,
     requestId?: string,
+  ): Promise<{ lease_expires_at: string }> {
+    return contentStageTransition<{ lease_expires_at: string }>(claim, "heartbeat", {}, requestId);
+  },
+  async checkpointContentStage(
+    claim: ContentStageClaim,
+    phase: string,
+    proof: Record<string, unknown> = {},
+    requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
-    await contentStageTransition(claim, "heartbeat", {}, requestId);
+    await makeProtectedRequest<void>(
+      "POST",
+      `/content-stages/${encodeURIComponent(claim.request_id)}/checkpoint`,
+      {
+        ...contentStageCorrelation(claim, ""),
+        phase,
+        proof,
+      },
+      requestId,
+      parentSignal,
+    );
   },
   async deferContentStage(
     claim: ContentStageClaim,
@@ -650,8 +691,8 @@ export const cmsClient = {
   async heartbeatPipelineRepair(
     input: { repairId: string; claimToken: string },
     requestId?: string,
-  ): Promise<void> {
-    await makeProtectedRequest(
+  ): Promise<{ lease_expires_at: string }> {
+    return makeProtectedRequest<{ lease_expires_at: string }>(
       "POST",
       `/pipeline-repairs/${encodeURIComponent(input.repairId)}/heartbeat`,
       { claim_token: input.claimToken },
@@ -1163,6 +1204,8 @@ export const cmsClient = {
       "/content-items",
       data,
       requestId,
+      undefined,
+      CMS_CONTENT_INGEST_TIMEOUT_MS,
     );
   },
 
@@ -1578,6 +1621,22 @@ export const cmsClient = {
     );
   },
 
+  /**
+   * Reconcile FAILED rows whose required artifact is already present. This is
+   * a CMS-local repair and deliberately does not enqueue another embedding.
+   */
+  async reconcileArtifactCompleteStatuses(
+    limit = 50,
+    requestId?: string,
+  ): Promise<{ reconciled: number; scanned: number }> {
+    return makeProtectedRequest<{ reconciled: number; scanned: number }>(
+      "POST",
+      `/content-items/reconcile-artifact-complete?limit=${Math.max(1, Math.min(200, Math.floor(limit)))}`,
+      {},
+      requestId,
+    );
+  },
+
   // ---------------------------------------------------------------
   // Storage management
   // ---------------------------------------------------------------
@@ -1863,6 +1922,24 @@ export const cmsClient = {
     return makeProtectedRequest<ArtifactManifest>(
       "GET",
       `/artifact-manifests/${encodeURIComponent(id)}`,
+      undefined,
+      requestId,
+      parentSignal,
+    );
+  },
+  async listArtifactManifests(
+    params: { state?: string; stale?: boolean; tenant_id?: string } = {},
+    requestId?: string,
+    parentSignal?: AbortSignal,
+  ): Promise<{ manifests: ArtifactManifest[] }> {
+    const query = new URLSearchParams();
+    if (params.state) query.set("state", params.state);
+    if (params.stale) query.set("stale", "true");
+    if (params.tenant_id) query.set("tenant_id", params.tenant_id);
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return makeProtectedRequest<{ manifests: ArtifactManifest[] }>(
+      "GET",
+      `/artifact-manifests${suffix}`,
       undefined,
       requestId,
       parentSignal,
@@ -2269,6 +2346,24 @@ export const cmsClient = {
       undefined,
       requestId,
     );
+  },
+
+  async putPipelineLaneSnapshot(data: {
+    tenant_id?: string;
+    lane: "news" | "pods";
+    required_queue_depth: number;
+    optional_queue_depth: number;
+    required_oldest_age_seconds: number;
+    optional_oldest_age_seconds: number;
+    dlq_delta: number;
+    failure_classes?: Record<string, number>;
+    stage_counts?: Record<string, number>;
+    enrichment_counts?: Record<string, number>;
+    process_metrics?: Record<string, unknown>;
+    resource_metrics?: Record<string, unknown>;
+    captured_at?: string;
+  }, requestId?: string): Promise<unknown> {
+    return makeProtectedRequest("PUT", `/pipeline-lanes/${data.lane}/snapshot`, data, requestId);
   },
 
   /**

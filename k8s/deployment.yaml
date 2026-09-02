@@ -110,12 +110,22 @@ spec:
             - {name: METRICS_PORT, value: "5002"}
             - {name: MEDIA_JOB_TIMEOUT_MS, value: "3600000"}
             - {name: WORKER_CONCURRENCY, value: "2"}
+            - {name: YOUTUBE_PO_TOKEN_PROVIDER_URL, value: "http://127.0.0.1:4416"}
           resources:
             requests: {cpu: "1", memory: 2Gi, ephemeral-storage: 8Gi}
             limits: {cpu: "4", memory: 8Gi, ephemeral-storage: 24Gi}
           readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 20, periodSeconds: 15, timeoutSeconds: 5}
           livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 30, periodSeconds: 30, timeoutSeconds: 5}
           volumeMounts: [{name: media-scratch, mountPath: /tmp/wahb-media}]
+        - name: youtube-pot-provider
+          image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
+          ports: [{name: youtube-pot, containerPort: 4416}]
+          startupProbe: {httpGet: {path: /ping, port: youtube-pot}, periodSeconds: 2, failureThreshold: 15}
+          readinessProbe: {httpGet: {path: /ping, port: youtube-pot}, periodSeconds: 10, timeoutSeconds: 3}
+          livenessProbe: {httpGet: {path: /ping, port: youtube-pot}, initialDelaySeconds: 15, periodSeconds: 30, timeoutSeconds: 3}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 1Gi}
       volumes: [{name: media-scratch, emptyDir: {sizeLimit: 24Gi}}]
 ---
 apiVersion: apps/v1
@@ -145,6 +155,34 @@ spec:
           livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 25, periodSeconds: 30, timeoutSeconds: 5}
           volumeMounts: [{name: scratch, mountPath: /tmp/wahb-media}]
       volumes: [{name: scratch, emptyDir: {sizeLimit: 8Gi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-legacy-drain
+  labels: {app: aggregation, role: legacy-drain}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: aggregation, role: legacy-drain}}
+  template:
+    metadata:
+      labels: {app: aggregation, role: legacy-drain}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "5002", prometheus.io/path: /metrics}
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      containers:
+        - name: legacy-drain
+          image: ghcr.io/your-org/aggregation-service:latest
+          command: ["node", "dist/index.js", "legacy-drain"]
+          ports: [{name: metrics, containerPort: 5002}]
+          envFrom: [{configMapRef: {name: aggregation-config}}, {secretRef: {name: aggregation-secrets}}]
+          env: [{name: ROLE, value: legacy-drain}, {name: METRICS_PORT, value: "5002"}]
+          resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {cpu: 750m, memory: 2Gi, ephemeral-storage: 2Gi}}
+          readinessProbe: {httpGet: {path: /ready, port: metrics}, initialDelaySeconds: 10, periodSeconds: 15, timeoutSeconds: 5}
+          livenessProbe: {httpGet: {path: /health, port: metrics}, initialDelaySeconds: 20, periodSeconds: 30, timeoutSeconds: 5}
+          volumeMounts: [{name: scratch, mountPath: /tmp/wahb-media}]
+      volumes: [{name: scratch, emptyDir: {sizeLimit: 2Gi}}]
 ---
 apiVersion: v1
 kind: Service

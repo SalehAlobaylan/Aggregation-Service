@@ -6,6 +6,7 @@ import {
   sourceRunReceiptCapability,
   sourceRunReceiptPayloadDigest,
   sourceRunManifestChildDigest,
+  sourceRunQueueJobId,
   sourceRunVerificationClaimSchema,
   sourceRunReceiptSchema,
   sourceRunTerminalOutcomeCategory,
@@ -62,6 +63,12 @@ describe('source-run/v1 contract', () => {
     expect(sourceRunManifestChildDigest(['normalize:page-a:batch-2', 'normalize:page-a:batch-1']))
       .toBe(sourceRunManifestChildDigest(['normalize:page-a:batch-1', 'normalize:page-a:batch-2']))
     expect(() => sourceRunManifestChildDigest([''])).toThrow('non-empty')
+  })
+
+  it('encodes CMS unit identities as BullMQ-safe custom job IDs', () => {
+    expect(sourceRunQueueJobId('source-unit:abc')).toBe('source-unit-abc')
+    expect(sourceRunQueueJobId('source-unit:abc')).not.toContain(':')
+    expect(() => sourceRunQueueJobId('  ')).toThrow('requires a CMS unit job ID')
   })
 
   it('accepts only a CMS-selected, fenced verification task', () => {

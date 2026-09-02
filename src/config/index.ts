@@ -118,6 +118,14 @@ const configSchema = z.object({
     // Optional - YouTube API
     youtubeApiKey: z.string().nullable().default(null),
     youtubeQuotaLimit: positiveIntSchema.default(10000),
+    // Netscape-format cookie jar used by yt-dlp when YouTube requires a
+    // provider-authenticated browser session. This is credential material,
+    // not a ranking/processing tuning knob.
+    youtubeCookiesFile: z.string().trim().min(1).nullable().default(null),
+    // Optional HTTP endpoint for the yt-dlp PO-token provider. The provider
+    // solves YouTube's per-video attestation challenge; it is boot-time media
+    // infrastructure rather than a processing policy knob.
+    youtubePoTokenProviderUrl: z.string().url().nullable().default(null),
 
     // Optional - Telegram API
     telegramApiId: z.preprocess(
@@ -215,6 +223,8 @@ function mapEnvToConfig(): Record<string, unknown> {
 
         youtubeApiKey: process.env.YOUTUBE_API_KEY || null,
         youtubeQuotaLimit: process.env.YOUTUBE_QUOTA_LIMIT,
+        youtubeCookiesFile: process.env.YOUTUBE_COOKIES_FILE || null,
+        youtubePoTokenProviderUrl: process.env.YOUTUBE_PO_TOKEN_PROVIDER_URL || null,
 
         telegramApiId: process.env.TELEGRAM_API_ID,
         telegramApiHash: process.env.TELEGRAM_API_HASH || null,
@@ -299,6 +309,8 @@ export function getRedactedConfig(cfg: Config): Record<string, unknown> {
         cbFailureThreshold: cfg.cbFailureThreshold,
         cbResetTimeoutMs: cfg.cbResetTimeoutMs,
         youtubeApiKey: cfg.youtubeApiKey ? '[CONFIGURED]' : null,
+        youtubeCookiesFile: cfg.youtubeCookiesFile ? '[CONFIGURED]' : null,
+        youtubePoTokenProviderUrl: cfg.youtubePoTokenProviderUrl ? '[CONFIGURED]' : null,
         telegramApiId: cfg.telegramApiId ? '[CONFIGURED]' : null,
         telegramApiHash: cfg.telegramApiHash ? '[CONFIGURED]' : null,
         telegramSessionString: cfg.telegramSessionString ? '[CONFIGURED]' : null,

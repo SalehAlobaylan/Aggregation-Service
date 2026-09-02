@@ -26,6 +26,7 @@ import { cmsClient } from '../../cms/client.js';
 import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
 import { runSweepForTenant } from '../../services/storage.service.js';
 import { databaseMigrationQuiescence, quiesceForDatabaseMigration, resumeAfterDatabaseMigration } from '../../services/database-migration-quiescence.js';
+import { aggregateTopologyReadiness } from '../../runtime/role-readiness.js';
 
 interface UserContentResponse {
     success: boolean;
@@ -139,6 +140,21 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		fastify.addContentTypeParser('application/octet-stream', (request, payload, done) => done(null, payload));
 	}
     fastify.addHook('onRequest', verifyInternalServiceAuth);
+
+	fastify.get('/internal/readiness/topology', async (_request, reply) => {
+		try {
+			return reply.send(await aggregateTopologyReadiness());
+		} catch (error) {
+			logger.warn('Aggregation topology readiness unavailable', {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return reply.status(503).send({
+				schema_version: 'aggregation-topology-readiness/v1',
+				status: 'unavailable',
+				message: 'distributed role evidence is unavailable',
+			});
+		}
+	});
 
 	fastify.get<{ Reply: { data: InternalQueueStats[] } }>('/internal/queues', async (_request, reply) => {
         const data: InternalQueueStats[] = [];

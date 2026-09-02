@@ -187,16 +187,32 @@ export async function generateEmbeddingViaEnrichment(
 	if (opts.lane) body.lane = opts.lane;
 	if (opts.contentStage) body.content_stage = opts.contentStage;
 
-    const response = await fetch(`${baseUrl()}/v1/embed`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-        headers: {
-            'Content-Type': 'application/json',
-            ...authHeaders(),
-            ...tracingHeaders(opts.requestId),
-        },
-        signal: requestSignal(opts.signal, EMBED_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+        response = await fetch(`${baseUrl()}/v1/embed`, {
+            method: 'POST',
+            body: JSON.stringify(body),
+            headers: {
+                'Content-Type': 'application/json',
+                ...authHeaders(),
+                ...tracingHeaders(opts.requestId),
+            },
+            signal: requestSignal(opts.signal, EMBED_TIMEOUT_MS),
+        });
+    } catch (error) {
+        // A worker shutdown is a real cancellation and must not turn into a
+        // retryable provider failure. Other abort/network failures are
+        // explicitly unknown-effect: Enrichment may still have finished its
+        // CMS writeback after the client stopped waiting.
+        if (opts.signal?.aborted) throw error;
+        throw new EnrichmentRequestError(
+            `Enrichment /v1/embed request did not complete: ${error instanceof Error ? error.message : String(error)}`,
+            504,
+            true,
+            10,
+            'UPSTREAM_TIMEOUT_OR_NETWORK',
+        );
+    }
 
     if (!response.ok) {
         const errorText = await response.text().catch(() => '');

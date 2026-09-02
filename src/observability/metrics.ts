@@ -88,6 +88,13 @@ export const mediaPermitSaturation = new client.Gauge({
     registers: [registry],
 });
 
+export const contentStageLeaseRenewals = new client.Counter({
+    name: 'aggregation_content_stage_lease_renewals_total',
+    help: 'Content-stage lease renewal attempts by stage and outcome',
+    labelNames: ['stage', 'outcome'] as const,
+    registers: [registry],
+});
+
 /** Aggregate optional maintenance backlog for its independently pausable role. */
 export const maintenanceQueueDepth = new client.Gauge({
     name: 'aggregation_maintenance_queue_depth',

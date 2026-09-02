@@ -44,6 +44,26 @@ export class ResourceDeferredError extends Error {
   }
 }
 
+export class ResourceLeaseLostError extends Error {
+  constructor(readonly workload: WorkloadClass) {
+    super(`resource lease lost while running ${workload}`);
+    this.name = "ResourceLeaseLostError";
+  }
+}
+
+export function mergeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal {
+  const controller = new AbortController();
+  const abort = (signal: AbortSignal) => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  for (const signal of signals) {
+    if (!signal) continue;
+    if (signal.aborted) { abort(signal); continue; }
+    signal.addEventListener("abort", () => abort(signal), { once: true });
+  }
+  return controller.signal;
+}
+
 export interface ResourceLease {
   id: string;
   workload: WorkloadClass;
@@ -68,25 +88,45 @@ local weight = tonumber(ARGV[3])
 local lease = ARGV[4]
 local expires = tonumber(ARGV[5])
 local lane = ARGV[6]
-local required_waiting = tonumber(redis.call('HGET', key, 'required_waiting') or '0')
-for member, expiry in pairs(redis.call('ZRANGE', key .. ':leases', 0, -1, 'WITHSCORES')) do
-  if tonumber(expiry) <= now then redis.call('ZREM', key .. ':leases', member); redis.call('HDEL', key .. ':weights', member) end
+local waiter = ARGV[7]
+local leases = redis.call('ZRANGE', key .. ':leases', 0, -1, 'WITHSCORES')
+for index = 1, #leases, 2 do
+  local member = leases[index]
+  local expiry = tonumber(leases[index + 1])
+  if expiry <= now then redis.call('ZREM', key .. ':leases', member); redis.call('HDEL', key .. ':weights', member) end
 end
+-- Recover from an older lease ZSET expiring before its weights hash. A weight
+-- without a live lease is never capacity ownership and must not strand the
+-- domain permanently.
+for _, member in ipairs(redis.call('HKEYS', key .. ':weights')) do
+  if redis.call('ZSCORE', key .. ':leases', member) == false then
+    redis.call('HDEL', key .. ':weights', member)
+  end
+end
+redis.call('ZREMRANGEBYSCORE', key .. ':waiters', '-inf', now)
+if lane == 'required' then redis.call('ZADD', key .. ':waiters', expires, waiter) end
+local required_waiting = redis.call('ZCARD', key .. ':waiters')
 local values = redis.call('HVALS', key .. ':weights')
 local used = 0
 for _, value in ipairs(values) do used = used + tonumber(value) end
 if lane == 'maintenance' and required_waiting > 0 then return {0, used} end
 if used + weight > capacity then return {0, used} end
+redis.call('ZREM', key .. ':waiters', waiter)
 redis.call('ZADD', key .. ':leases', expires, lease)
 redis.call('HSET', key .. ':weights', lease, weight)
-redis.call('EXPIRE', key, 120)
 redis.call('EXPIRE', key .. ':leases', 120)
+redis.call('EXPIRE', key .. ':weights', 120)
+redis.call('EXPIRE', key .. ':waiters', 120)
 return {1, used + weight}
 `;
 
 const HEARTBEAT = `
 if redis.call('ZSCORE', KEYS[1] .. ':leases', ARGV[1]) == false then return 0 end
+if redis.call('HEXISTS', KEYS[1] .. ':weights', ARGV[1]) == 0 then return 0 end
 redis.call('ZADD', KEYS[1] .. ':leases', ARGV[2], ARGV[1])
+redis.call('EXPIRE', KEYS[1] .. ':leases', 120)
+redis.call('EXPIRE', KEYS[1] .. ':weights', 120)
+redis.call('EXPIRE', KEYS[1] .. ':waiters', 120)
 return 1
 `;
 
@@ -101,6 +141,7 @@ return used
 export async function acquireResourceLease(
   workload: WorkloadClass,
   lane: WorkloadLane = "required",
+  requestId?: string,
 ): Promise<ResourceLease> {
   const redis = getRedisConnection();
   const id = `${process.pid}:${randomUUID()}`;
@@ -115,6 +156,10 @@ export async function acquireResourceLease(
     id,
     now + LEASE_MS,
     lane,
+    // The lease UUID is the attempt identity. A caller/job id may be reused
+    // across retries and must never collapse two required waiters into one
+    // Redis ZSET member.
+    `${requestId?.trim() || "request"}:${id}`,
   )) as [number, number];
   const used = Number(acquired[1] ?? 0);
   mediaPermitSaturation.set(Math.min(1, used / DEFAULT_COMPUTE_CAPACITY));
@@ -153,18 +198,51 @@ export async function acquireResourceLease(
 export async function withResourceLease<T>(
   workload: WorkloadClass,
   lane: WorkloadLane,
-  effect: () => Promise<T>,
+  effect: (leaseSignal: AbortSignal) => Promise<T>,
+  requestId?: string,
 ): Promise<T> {
-  const lease = await acquireResourceLease(workload, lane);
+  const lease = await acquireResourceLease(workload, lane, requestId);
+  const leaseAbort = new AbortController();
+  let lost: ResourceLeaseLostError | undefined;
+  let rejectLoss: ((error: Error) => void) | undefined;
+  const loss = new Promise<never>((_, reject) => { rejectLoss = reject; });
   const heartbeat = setInterval(
-    () => void lease.heartbeat().catch(() => undefined),
+    () => void lease.heartbeat().then((ok) => {
+      if (!ok && !lost) {
+        lost = new ResourceLeaseLostError(workload);
+        leaseAbort.abort(lost);
+        rejectLoss?.(lost);
+      }
+    }).catch(() => {
+      if (!lost) {
+        lost = new ResourceLeaseLostError(workload);
+        leaseAbort.abort(lost);
+        rejectLoss?.(lost);
+      }
+    }),
     LEASE_MS / 3,
   );
   heartbeat.unref();
+  // Keep a handle to the actual effect. If the lease disappears, the race
+  // rejects immediately so BullMQ can defer the job, but the child process
+  // still needs time to observe the abort and exit before the lease is
+  // released. Releasing first would let a replacement job overlap the
+  // terminating encoder and recreate the overload this admission layer is
+  // meant to prevent.
+  // A callback typed as Promise<T> can still throw before returning one. Wrap
+  // that synchronous failure so the lease-cleanup path always runs and the
+  // admission record cannot be stranded.
+  let effectPromise: Promise<T>;
   try {
-    return await effect();
+    effectPromise = Promise.resolve(effect(leaseAbort.signal));
+  } catch (error) {
+    effectPromise = Promise.reject(error);
+  }
+  try {
+    return await Promise.race([effectPromise, loss]);
   } finally {
     clearInterval(heartbeat);
+    if (lost) await effectPromise.catch(() => undefined);
     await lease.release();
   }
 }

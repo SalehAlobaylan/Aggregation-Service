@@ -17,7 +17,7 @@ import { logger } from '../observability/logger.js';
 
 const REPEATABLE_NAME = 'discovery-sweep-repeatable';
 
-export const discoverySweepWorker = createWorker({
+export const createDiscoverySweepWorker = () => createWorker({
     queueName: QUEUE_NAMES.DISCOVERY_SWEEP,
     concurrency: 1,
     processor: async (job: Job<DiscoverySweepJob>, jobLogger): Promise<void> => {

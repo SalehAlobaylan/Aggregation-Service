@@ -17,7 +17,7 @@ import { runSweepForTenant } from '../services/storage.service.js';
 import { logger } from '../observability/logger.js';
 import type { StoragePolicy } from '../cms/types.js';
 
-export const storageWorker = createWorker({
+export const createStorageWorker = () => createWorker({
     queueName: QUEUE_NAMES.STORAGE_SWEEP,
     concurrency: 1,
     timeoutMs: 10 * 60 * 1000, // 10 min

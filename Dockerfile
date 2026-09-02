@@ -1,7 +1,11 @@
 # Build stage
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
+
+# Node 22 may need to compile optional native transports when a matching
+# prebuilt artifact is unavailable for the target architecture.
+RUN apk add --no-cache python3 make g++
 
 # Copy package files
 COPY package*.json ./
@@ -17,7 +21,7 @@ COPY src ./src
 RUN npm run build
 
 # Production stage
-FROM node:20-slim AS production
+FROM node:22-slim AS production
 
 WORKDIR /app
 
@@ -26,17 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     python3 \
     python3-pip \
+    build-essential \
     curl \
     wget \
-    && pip3 install --no-cache-dir --break-system-packages yt-dlp \
+    && pip3 install --no-cache-dir --break-system-packages yt-dlp==2026.8.19 yt-dlp-ejs==0.8.0 bgutil-ytdlp-pot-provider==1.3.1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies only
-RUN npm ci --only=production
+# Install production dependencies only, then remove the compiler toolchain.
+# Runtime Python remains because yt-dlp itself is a Python application.
+RUN npm ci --omit=dev \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
 
 # Copy built files from builder
 COPY --from=builder /app/dist ./dist

@@ -3,7 +3,6 @@
  * Phase 3: Full implementation
  */
 import { Job } from 'bullmq';
-import { join } from 'path';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type AIJob } from '../queues/index.js';
 import { getQueue } from '../queues/index.js';
@@ -15,7 +14,7 @@ import { config } from '../config/index.js';
 //   - Enrichment-Service: text intelligence (text embed, tags, future LLM)
 // Aggregation passes content_id; each service writes its artifact to CMS.
 import {
-    transcribeViaMedia,
+    transcribeUrlViaMedia,
     transcribeAsyncViaMedia,
     embedImageViaMedia,
     type TranscriptResult,
@@ -27,11 +26,7 @@ import {
 import { buildEmbeddingText } from '../ai/embeddings.js';
 import { shouldAtomizeParent } from './atomization.helpers.js';
 
-// Media services
-import { extractAudio, getMediaInfo } from '../media/transcoder.js';
-import { cleanupTempFile, downloadHttp } from '../media/downloader.js';
-
-export const aiWorker = createWorker({
+export const createLegacyAIWorker = () => createWorker({
     queueName: QUEUE_NAMES.AI,
     // Match Enrichment's bounded embedding admission capacity. A larger local
     // worker pool predictably creates 429s instead of increasing throughput.
@@ -42,8 +37,9 @@ export const aiWorker = createWorker({
             contentType,
             operations,
             textContent,
-            mediaPath,
             mediaUrl,
+            transcriptionUrl,
+            durationSec,
             heroImageUrl,
             captionState = 'none',
             captionText,
@@ -54,10 +50,9 @@ export const aiWorker = createWorker({
             contentItemId,
             contentType,
             operations,
-            hasMediaPath: !!mediaPath,
+            hasTranscriptionUrl: !!(transcriptionUrl || mediaUrl),
         });
 
-        const tempFiles: string[] = [];
         // Seed from the YouTube caption (if any) so embedding includes the
         // caption text even when STT runs asynchronously / not at all.
         let transcriptText: string | undefined = captionText;
@@ -71,28 +66,12 @@ export const aiWorker = createWorker({
         let embeddingFailure: unknown;
 
         try {
-            // 1. Generate transcript if media path provided and transcript operation requested
+            // 1. Decide whether STT is needed before downloading any processed
+            // media. The CMS guard owns this decision (toggle, caption state,
+            // budget, and current transcript state). A denied or unnecessary
+            // request must not trigger a second full-media download.
             const wantsTranscript = operations.includes('transcript');
-            // Producer temp files are never a valid cross-job contract. Drain
-            // legacy path-bearing payloads by using their durable URL instead.
-            // A path-only legacy job will retry rather than read an arbitrary
-            // local file.
-            let resolvedMediaPath: string | undefined;
-
-            if (wantsTranscript && !resolvedMediaPath && mediaUrl) {
-                try {
-                    jobLogger.info('Downloading media for transcript', { mediaUrl });
-                    const expectedExt = contentType === 'PODCAST' ? 'mp3' : 'mp4';
-                    const downloadResult = await downloadHttp(mediaUrl, `${contentItemId}_ai`, expectedExt, signal);
-                    resolvedMediaPath = downloadResult.filePath;
-                    tempFiles.push(resolvedMediaPath);
-                } catch (downloadError) {
-                    jobLogger.warn('Failed to download media for transcript', {
-                        contentItemId,
-                        error: downloadError instanceof Error ? downloadError.message : 'Unknown error',
-                    });
-                }
-            }
+            const durableTranscriptionUrl = transcriptionUrl || mediaUrl;
 
             // Caption-first transcript logic:
             //  - youtube_human → caption already written by media worker; skip STT.
@@ -104,7 +83,7 @@ export const aiWorker = createWorker({
             if (wantsTranscript && captionState === 'youtube_human') {
                 transcriptWritten = true; // the human caption IS the transcript
                 jobLogger.info('Human YouTube caption present — skipping STT', { contentItemId });
-            } else if (wantsTranscript && resolvedMediaPath) {
+            } else if (wantsTranscript && durableTranscriptionUrl) {
                 try {
                     const decision = await cmsClient.requestStt(contentItemId, forceStt, job.id, signal);
                     sttAllowed = decision.triggered;
@@ -124,45 +103,22 @@ export const aiWorker = createWorker({
                 }
             }
 
-            if (sttAllowed && resolvedMediaPath) {
+            if (sttAllowed && durableTranscriptionUrl) {
                 try {
-                    jobLogger.info('Generating transcript', { mediaPath: resolvedMediaPath });
-
-                    // Extract audio if video file
-                    let audioPath = resolvedMediaPath;
-                    if (resolvedMediaPath.endsWith('.mp4') || resolvedMediaPath.endsWith('.webm')) {
-                        audioPath = join(config.mediaTempDir, `${contentItemId}_audio.mp3`);
-                        await extractAudio(resolvedMediaPath, audioPath, { signal });
-                        tempFiles.push(audioPath);
-                    }
-
-                    // Transcribe via Media-Service. content_id triggers
-                    // server-side write-back to CMS (transcript + link).
-                    // Route by ACTUAL audio duration, not content type: anything
-                    // longer than the threshold goes async to avoid HTTP gateway
-                    // timeouts (a long VIDEO is just as risky as a podcast). If
-                    // the ffprobe fails, fall back to the content-type heuristic
-                    // so a bad probe never drops the job onto a timeout-prone path.
-                    let useAsync = contentType === 'PODCAST';
-                    try {
-                        const { duration } = await getMediaInfo(audioPath);
-                        if (duration > 0) {
-                            useAsync = duration > config.asyncTranscribeThresholdSec;
-                        }
-                    } catch (probeError) {
-                        jobLogger.debug('Duration probe failed; using content-type heuristic', {
-                            contentItemId,
-                            error: probeError instanceof Error ? probeError.message : 'Unknown error',
-                        });
-                    }
+                    // The source was already persisted and verified by the Media
+                    // worker. Do not download, probe, extract, and upload a second
+                    // copy merely to hand it to the async Media worker.
+                    const useAsync = typeof durationSec === 'number' && durationSec > 0
+                        ? durationSec > config.asyncTranscribeThresholdSec
+                        : contentType === 'PODCAST';
                     const result: TranscriptResult = useAsync
                         ? await transcribeAsyncViaMedia(
-                              audioPath,
+                              durableTranscriptionUrl,
                               contentItemId,
                               { wordTimestamps: true, requestId: job.id, transcriptionJobId, signal },
                           )
-                        : await transcribeViaMedia(
-                              audioPath,
+                        : await transcribeUrlViaMedia(
+                              durableTranscriptionUrl,
                               contentItemId,
                               { wordTimestamps: true, requestId: job.id, transcriptionJobId, signal },
                           );
@@ -383,6 +339,34 @@ export const aiWorker = createWorker({
         } catch (error) {
             jobLogger.error('AI job failed', error, { contentItemId });
 
+            // A client timeout is not proof that the Enrichment writeback did
+            // not happen. Read the CMS artifact owner once before retrying or
+            // recording a lifecycle failure. This closes the race where a
+            // successful embedding was followed by a stale FAILED status.
+            try {
+                const observed = await cmsClient.getContentItem(contentItemId, job.id);
+                if (observed.has_embedding) {
+                    if (observed.status !== 'READY' && observed.status !== 'ARCHIVED') {
+                        await cmsClient.updateStatus(contentItemId, { status: 'READY' }, job.id);
+                    }
+                    jobLogger.info('Recovered successful embedding after uncertain AI outcome', {
+                        contentItemId,
+                        observedStatus: observed.status,
+                    });
+                    return;
+                }
+                if (observed.status === 'READY' || observed.status === 'ARCHIVED') {
+                    // Published lifecycle is monotonic even when this is a
+                    // duplicate or optional operation.
+                    return;
+                }
+            } catch (observationError) {
+                jobLogger.warn('Could not verify AI effect before failure handling', {
+                    contentItemId,
+                    error: observationError instanceof Error ? observationError.message : String(observationError),
+                });
+            }
+
             // Reconcile/repair jobs must NEVER downgrade an item's status: they
             // run against items that are typically already READY but missing an
             // embedding, so a failed re-embed (e.g. a transient Enrichment
@@ -391,9 +375,11 @@ export const aiWorker = createWorker({
             // (still PROCESSING) keep the FAILED transition so genuine failures
             // stay visible.
             const isRepairJob = job.name?.startsWith('reconcile-embed') ?? false;
-            const maxAttempts = job.opts.attempts ?? 1;
-            const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
-            const shouldPersistFailure = !isRetryableEnrichmentError(error) || isFinalAttempt;
+            // Retryable capacity/transport errors are deliberately left in the
+            // queue with the long AI backoff. The CMS stage path uses explicit
+            // deferral; the compatibility drain must not burn its last attempt
+            // merely because Enrichment was busy.
+            const shouldPersistFailure = !isRetryableEnrichmentError(error);
             if (!isRepairJob && shouldPersistFailure) {
                 try {
                     await cmsClient.updateStatus(
@@ -412,9 +398,6 @@ export const aiWorker = createWorker({
             throw error;
         } finally {
             // Cleanup temp files
-            for (const tempFile of tempFiles) {
-                await cleanupTempFile(tempFile);
-            }
         }
     },
 });

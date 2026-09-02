@@ -262,7 +262,6 @@ async function measureAudioPacketBitrateKbps(
       inputPath,
     ],
     timeoutMs: options.timeoutMs ?? config.mediaJobTimeoutMs,
-    noProgressTimeoutMs: MEDIA_COMMAND_NO_PROGRESS_TIMEOUT_MS,
     signal: options.signal,
     onStdout: (chunk) => {
       const value = remainder + chunk.toString();
@@ -337,7 +336,6 @@ export async function getMediaInfo(
       inputPath,
     ],
     timeoutMs: options.timeoutMs ?? Math.min(config.mediaJobTimeoutMs, 60_000),
-    noProgressTimeoutMs: MEDIA_COMMAND_NO_PROGRESS_TIMEOUT_MS,
     signal: options.signal,
     onStdout: (chunk) => {
       stdout += chunk.toString();
@@ -1299,7 +1297,13 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
   playlistCount: number;
   evidence: Record<string, unknown>;
 }> {
-  const files = await readdir(outputDir);
+  const files = (await readdir(outputDir)).sort();
+  for (const file of files) {
+    if (file !== file.trim() || file.includes("/") || file.includes("\\"))
+      throw new Error(`HLS package contains an unsafe object name: ${file}`);
+    const entry = await stat(join(outputDir, file));
+    if (!entry.isFile()) throw new Error(`HLS package contains non-file ${file}`);
+  }
   const playlists = files.filter((file) => file.endsWith(".m3u8"));
   if (!files.includes("master.m3u8") || playlists.length < 4)
     throw new Error("adaptive HLS package is incomplete");
@@ -1365,7 +1369,8 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
   const mediaPlaylists = playlists.filter(
     (file) => !["master.m3u8", "standard.m3u8", "high.m3u8"].includes(file),
   );
-  if (mediaPlaylists.length < 3)
+  const videoPlaylists = mediaPlaylists.filter((file) => /^v\d+\.m3u8$/.test(file));
+  if (!mediaPlaylists.includes("audio.m3u8") || videoPlaylists.length < 2)
     throw new Error(
       "adaptive HLS requires shared audio and at least two video playlists",
     );
@@ -1398,16 +1403,35 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
     Math.abs(masterProbe.duration - Math.max(...durations)) > 6.25
   )
     throw new Error("HLS probe duration differs from manifest timeline");
-  const declaredBandwidth = [...master.matchAll(/BANDWIDTH=(\d+)/g)].map(
-    (match) => Number(match[1]),
-  );
+  const masterVariants = [...master.matchAll(
+    /#EXT-X-STREAM-INF:([^\n]+)\n([^\n]+)/g,
+  )].map((match) => {
+    const attributes = match[1] ?? "";
+    const playlist = (match[2] ?? "").trim();
+    const readAttribute = (name: string): number | string | undefined => {
+      const value = attributes.match(new RegExp(`(?:^|,)${name}=([^,]+)`))?.[1];
+      if (!value) return undefined;
+      return /^\d+$/.test(value) ? Number(value) : value.replace(/^"|"$/g, "");
+    };
+    return {
+      playlist,
+      bandwidth: readAttribute("BANDWIDTH"),
+      averageBandwidth: readAttribute("AVERAGE-BANDWIDTH"),
+    };
+  });
+  const declaredBandwidth = masterVariants.map((variant) => variant.bandwidth);
+  if (masterVariants.length !== variantCount)
+    throw new Error("HLS master contains malformed variant declarations");
   const measuredBandwidth: Record<string, number> = {};
+  const peakBandwidth: Record<string, number> = {};
   for (const playlist of mediaPlaylists) {
     const raw = await readFile(join(outputDir, playlist), "utf8");
-    const refs = raw
-      .split("\n")
-      .map((v) => v.trim())
-      .filter((v) => v && !v.startsWith("#") && v.endsWith(".m4s"));
+    const segmentDurations = [
+      ...raw.matchAll(/#EXTINF:([0-9.]+)[^\n]*\n([^\n]+)/g),
+    ].map((match) => ({ duration: Number(match[1]), ref: match[2]?.trim() }));
+    const refs = segmentDurations
+      .map((segment) => segment.ref)
+      .filter((ref): ref is string => Boolean(ref?.endsWith(".m4s")));
     const bytes = (
       await Promise.all(
         refs.map((ref) =>
@@ -1421,6 +1445,15 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
     if (bandwidth <= 0)
       throw new Error(`HLS playlist ${playlist} has no measurable bandwidth`);
     measuredBandwidth[playlist] = bandwidth;
+    const segmentRates = await Promise.all(
+      segmentDurations.map(async (segment) => {
+        if (!segment.ref || !Number.isFinite(segment.duration) || segment.duration <= 0)
+          throw new Error(`HLS playlist cannot map segment timing: ${playlist}`);
+        const entry = await stat(join(outputDir, segment.ref));
+        return Math.ceil((entry.size * 8) / segment.duration);
+      }),
+    );
+    peakBandwidth[playlist] = Math.max(...segmentRates, bandwidth);
     if (playlist !== "audio.m3u8") {
       let packetJson = "";
       const packetProbe = await runManagedProcess({
@@ -1438,7 +1471,6 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
           join(outputDir, playlist),
         ],
         timeoutMs: 60_000,
-        noProgressTimeoutMs: MEDIA_COMMAND_NO_PROGRESS_TIMEOUT_MS,
         onStdout: (chunk) => {
           packetJson += chunk.toString();
         },
@@ -1455,14 +1487,73 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
         throw new Error(
           `HLS playlist does not start on a keyframe: ${playlist}`,
         );
+      const boundaryChecks: Array<{
+        index: number;
+        offset: number;
+        keyframe: boolean;
+        pts?: string;
+      }> = [{
+        index: 0,
+        offset: 0,
+        keyframe: true,
+        pts: packets[0]?.pts_time,
+      }];
+      for (const index of [...new Set([
+        Math.floor(segmentDurations.length / 2),
+        segmentDurations.length - 1,
+      ])]) {
+        const segment = segmentDurations[index];
+        if (!segment?.ref || !Number.isFinite(segment.duration))
+          throw new Error(`HLS playlist cannot map segment timing: ${playlist}`);
+        const offset = segmentDurations
+          .slice(0, index)
+          .reduce((total, value) => total + value.duration, 0);
+        let boundaryJson = "";
+        const boundaryProbe = await runManagedProcess({
+          label: "ffprobe",
+          args: [
+            "-v",
+            "error",
+            "-read_intervals",
+            `${Math.max(0, offset - 0.25).toFixed(3)}%+1.5`,
+            "-select_streams",
+            "v:0",
+            "-show_packets",
+            "-of",
+            "json",
+            join(outputDir, playlist),
+          ],
+          timeoutMs: 60_000,
+          onStdout: (chunk) => {
+            boundaryJson += chunk.toString();
+          },
+        });
+        if (boundaryProbe.code !== 0)
+          throw new Error(`cannot inspect HLS keyframe boundary for ${playlist}:${index}`);
+        const boundaryPackets =
+          (JSON.parse(boundaryJson) as {
+            packets?: Array<{ flags?: string; pts_time?: string }>;
+          }).packets ?? [];
+        const boundaryPacket = boundaryPackets.find((packet) => {
+          const pts = Number(packet.pts_time);
+          return Number.isFinite(pts) && pts >= Math.max(0, offset - 0.25);
+        });
+        const isKeyframe = Boolean(boundaryPacket?.flags?.includes("K"));
+        if (!isKeyframe)
+          throw new Error(`HLS playlist boundary is not a keyframe: ${playlist}:${index}`);
+        boundaryChecks.push({
+          index,
+          offset,
+          keyframe: true,
+          pts: boundaryPacket?.pts_time,
+        });
+      }
       keyframes[playlist] = {
         first_packet_keyframe: true,
         first_pts: packets[0]?.pts_time,
+        boundary_checks: boundaryChecks,
       };
     }
-    const segmentDurations = [
-      ...raw.matchAll(/#EXTINF:([0-9.]+)[^\n]*\n([^\n]+)/g),
-    ].map((match) => ({ duration: Number(match[1]), ref: match[2]?.trim() }));
     for (const index of [
       ...new Set([
         0,
@@ -1509,8 +1600,19 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
       };
     }
   }
-  if (declaredBandwidth.some((value) => value <= 0))
+  if (declaredBandwidth.some((value) => typeof value !== "number" || value <= 0))
     throw new Error("HLS master has an invalid bandwidth declaration");
+  for (const variant of masterVariants) {
+    if (!mediaPlaylists.includes(variant.playlist))
+      throw new Error(`HLS master references an unowned playlist ${variant.playlist}`);
+    const measured = measuredBandwidth[variant.playlist];
+    const peak = peakBandwidth[variant.playlist];
+    if (!measured || !peak) throw new Error(`HLS variant has no measured bandwidth: ${variant.playlist}`);
+    if ((variant.bandwidth as number) < peak)
+      throw new Error(`HLS BANDWIDTH under-reports measured peak: ${variant.playlist}`);
+    if (typeof variant.averageBandwidth !== "number" || variant.averageBandwidth < measured)
+      throw new Error(`HLS AVERAGE-BANDWIDTH under-reports measured average: ${variant.playlist}`);
+  }
   const playbackDuration = Math.max(...Object.values(timeline));
   const seeks = [
     Math.min(1, playbackDuration / 4),
@@ -1558,6 +1660,7 @@ export async function validateAdaptiveHlsPackage(outputDir: string): Promise<{
       timeline_seconds: timeline,
       master_probe_duration: masterProbe?.duration,
       measured_bandwidth: measuredBandwidth,
+      peak_bandwidth: peakBandwidth,
       segment_probes: probes,
       keyframe_alignment: keyframes,
       seeks: seekEvidence,

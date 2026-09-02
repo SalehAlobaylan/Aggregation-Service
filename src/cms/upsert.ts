@@ -30,6 +30,8 @@ export async function upsertContentItem(
 	disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
 	activeStages: string[];
 	deliveryMode: "legacy" | "shadow" | "durable_required";
+	nextRequiredStages: string[];
+	lifecycleReconciliationRequired: boolean;
 }> {
   const redis = getRedisConnection();
   const cacheKey = `${SOURCE_CACHE_PREFIX}${item.idempotencyKey}`;
@@ -76,7 +78,7 @@ export async function upsertContentItem(
 			idempotencyKey: item.idempotencyKey,
 			contentItemId,
 		});
-		return { contentItemId, created: false, retired: true, status: response.status, disposition: "retired", activeStages: [], deliveryMode: response.delivery_mode ?? "legacy" };
+		return { contentItemId, created: false, retired: true, status: response.status, disposition: "retired", activeStages: [], deliveryMode: response.delivery_mode ?? "legacy", nextRequiredStages: [], lifecycleReconciliationRequired: false };
 	}
 
     // Cache the mapping
@@ -102,6 +104,8 @@ export async function upsertContentItem(
 		disposition: response.disposition ?? "unknown",
 		activeStages: response.active_stages ?? [],
 		deliveryMode: response.delivery_mode ?? "legacy",
+		nextRequiredStages: response.next_required_stages ?? [],
+		lifecycleReconciliationRequired: response.lifecycle_reconciliation_required === true,
 	};
   } catch (error) {
     // Check if it's a duplicate error (409 Conflict)

@@ -9,8 +9,6 @@
  * History: these functions used to live in enrichment-client.ts when there
  * was a single AI service. They moved here as part of the Media-Service split.
  */
-import { basename, extname } from 'path';
-import { openAsBlob } from 'fs';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 
@@ -27,6 +25,15 @@ export interface TranscriptResult {
     /** Media's CMS write-back result: 'ok' | 'failed' | undefined (no content_id). */
     writeBackStatus?: string;
     writeBackError?: string | null;
+}
+
+export interface YouTubeCaptionImport {
+    contentItemId: string;
+    fullText: string;
+    language: string;
+    segments: TranscriptSegment[];
+    chapters?: Array<{ start: number; end: number; title: string; source: 'youtube' | 'derived' }>;
+    source: 'youtube_human' | 'youtube_auto';
 }
 
 const TRANSCRIBE_TIMEOUT_MS = 600_000; // 10 min — long-form podcasts
@@ -54,57 +61,15 @@ function tracingHeaders(requestId?: string): Record<string, string> {
     return requestId ? { 'X-Request-ID': requestId } : {};
 }
 
-function audioMimeType(path: string): string {
-    switch (extname(path).toLowerCase()) {
-        case '.mp3':
-            return 'audio/mpeg';
-        case '.m4a':
-            return 'audio/mp4';
-        case '.aac':
-            return 'audio/aac';
-        case '.wav':
-            return 'audio/wav';
-        case '.opus':
-            return 'audio/opus';
-        case '.webm':
-            return 'audio/webm';
-        case '.mp4':
-        case '.m4v':
-        case '.mov':
-            return 'video/mp4';
-        default:
-            return 'application/octet-stream';
-    }
-}
-
-async function appendAudioFile(form: FormData, audioPath: string): Promise<void> {
-    const blob = await openAsBlob(audioPath, { type: audioMimeType(audioPath) });
-    form.append('audio_file', blob, basename(audioPath));
-}
-
-/**
- * Transcribe an audio file via Media-Service (synchronous).
- *
- * If `contentItemId` is supplied, Media writes the transcript to CMS itself
- * (and links it to the content item). The response surfaces the write-back
- * outcome via writeBackStatus. Use `transcribeAsyncViaMedia` for long-form
- * audio that might exceed gateway timeouts.
- */
-export async function transcribeViaMedia(
-    audioPath: string,
+/** Transcribe a durable URL synchronously. Kept for short work only. */
+export async function transcribeUrlViaMedia(
+    url: string,
     contentItemId?: string,
     opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string; signal?: AbortSignal } = {},
 ): Promise<TranscriptResult> {
     const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
-
-    logger.info('Calling Media /v1/transcribe', {
-        audioPath,
-        contentItemId,
-        wordTimestamps,
-    });
-
     const form = new FormData();
-    await appendAudioFile(form, audioPath);
+    form.append('url', url);
     if (contentItemId) form.append('content_id', contentItemId);
     if (transcriptionJobId) form.append('transcription_job_id', transcriptionJobId);
     if (language) form.append('language', language);
@@ -113,20 +78,13 @@ export async function transcribeViaMedia(
     const response = await fetch(`${baseUrl()}/v1/transcribe`, {
         method: 'POST',
         body: form,
-        headers: {
-            ...authHeaders(),
-            ...tracingHeaders(requestId),
-        },
+        headers: { ...authHeaders(), ...tracingHeaders(requestId) },
         signal: requestSignal(opts.signal, TRANSCRIBE_TIMEOUT_MS),
     });
-
     if (!response.ok) {
         const errorText = await response.text().catch(() => '');
-        throw new Error(
-            `Media /v1/transcribe failed: ${response.status} ${response.statusText} - ${errorText}`,
-        );
+        throw new Error(`Media /v1/transcribe failed: ${response.status} ${response.statusText} - ${errorText}`);
     }
-
     const result = (await response.json()) as {
         text?: string;
         language?: string;
@@ -134,7 +92,6 @@ export async function transcribeViaMedia(
         write_back_status?: string;
         write_back_error?: string | null;
     };
-
     return {
         text: result.text || '',
         language: result.language,
@@ -142,6 +99,30 @@ export async function transcribeViaMedia(
         writeBackStatus: result.write_back_status,
         writeBackError: result.write_back_error ?? null,
     };
+}
+
+export async function importYouTubeCaptionViaMedia(
+    caption: YouTubeCaptionImport,
+    opts: { requestId?: string; signal?: AbortSignal } = {},
+): Promise<{ transcriptId?: string }> {
+    const response = await fetch(`${baseUrl()}/v1/captions/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(), ...tracingHeaders(opts.requestId) },
+        body: JSON.stringify({
+            content_item_id: caption.contentItemId,
+            full_text: caption.fullText,
+            language: caption.language,
+            segments: caption.segments,
+            chapters: caption.chapters ?? [],
+            source: caption.source,
+            provider: 'youtube',
+        }),
+        signal: requestSignal(opts.signal, 30_000),
+    });
+    if (!response.ok) throw new Error(`Media /v1/captions/import failed: ${response.status}`);
+    const result = (await response.json()) as { status?: string; transcript_id?: string; error?: string };
+    if (result.status !== 'ok') throw new Error(result.error || 'Media rejected caption import');
+    return { transcriptId: result.transcript_id };
 }
 
 /**
@@ -152,14 +133,14 @@ export async function transcribeViaMedia(
  * arq worker process and writes the transcript back to CMS via content_id.
  */
 export async function submitTranscribeJobViaMedia(
-    audioPath: string,
+    url: string,
     contentItemId?: string,
     opts: { language?: string; wordTimestamps?: boolean; requestId?: string; transcriptionJobId?: string; signal?: AbortSignal } = {},
 ): Promise<string> {
     const { language, wordTimestamps = true, requestId, transcriptionJobId } = opts;
 
     const form = new FormData();
-    await appendAudioFile(form, audioPath);
+    form.append('url', url);
     if (contentItemId) form.append('content_id', contentItemId);
     if (transcriptionJobId) form.append('transcription_job_id', transcriptionJobId);
     if (language) form.append('language', language);
@@ -262,7 +243,7 @@ export async function getTranscribeJobStatusViaMedia(
  * gives up after `maxWaitMs` (default 30 min).
  */
 export async function transcribeAsyncViaMedia(
-    audioPath: string,
+    url: string,
     contentItemId?: string,
     opts: {
         language?: string;
@@ -277,7 +258,7 @@ export async function transcribeAsyncViaMedia(
     const pollIntervalMs = opts.pollIntervalMs ?? 5_000;
     const maxWaitMs = opts.maxWaitMs ?? 30 * 60_000;
 
-    const jobId = await submitTranscribeJobViaMedia(audioPath, contentItemId, opts);
+    const jobId = await submitTranscribeJobViaMedia(url, contentItemId, opts);
     logger.info('Media async transcribe job submitted', { jobId, contentItemId });
 
     const deadline = Date.now() + maxWaitMs;

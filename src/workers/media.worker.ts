@@ -13,7 +13,7 @@ import {
   type MediaJob,
 } from "../queues/index.js";
 import { getQueue } from "../queues/index.js";
-import { cmsClient, contentStageCorrelation } from "../cms/client.js";
+import { cmsClient, contentStageCorrelation, isStaleContentStageDeliveryError } from "../cms/client.js";
 import { config } from "../config/index.js";
 
 // Media services
@@ -52,6 +52,7 @@ import {
   preflightCheck,
 } from "../services/quality.service.js";
 import { captionsToFullText } from "../media/captions.js";
+import { importYouTubeCaptionViaMedia } from "../ai/media-client.js";
 import { lookup as lookupMime } from "mime-types";
 import { aiPriorityForContentType } from "../services/ai-queue-priority.js";
 import { createLogger } from "../observability/logger.js";
@@ -62,6 +63,7 @@ import {
 } from "../services/pods-admission.js";
 import {
   ResourceDeferredError,
+  mergeAbortSignals,
   withResourceLease,
 } from "../runtime/resource-admission.js";
 import {
@@ -72,6 +74,8 @@ import {
   reserveLocalScratch,
   type LocalReservation,
 } from "../runtime/local-reservations.js";
+import { startContentStageLeaseHeartbeat } from "./content-stage-lease.js";
+import { contentStageLeaseRenewals } from "../observability/metrics.js";
 
 type CaptionState = "youtube_human" | "youtube_auto" | "none";
 type MediaSuitabilityVerdict =
@@ -85,6 +89,35 @@ interface MediaSuitabilityResult {
   verdict: MediaSuitabilityVerdict;
   confidence: number;
   reasons: string[];
+}
+
+async function checkpointMediaStage(
+  job: Job<MediaJob>,
+  phase: string,
+  proof: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<void> {
+  const claim = job.data.contentStageClaim;
+  if (!job.data.contentStage || !claim) return;
+  await cmsClient.checkpointContentStage(claim, phase, proof, job.id, signal);
+}
+
+function isYouTubeAccessDeferredError(
+  error: unknown,
+): error is Error & { retryAfterSec: number; failureClass: string } {
+  // Some isolated worker tests intentionally mock the downloader surface. Do
+  // not let a missing optional constructor turn normal error handling into a
+  // secondary TypeError.
+  if (!(error instanceof Error) || error.name !== "YouTubeAccessDeferredError")
+    return false;
+  const candidate = error as Error & {
+    retryAfterSec?: unknown;
+    failureClass?: unknown;
+  };
+  return (
+    typeof candidate.retryAfterSec === "number" &&
+    typeof candidate.failureClass === "string"
+  );
 }
 
 function classifyMediaSuitability(args: {
@@ -254,6 +287,7 @@ export async function processMediaJob(
       estimatedScratchBytes,
       { contentId: contentItemId, ownerRole: "aggregation-media-executor" },
     );
+    signal = mergeAbortSignals(signal, localReservation.signal);
     reservationHeartbeat = setInterval(
       () => void localReservation?.heartbeat().catch(() => undefined),
       30_000,
@@ -269,6 +303,10 @@ export async function processMediaJob(
         signal,
       );
     }
+    await checkpointMediaStage(job, "started", {
+      content_item_id: contentItemId,
+      operations,
+    }, signal);
 
     // 2. Check if already processed (idempotent)
     const artifactExtension = inferArtifactExtension(
@@ -372,7 +410,9 @@ export async function processMediaJob(
           job.data.contentStage,
         );
         if (!job.data.contentStage)
-          await enqueueAIJob(job, contentItemId, contentType, publicUrl);
+          await enqueueAIJob(job, contentItemId, contentType, publicUrl, {
+            durationSec: contentItem.duration_sec ?? undefined,
+          });
         return;
       }
     }
@@ -417,10 +457,20 @@ export async function processMediaJob(
       filePath: downloadResult.filePath,
       format: downloadResult.format,
     });
+    await checkpointMediaStage(job, "download", {
+      source_type: sourceType,
+      provider_format: downloadResult.format,
+    }, signal);
 
     // 4. Get media info
-    const mediaInfo = await getMediaInfo(downloadResult.filePath);
+    const mediaInfo = await getMediaInfo(downloadResult.filePath, { signal });
     jobLogger.debug("Media info", { ...mediaInfo });
+    await checkpointMediaStage(job, "probe", {
+      probe_digest: mediaInfo.probeDigest,
+      duration_sec: Math.floor(mediaInfo.duration),
+      visual_available: mediaInfo.visualAvailable,
+      seekable: mediaInfo.seekable,
+    }, signal);
 
     // Provider metadata can be missing or stale. FFprobe is authoritative,
     // and this gate is deliberately before transcoding, thumbnail extraction,
@@ -678,6 +728,12 @@ export async function processMediaJob(
       job.id,
       signal,
     );
+    await checkpointMediaStage(job, "route_persisted", {
+      route: routeDecision.route,
+      route_digest: routeDecision.digest,
+      generation_id: renditionGenerationId,
+      policy_digest: snapshotDigest(policySnapshot),
+    }, signal);
 
     // 6. Transcode/process media
     let processedPath: string;
@@ -728,7 +784,7 @@ export async function processMediaJob(
       routeDecision.route === "audio_transcode" ||
       routeDecision.route === "audio_passthrough"
     ) {
-      audioLadder = await withResourceLease("software_encode", "required", () =>
+      audioLadder = await withResourceLease("software_encode", "required", (leaseSignal) =>
         createAndUploadAudioDeliveryLadder({
           tenantId,
           contentItemId,
@@ -747,7 +803,7 @@ export async function processMediaJob(
           artifactRole: "delivery_audio",
           creatorRole: "aggregation-media-executor",
           inputDigest: mediaInfo.probeDigest ?? snapshotDigest(probeSnapshot),
-          signal,
+          signal: mergeAbortSignals(signal, leaseSignal),
         }),
       );
       const preferred = preferredAudioRendition(audioLadder);
@@ -763,8 +819,8 @@ export async function processMediaJob(
         localReservation!.outputDir,
         `${contentItemId}_remux.mp4`,
       );
-      const result = await withResourceLease("light_media", "required", () =>
-        remuxToMp4(downloadResult.filePath, outPath, { signal }),
+      const result = await withResourceLease("light_media", "required", (leaseSignal) =>
+        remuxToMp4(downloadResult.filePath, outPath, { signal: mergeAbortSignals(signal, leaseSignal) }),
       );
       processedPath = result.outputPath;
       duration = result.duration;
@@ -785,7 +841,7 @@ export async function processMediaJob(
       const result = await withResourceLease(
         "software_encode",
         "required",
-        () =>
+        (leaseSignal) =>
           transcodeProgressive(
             downloadResult.filePath,
             outPath,
@@ -793,7 +849,7 @@ export async function processMediaJob(
             routeDecision.route === "adaptive_hls_transcode"
               ? Math.min(720, mediaInfo.height ?? 720)
               : undefined,
-            { signal },
+            { signal: mergeAbortSignals(signal, leaseSignal) },
           ),
       );
       processedPath = result.outputPath;
@@ -813,6 +869,11 @@ export async function processMediaJob(
     }
 
     jobLogger.info("Transcode complete", { processedPath, duration });
+    await checkpointMediaStage(job, "encode", {
+      route: routeDecision.route,
+      duration_sec: Math.floor(duration),
+      source_only: isLongParentSourceFlow,
+    }, signal);
 
     // Trusted long-form work gets one durable analysis-audio artifact. The
     // Media service then extracts bounded windows from this artifact for
@@ -826,8 +887,8 @@ export async function processMediaJob(
         localReservation!.outputDir,
         `${contentItemId}_analysis.m4a`,
       );
-      await withResourceLease("software_encode", "required", () =>
-        extractAudio(processedPath, analysisPath, { signal }),
+      await withResourceLease("software_encode", "required", (leaseSignal) =>
+        extractAudio(processedPath, analysisPath, { signal: mergeAbortSignals(signal, leaseSignal) }),
       );
       tempFiles.push(analysisPath);
       const analysisAttempt = (
@@ -864,6 +925,10 @@ export async function processMediaJob(
         manifestId: analysisAudioManifestId,
         bytes: analysisUpload.bytes,
       });
+      await checkpointMediaStage(job, "transcription_input", {
+        analysis_audio_manifest_id: analysisAudioManifestId,
+        bytes: analysisUpload.bytes,
+      }, signal);
     }
 
     // 7. Extract thumbnail with profile-driven offset + maxHeight.
@@ -1008,6 +1073,10 @@ export async function processMediaJob(
     const mediaUrl = mediaUpload.url;
     mediaArtifactManifestId = mediaUpload.manifestId;
     jobLogger.info("Processed media uploaded", { mediaUrl });
+    await checkpointMediaStage(job, "upload", {
+      media_manifest_id: mediaArtifactManifestId,
+      audio_manifest_count: audioLadder.length,
+    }, signal);
 
     let hlsPackage:
       Awaited<ReturnType<typeof createAndUploadAdaptiveHlsPackage>> | undefined;
@@ -1019,7 +1088,7 @@ export async function processMediaJob(
       mediaInfo.visualAvailable &&
       policySnapshot.generate_audio_alternate !== false
     ) {
-      audioLadder = await withResourceLease("software_encode", "required", () =>
+      audioLadder = await withResourceLease("software_encode", "required", (leaseSignal) =>
         createAndUploadAudioDeliveryLadder({
           tenantId,
           contentItemId,
@@ -1037,7 +1106,7 @@ export async function processMediaJob(
           artifactRole: "delivery_audio",
           creatorRole: "aggregation-media-executor",
           inputDigest: mediaInfo.probeDigest ?? snapshotDigest(probeSnapshot),
-          signal,
+          signal: mergeAbortSignals(signal, leaseSignal),
         }),
       );
       for (const output of audioLadder)
@@ -1048,7 +1117,7 @@ export async function processMediaJob(
         localReservation!.hlsDir,
         `${contentItemId}_delivery`,
       );
-      hlsPackage = await withResourceLease("media_io_package", "required", () =>
+      hlsPackage = await withResourceLease("media_io_package", "required", (leaseSignal) =>
         createAndUploadAdaptiveHlsPackage({
           tenantId,
           contentItemId,
@@ -1065,10 +1134,15 @@ export async function processMediaJob(
           inputDigest: createHash("sha256")
             .update(`${contentItemId}:${mediaInfo.probeDigest}:adaptive-hls`)
             .digest("hex"),
-          signal,
+          signal: mergeAbortSignals(signal, leaseSignal),
         }),
       );
       tempDirectories.push(hlsDir);
+      await checkpointMediaStage(job, "package", {
+        package_id: hlsPackage.packageId,
+        validation_digest: hlsPackage.validationDigest,
+        manifest_count: hlsPackage.manifestIds.length,
+      }, signal);
     }
 
     let processedBytes = 0;
@@ -1398,6 +1472,17 @@ export async function processMediaJob(
         signal,
       );
     }
+    await checkpointMediaStage(job, "verification", {
+      generation_id: renditionGenerationId,
+      active_manifest_count: new Set([
+        mediaArtifactManifestId,
+        thumbnailManifestId,
+        analysisAudioManifestId,
+        ...audioLadder.map((audio) => audio.manifestId),
+        ...(hlsPackage?.manifestIds ?? []),
+      ]).size,
+      hls_validation_digest: hlsPackage?.validationDigest,
+    }, signal);
 
     // 9a. Caption-first: if YouTube gave us a usable caption track, persist
     // it as the transcript now (the free fast-path). Human caption →
@@ -1411,18 +1496,14 @@ export async function processMediaJob(
       captionState = captions.isAuto ? "youtube_auto" : "youtube_human";
       captionText = captionsToFullText(captions.segments);
       try {
-        await cmsClient.createTranscript(
-          {
-            content_item_id: contentItemId,
-            full_text: captionText,
-            language: captions.language,
-            segments: captions.segments,
-            chapters: chapters && chapters.length > 0 ? chapters : undefined,
-            source: captions.isAuto ? "youtube_auto" : "youtube_human",
-            provider: "youtube",
-          },
-          job.id,
-        );
+        await importYouTubeCaptionViaMedia({
+          contentItemId,
+          fullText: captionText,
+          language: captions.language,
+          segments: captions.segments,
+          chapters: chapters && chapters.length > 0 ? chapters : undefined,
+          source: captions.isAuto ? "youtube_auto" : "youtube_human",
+        }, { requestId: job.id, signal });
         jobLogger.info("Caption transcript written", {
           contentItemId,
           captionState,
@@ -1447,9 +1528,13 @@ export async function processMediaJob(
         contentItemId,
         contentType,
         mediaUrl,
-        captionState,
-        captionText,
-        true,
+        {
+          durationSec: duration,
+          transcriptionUrl: analysisAudioUrl ?? mediaUrl,
+          captionState,
+          captionText,
+          replaceCompleted: true,
+        },
       );
     }
 
@@ -1457,6 +1542,22 @@ export async function processMediaJob(
   } catch (error) {
     jobLogger.error("Media job failed", error, { contentItemId });
 
+    if (
+      isYouTubeAccessDeferredError(error) &&
+      job.data.contentStage &&
+      job.data.contentStageClaim
+    ) {
+      // Provider access (authentication or rate limit) is an external
+      // dependency deferral. No media effect crossed the boundary, so do not
+      // mark the stage uncertain or burn immediate retries.
+      await cmsClient.deferContentStage(
+        job.data.contentStageClaim,
+        error.retryAfterSec,
+        error.message,
+        job.id,
+      );
+      return;
+    }
     if (error instanceof ResourceDeferredError && !job.data.contentStage) {
       // Capacity pressure is recoverable admission, not a media-policy failure.
       throw error;
@@ -1556,15 +1657,40 @@ export const createPodsMediaWorker = () =>
         });
         return;
       }
-      await cmsClient.beginContentStage(claim, stageJob.id);
-      const heartbeat = setInterval(
-        () =>
-          void cmsClient
-            .heartbeatContentStage(claim, stageJob.id)
-            .catch(() => undefined),
-        15_000,
-      );
-      heartbeat.unref();
+      try {
+        await cmsClient.beginContentStage(claim, stageJob.id);
+      } catch (error) {
+        if (isStaleContentStageDeliveryError(error)) {
+          jobLogger.info("Discarded stale or non-claimable media-stage delivery", {
+            requestId: claim.request_id,
+          });
+          return;
+        }
+        throw error;
+      }
+      const leaseHeartbeat = startContentStageLeaseHeartbeat({
+        initialLeaseExpiresAt: claim.lease_expires_at,
+        heartbeat: async () => {
+          const renewed = await cmsClient.heartbeatContentStage(claim, stageJob.id);
+          contentStageLeaseRenewals.inc({ stage: claim.stage, outcome: "succeeded" });
+          return renewed;
+        },
+        onRenewalFailure: (error, leaseExpiresAt) => {
+          contentStageLeaseRenewals.inc({ stage: claim.stage, outcome: "failed" });
+          jobLogger.warn("Content-stage lease renewal failed", {
+            requestId: claim.request_id,
+            leaseExpiresAt,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+        onLeaseLost: (error) =>
+          jobLogger.error("Aborting media effect after lease loss", error, {
+            requestId: claim.request_id,
+          }),
+      });
+      const stageSignal = signal
+        ? AbortSignal.any([signal, leaseHeartbeat.signal])
+        : leaseHeartbeat.signal;
       try {
         const mediaData: MediaJob = {
           contentItemId: claim.content_item_id,
@@ -1584,9 +1710,9 @@ export const createPodsMediaWorker = () =>
         const mediaJob = Object.assign(stageJob, {
           data: mediaData,
         }) as unknown as Job<MediaJob>;
-        await processMediaJob(mediaJob, jobLogger, signal);
+        await processMediaJob(mediaJob, jobLogger, stageSignal);
       } finally {
-        clearInterval(heartbeat);
+        await leaseHeartbeat.stop();
       }
     },
   });
@@ -1599,9 +1725,13 @@ async function enqueueAIJob(
   contentItemId: string,
   contentType: string,
   mediaUrl?: string,
-  captionState: CaptionState = "none",
-  captionText?: string,
-  replaceCompleted = false,
+  options: {
+    durationSec?: number;
+    transcriptionUrl?: string;
+    captionState?: CaptionState;
+    captionText?: string;
+    replaceCompleted?: boolean;
+  } = {},
 ): Promise<void> {
   const aiQueue = getQueue(QUEUE_NAMES.AI);
   if (!aiQueue) {
@@ -1614,7 +1744,7 @@ async function enqueueAIJob(
   const existing = await aiQueue.getJob(jobId);
   if (existing) {
     const state = await existing.getState();
-    if (state === "failed" || (state === "completed" && replaceCompleted)) {
+    if (state === "failed" || (state === "completed" && options.replaceCompleted)) {
       await existing.remove();
     } else {
       job.log(`AI job already queued for ${contentItemId} (${state})`);
@@ -1630,8 +1760,10 @@ async function enqueueAIJob(
       operations,
       textContent: job.data.textContent ?? { title: "" },
       mediaUrl,
-      captionState,
-      captionText,
+      transcriptionUrl: options.transcriptionUrl ?? mediaUrl,
+      durationSec: options.durationSec,
+      captionState: options.captionState ?? "none",
+      captionText: options.captionText,
     },
     {
       priority: aiPriorityForContentType(contentType),

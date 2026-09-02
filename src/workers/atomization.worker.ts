@@ -5,7 +5,7 @@ import { join } from "path";
 import { readdir, rm, stat } from "fs/promises";
 import { createWorker } from "./base-worker.js";
 import { getQueue, QUEUE_NAMES, type AtomizationJob } from "../queues/index.js";
-import { cmsClient, contentStageCorrelation } from "../cms/client.js";
+import { cmsClient, contentStageCorrelation, isStaleContentStageDeliveryError } from "../cms/client.js";
 import { config } from "../config/index.js";
 import { downloadHttp, cleanupTempFile } from "../media/downloader.js";
 import {
@@ -45,7 +45,7 @@ import {
   shouldAtomizeParent,
   sliceSegments,
 } from "./atomization.helpers.js";
-import { withResourceLease } from "../runtime/resource-admission.js";
+import { mergeAbortSignals, withResourceLease } from "../runtime/resource-admission.js";
 import { ResourceDeferredError } from "../runtime/resource-admission.js";
 import {
   reserveLocalScratch,
@@ -54,7 +54,7 @@ import {
 
 const HLS_UPLOAD_CONCURRENCY = 6;
 
-export const atomizationWorker = createWorker({
+export const createAtomizationWorker = () => createWorker({
   queueName: QUEUE_NAMES.ATOMIZATION,
   concurrency: 1,
   timeoutMs: config.mediaJobTimeoutMs,
@@ -102,9 +102,11 @@ export const atomizationWorker = createWorker({
     };
 
     let stageHeartbeat: NodeJS.Timeout | undefined;
+    let stageBegun = false;
     try {
       if (stageClaim) {
         await cmsClient.beginContentStage(stageClaim, job.id);
+        stageBegun = true;
         stageHeartbeat = setInterval(
           () =>
             void cmsClient
@@ -244,6 +246,7 @@ export const atomizationWorker = createWorker({
           estimatedBytes,
           { contentId: contentItemId, ownerRole: "aggregation-media-executor" },
         );
+        signal = mergeAbortSignals(signal, localReservation.signal);
         reservationHeartbeat = setInterval(
           () => void localReservation?.heartbeat().catch(() => undefined),
           30_000,
@@ -258,7 +261,7 @@ export const atomizationWorker = createWorker({
           localReservation.sourceDir,
         );
         tempFiles.push(parentDownload.filePath);
-        const mediaInfo = await getMediaInfo(parentDownload.filePath);
+        const mediaInfo = await getMediaInfo(parentDownload.filePath, { signal });
         const deliveryPolicy = (
           await cmsClient.resolveMediaDeliveryPolicy(
             {
@@ -341,7 +344,7 @@ export const atomizationWorker = createWorker({
             audioLadder = await withResourceLease(
               "software_encode",
               "required",
-              () =>
+              (leaseSignal) =>
                 createAndUploadAudioDeliveryLadder({
                   tenantId: input.item.tenant_id,
                   parentContentItemId: contentItemId,
@@ -362,7 +365,7 @@ export const atomizationWorker = createWorker({
                     .digest("hex"),
                   startSec,
                   durationSec,
-                  signal,
+                  signal: mergeAbortSignals(signal, leaseSignal),
                 }),
             );
             for (const audio of audioLadder) {
@@ -380,14 +383,14 @@ export const atomizationWorker = createWorker({
               duration: preferred.duration,
             };
           } else {
-            cut = await withResourceLease("software_encode", "required", () =>
+            cut = await withResourceLease("software_encode", "required", (leaseSignal) =>
               cutMediaSegment(
                 parentDownload.filePath,
                 clipPath,
                 startSec,
                 durationSec,
                 undefined,
-                { signal },
+                { signal: mergeAbortSignals(signal, leaseSignal) },
               ),
             );
             chapterTempFiles.push(clipPath);
@@ -496,7 +499,7 @@ export const atomizationWorker = createWorker({
               const hls = await withResourceLease(
                 "media_io_package",
                 "required",
-                () => createAdaptiveHlsPackage(clipPath, hlsDir, { signal }),
+                (leaseSignal) => createAdaptiveHlsPackage(clipPath, hlsDir, { signal: mergeAbortSignals(signal, leaseSignal) }),
               );
               const validation = await withResourceLease(
                 "media_io_package",
@@ -506,32 +509,33 @@ export const atomizationWorker = createWorker({
               const hlsUpload = await withResourceLease(
                 "media_io_package",
                 "required",
-                () =>
-                  uploadHlsDirectory(hlsDir, unitArtifactPrefix, signal, {
+                (leaseSignal) =>
+                  uploadHlsDirectory(hlsDir, unitArtifactPrefix, mergeAbortSignals(signal, leaseSignal), {
                     tenantId: input.item.tenant_id,
                     parentContentItemId: contentItemId,
                     atomizationGenerationId: generationResponse.generation.id,
                     atomizationChapterUnitId: unitId,
                     attemptId: governed?.attemptId,
-                    inputDigest: createHash("sha256")
+                      inputDigest: createHash("sha256")
                       .update(`${planDigest}:${i}:hls`)
                       .digest("hex"),
                     fenceToken: unitClaim.unit.fence_token ?? undefined,
                   }),
               );
-              hlsUploadManifestIds = hlsUpload.manifestIds;
-              primaryUrl = hlsUpload.url || mp4Url;
-              primaryType = hlsUpload.url ? "hls" : "mp4";
-              if (hlsUpload.url) {
-                renditions.unshift({
-                  type: "hls",
-                  url: hlsUpload.url,
-                  has_video: mediaInfo.hasVideo,
-                  mime_type: "application/vnd.apple.mpegurl",
-                  validation_evidence: validation.evidence,
-                  is_primary: true,
-                });
+              if (!hlsUpload.url || hlsUpload.manifestIds.length === 0) {
+                throw new Error("adaptive HLS upload did not return a verified master manifest");
               }
+              hlsUploadManifestIds = hlsUpload.manifestIds;
+              primaryUrl = hlsUpload.url;
+              primaryType = "hls";
+              renditions.unshift({
+                type: "hls",
+                url: hlsUpload.url,
+                has_video: mediaInfo.hasVideo,
+                mime_type: "application/vnd.apple.mpegurl",
+                validation_evidence: validation.evidence,
+                is_primary: true,
+              });
               if (hls.duration > 0) {
                 chapter.end_ms =
                   chapter.start_ms + Math.round(hls.duration * 1000);
@@ -540,7 +544,12 @@ export const atomizationWorker = createWorker({
               renditions[0]!.is_primary = true;
             }
           } catch (hlsError) {
-            jobLogger.warn("HLS rendition failed; using MP4 fallback", {
+            // A chapter whose resolved policy requires adaptive HLS must not
+            // silently publish a different delivery contract in the same
+            // generation. The next retry may create a new persisted route;
+            // this attempt remains failed and fenced.
+            if (chapterUsesAdaptiveHls) throw hlsError;
+            jobLogger.warn("Optional HLS rendition failed; using MP4 fallback", {
               contentItemId,
               chapter: i,
               error:
@@ -742,6 +751,12 @@ export const atomizationWorker = createWorker({
         }
       }
     } catch (error) {
+      if (stageClaim && !stageBegun && isStaleContentStageDeliveryError(error)) {
+        jobLogger.info("Discarded stale or non-claimable atomization-stage delivery", {
+          requestId: stageClaim.request_id,
+        });
+        return;
+      }
       if (error instanceof ResourceDeferredError && governed) {
         await cmsClient.deferAtomizationWork(
           {
@@ -895,6 +910,9 @@ async function uploadHlsDirectory(
         : "public, max-age=31536000, immutable",
     });
   }
+  if (!uploadable.some((item) => item.file === "master.m3u8")) {
+    throw new Error("adaptive HLS directory has no master playlist");
+  }
 
   // The master is the package identity. Upload and verify it first, then bind
   // every owned playlist/init/segment manifest to that immutable identity.
@@ -958,7 +976,11 @@ async function uploadHlsDirectory(
         if (item.file === "master.m3u8") packageManifestId = item.manifestId;
       }
     }
+    if (manifestContext && i === 0 && !packageManifestId) {
+      throw new Error("adaptive HLS master manifest was not persisted");
+    }
     i += size;
   }
+  if (!playlistUrl) throw new Error("adaptive HLS upload has no master URL");
   return { url: playlistUrl, manifestIds };
 }

@@ -26,6 +26,7 @@ const POLL_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const CF_GRAPHQL_URL = 'https://api.cloudflare.com/client/v4/graphql';
 
 let timer: NodeJS.Timeout | null = null;
+let bootstrapTimer: NodeJS.Timeout | null = null;
 // Track per-date hourly windows we've already pulled, so a re-tick within the
 // same hour doesn't double-count. Key: `${date}|${hour}`. In-memory only —
 // on restart we re-pull the current day's data, which CMS UPSERT will simply
@@ -43,13 +44,21 @@ export function startCloudflareAnalyticsPuller(): void {
         return;
     }
     // Run once at boot (after a short delay to let other startup finish), then hourly.
-    setTimeout(() => { void pullOnce(); }, 30_000);
+    bootstrapTimer = setTimeout(() => {
+        bootstrapTimer = null;
+        void pullOnce();
+    }, 30_000);
+    bootstrapTimer.unref?.();
     timer = setInterval(() => { void pullOnce(); }, POLL_INTERVAL_MS);
     timer.unref?.();
     logger.info('Cloudflare Analytics puller: started');
 }
 
 export function stopCloudflareAnalyticsPuller(): void {
+    if (bootstrapTimer) {
+        clearTimeout(bootstrapTimer);
+        bootstrapTimer = null;
+    }
     if (timer) {
         clearInterval(timer);
         timer = null;

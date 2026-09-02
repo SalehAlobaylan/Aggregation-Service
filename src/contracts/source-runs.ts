@@ -230,6 +230,16 @@ export function deterministicSourceRunUnitJobId(input: Pick<SourceRunExecutionEn
   return `source-unit:${createHash('sha256').update(values.join('\n')).digest('hex')}`
 }
 
+// CMS unit job IDs are protocol identities and intentionally use a colon.
+// BullMQ reserves colons in custom job IDs, so queue identity must use this
+// lossless, deterministic transport encoding while the fenced CMS envelope
+// continues carrying the original protocol value.
+export function sourceRunQueueJobId(unitJobId: string): string {
+  const normalized = unitJobId.trim()
+  if (!normalized) throw new Error('source-run queue job ID requires a CMS unit job ID')
+  return normalized.replaceAll(':', '-')
+}
+
 export function canBeginSourceRunEffect(envelope: SourceRunExecutionEnvelope, now = new Date()): boolean {
   return Boolean(
     envelope.tenantId.trim() &&

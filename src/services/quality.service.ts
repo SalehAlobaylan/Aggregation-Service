@@ -737,12 +737,12 @@ export async function resolveIngestProfile(
             tenant_id: tenantId,
             source_type: sourceType,
         });
-        const profile = resp ? toEncodeProfile(resp.profile) : SAFE_FALLBACK_ENCODE_PROFILE;
+        const profile = resp?.profile ? toEncodeProfile(resp.profile) : SAFE_FALLBACK_ENCODE_PROFILE;
         const out = {
             profile,
-            profileId: resp?.profile.id ?? null,
+            profileId: resp?.profile?.id ?? null,
             rawProfile: resp?.profile ?? null,
-            profileSource: resp ? ('cms' as const) : ('safe_fallback' as const),
+            profileSource: resp?.profile ? ('cms' as const) : ('safe_fallback' as const),
         };
         ingestResolveCache.set(key, { ...out, expiresAt: now + RESOLVE_TTL_MS });
         return out;

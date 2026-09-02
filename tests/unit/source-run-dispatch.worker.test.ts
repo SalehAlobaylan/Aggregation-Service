@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => {
-  const queues = new Map<string, { add: ReturnType<typeof vi.fn> }>()
+  const queues = new Map<string, { add: ReturnType<typeof vi.fn>; getRepeatableJobs?: ReturnType<typeof vi.fn>; removeRepeatableByKey?: ReturnType<typeof vi.fn> }>()
   const cmsClient = {
     claimNextSourceRun: vi.fn(), claimUnitAdoptionAction: vi.fn(), prepareUnitAdoptionAction: vi.fn(), acknowledgeUnitAdoptionAction: vi.fn(),
     acceptSourceRunUnit: vi.fn(), authorizeSourceRunUnit: vi.fn(),
@@ -43,14 +43,16 @@ describe('source-run dispatch worker', () => {
   })
 
   it('claims only CMS-selected work and preserves the deterministic root identity', async () => {
-    const { sourceRunDispatchWorker } = await import('../../src/workers/source-run-dispatch.worker.js')
+    const { createSourceRunDispatchWorker } = await import('../../src/workers/source-run-dispatch.worker.js')
+    const sourceRunDispatchWorker = createSourceRunDispatchWorker() as unknown as { processor: (job: unknown, logger: unknown) => Promise<void> }
     await sourceRunDispatchWorker.processor({ data: { trigger: 'auto' }, id: 'tick-1' } as never, { debug: vi.fn() })
     expect(mocks.cmsClient.claimNextSourceRun).toHaveBeenCalledWith('tick-1')
-    expect(mocks.queues.get('source-run-dispatch-queue')!.add).toHaveBeenCalledWith('source-run-coordinator', expect.objectContaining({ claim }), expect.objectContaining({ jobId: claim.unit.job_id }))
+    expect(mocks.queues.get('source-run-dispatch-queue')!.add).toHaveBeenCalledWith('source-run-coordinator', expect.objectContaining({ claim }), expect.objectContaining({ jobId: 'source-unit-root' }))
   })
 
   it('uses CMS-authorized page identity and carries the complete fenced envelope', async () => {
-    const { sourceRunDispatchWorker } = await import('../../src/workers/source-run-dispatch.worker.js')
+    const { createSourceRunDispatchWorker } = await import('../../src/workers/source-run-dispatch.worker.js')
+    const sourceRunDispatchWorker = createSourceRunDispatchWorker() as unknown as { processor: (job: unknown, logger: unknown) => Promise<void> }
     await sourceRunDispatchWorker.processor({ data: { trigger: 'auto', claim }, id: 'coordinator-1' } as never, { debug: vi.fn() })
     expect(mocks.cmsClient.acceptSourceRunUnit).toHaveBeenCalledWith(expect.objectContaining({ tenantId: 'tenant-a', requestId: ids.request, attemptId: ids.attempt, unitId: ids.root, unitJobId: claim.unit.job_id, attemptFenceToken: ids.fence }), 'coordinator-1')
     expect(mocks.cmsClient.authorizeSourceRunUnit).toHaveBeenCalledWith(expect.objectContaining({ tenantId: 'tenant-a', requestId: ids.request, attemptId: ids.attempt, parentUnitId: ids.root, unitType: 'fetch_page', pageId: 'initial' }), 'coordinator-1')
@@ -61,14 +63,36 @@ describe('source-run dispatch worker', () => {
       max_results: 3,
       min_duration_minutes: 4.5,
     }))
-    expect(fetchCall[2]).toEqual(expect.objectContaining({ jobId: 'source-unit:page' }))
+    expect(fetchCall[2]).toEqual(expect.objectContaining({ jobId: 'source-unit-page' }))
     expect(mocks.enqueueSourceRunReceipt).toHaveBeenCalledTimes(1)
+    const dispatchReceipt = mocks.buildSourceRunReceipt.mock.calls[0][0]
+    expect(dispatchReceipt).toEqual(expect.objectContaining({
+      stage: 'dispatch',
+      eventType: 'accepted',
+    }))
+    expect(dispatchReceipt.pageId).toBeUndefined()
   })
 
   it('fails closed when the CMS-authorized downstream queue is unavailable', async () => {
     mocks.queues.delete('fetch-queue')
-    const { sourceRunDispatchWorker } = await import('../../src/workers/source-run-dispatch.worker.js')
+    const { createSourceRunDispatchWorker } = await import('../../src/workers/source-run-dispatch.worker.js')
+    const sourceRunDispatchWorker = createSourceRunDispatchWorker() as unknown as { processor: (job: unknown, logger: unknown) => Promise<void> }
     await expect(sourceRunDispatchWorker.processor({ data: { trigger: 'auto', claim }, id: 'coordinator-2' } as never, { debug: vi.fn() })).rejects.toThrow('fetch queue is unavailable')
     expect(mocks.enqueueSourceRunReceipt).not.toHaveBeenCalled()
+  })
+
+  it('keeps the polling tick below claimed coordinator work', async () => {
+    const queue = mocks.queues.get('source-run-dispatch-queue')!
+    queue.getRepeatableJobs = vi.fn().mockResolvedValue([])
+    queue.removeRepeatableByKey = vi.fn().mockResolvedValue(undefined)
+    const { syncSourceRunDispatchSweeper } = await import('../../src/workers/source-run-dispatch.worker.js')
+
+    await syncSourceRunDispatchSweeper()
+
+    expect(queue.add).toHaveBeenCalledWith(
+      'source-run-dispatch-repeatable',
+      { trigger: 'auto' },
+      expect.objectContaining({ priority: 100, attempts: 1 }),
+    )
   })
 })

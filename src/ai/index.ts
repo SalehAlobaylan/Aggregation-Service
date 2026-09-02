@@ -9,7 +9,7 @@
  * local model dependencies anymore.
  */
 export {
-    transcribeViaMedia,
+    transcribeUrlViaMedia,
     transcribeAsyncViaMedia,
     submitTranscribeJobViaMedia,
     getTranscribeJobStatusViaMedia,

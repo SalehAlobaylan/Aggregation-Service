@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.youtube-runtime/
 
 # Build output
 dist/

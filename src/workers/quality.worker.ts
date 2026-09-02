@@ -32,7 +32,7 @@ const CLEANUP_GRACE_MS = 5 * 60 * 1000; // 5 min
  *     re-encode → calls reencodeOneItem.
  *   - 'cleanup-old-version': delayed deletion of the prior versioned key.
  */
-export const qualityWorker = createWorker({
+export const createQualityWorker = () => createWorker({
     queueName: QUEUE_NAMES.QUALITY_REENCODE,
     concurrency: 1, // ffmpeg is CPU-heavy; one at a time per replica
     timeoutMs: 60 * 60 * 1000,
@@ -56,14 +56,14 @@ export const qualityWorker = createWorker({
             contentRole: data.contentRole,
         });
 
-        const result = await withResourceLease('maintenance_encode', 'maintenance', () => reencodeOneItem({
+        const result = await withResourceLease('maintenance_encode', 'maintenance', (leaseSignal) => reencodeOneItem({
             contentItemId: data.contentItemId,
             targetProfileId: data.targetProfileId,
             tenantId: data.tenantId,
             ruleId: data.ruleId,
             trigger: data.trigger,
             contentRole: data.contentRole,
-            signal,
+            signal: leaseSignal,
         }));
 
         if (!result.success) {

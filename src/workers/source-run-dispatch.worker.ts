@@ -8,7 +8,7 @@
  */
 import { Job, Queue } from 'bullmq';
 import { cmsClient } from '../cms/client.js';
-import { type SourceRunDispatchClaim, type SourceRunExecutionEnvelope } from '../contracts/source-runs.js';
+import { sourceRunQueueJobId, type SourceRunDispatchClaim, type SourceRunExecutionEnvelope } from '../contracts/source-runs.js';
 import { enqueueSourceRunReceipt, buildSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { getQueue, QUEUE_NAMES, type FetchJob, type SourceRunDispatchJob, type SourceType } from '../queues/index.js';
 import { createWorker } from './base-worker.js';
@@ -17,6 +17,7 @@ import { isDependencyDeferral } from '../observability/job-projection.js';
 
 const REPEATABLE_NAME = 'source-run-dispatch-repeatable';
 const DISPATCH_INTERVAL_MS = 5_000;
+const CONTROL_TICK_PRIORITY = 100;
 const PODS_MIN_DURATION_MINUTES = 4.5;
 
 interface ClaimedDispatchJob extends SourceRunDispatchJob {
@@ -79,7 +80,7 @@ async function enqueueClaim(claim: SourceRunDispatchClaim): Promise<void> {
   if (!queue) throw new Error('source-run dispatch queue is unavailable');
   await queue.add('source-run-coordinator', { trigger: 'auto', claim } satisfies ClaimedDispatchJob, {
     // This is the only queue identity derived from a CMS-issued unit.
-    jobId: claim.unit.job_id,
+    jobId: sourceRunQueueJobId(claim.unit.job_id),
     priority: 1,
   });
 }
@@ -149,7 +150,7 @@ async function runClaimedCoordinator(claim: SourceRunDispatchClaim, requestId?: 
     sourceRunCoordinatorUnitId: claim.unit.id,
     sourceRunPageId: pageId,
   };
-  await fetchQueue.add('source-run-fetch-page', fetchJob, { jobId: pageEnvelope.unitJobId, priority: 1 });
+  await fetchQueue.add('source-run-fetch-page', fetchJob, { jobId: sourceRunQueueJobId(pageEnvelope.unitJobId), priority: 1 });
 
   // Retain the exact dispatch receipt after its child is durable. No browser
   // or queue acknowledgement is treated as provider completion.
@@ -160,11 +161,10 @@ async function runClaimedCoordinator(claim: SourceRunDispatchClaim, requestId?: 
     outcome: 'no_change',
     sequence: 0,
     payload: { authorized_page_unit_id: page.id, page_id: pageId },
-    pageId,
   }));
 }
 
-export const sourceRunDispatchWorker = createWorker({
+export const createSourceRunDispatchWorker = () => createWorker({
   queueName: QUEUE_NAMES.SOURCE_RUN_DISPATCH,
   concurrency: 1,
   shouldDeadLetter: (job) => job.name !== REPEATABLE_NAME,
@@ -197,6 +197,10 @@ export async function syncSourceRunDispatchSweeper(): Promise<void> {
   await queue.add(REPEATABLE_NAME, { trigger: 'auto' } satisfies SourceRunDispatchJob, {
     repeat: { every: DISPATCH_INTERVAL_MS },
     jobId: REPEATABLE_NAME,
+    // Unprioritized BullMQ jobs outrank prioritized jobs. Keep the polling
+    // tick below CMS-authorized coordinator work so a slow claim round-trip
+    // cannot form an endless chain that starves the claimed unit.
+    priority: CONTROL_TICK_PRIORITY,
     attempts: 1,
   });
   logger.info('source-run dispatcher: registered CMS admission tick', { intervalMs: DISPATCH_INTERVAL_MS });
