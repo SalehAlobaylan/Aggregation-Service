@@ -13,6 +13,7 @@ import {
   managedChildren,
   managedProcessTerminations,
 } from "../observability/metrics.js";
+import { logger } from "../observability/logger.js";
 
 export interface ManagedProcessOptions {
   label: string;
@@ -210,6 +211,10 @@ export async function runManagedProcess(
     if (aborted) return;
     aborted = true;
     stopReason = reason;
+    logger.warn("Managed media process is being stopped", {
+      label: options.label,
+      reason: reason instanceof Error ? reason.message : String(reason ?? "unknown"),
+    });
     terminateTree(child, options.label);
     escalation = setTimeout(
       () => terminateTree(child, options.label, true),
@@ -229,6 +234,17 @@ export async function runManagedProcess(
         await waitForProcessGroupGone(child, options.label).catch((error) => {
           if (!aborted) { aborted = true; stopReason = error; }
         });
+        if (code !== 0 || signal || aborted) {
+          logger.warn("Managed media process exited abnormally", {
+            label: options.label,
+            code,
+            signal,
+            aborted,
+            elapsedMs: Date.now() - startedAt,
+            lastProgressAgeMs: Date.now() - lastProgressAt,
+            reason: stopReason instanceof Error ? stopReason.message : String(stopReason ?? "unknown"),
+          });
+        }
         if (aborted) {
           reject(
             abortError(options.label, stopReason ?? options.signal?.reason),

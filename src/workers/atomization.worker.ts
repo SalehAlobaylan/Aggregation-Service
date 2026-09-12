@@ -1,11 +1,12 @@
 import { Job } from "bullmq";
 import { createHash } from "crypto";
-import { v4 as uuidv4 } from "uuid";
+
 import { join } from "path";
 import { readdir, rm, stat } from "fs/promises";
 import { createWorker } from "./base-worker.js";
+import { startContentStageLeaseHeartbeats, type ContentStageLeaseHeartbeat } from "./content-stage-lease.js";
 import { getQueue, QUEUE_NAMES, type AtomizationJob } from "../queues/index.js";
-import { cmsClient, contentStageCorrelation, isStaleContentStageDeliveryError } from "../cms/client.js";
+import { cmsClient, CMSRequestError, contentStageCorrelation, isStaleContentStageDeliveryError } from "../cms/client.js";
 import { config } from "../config/index.js";
 import { downloadHttp, cleanupTempFile } from "../media/downloader.js";
 import {
@@ -39,9 +40,10 @@ import {
   compatibilityChapterChildren,
   countReviewChapters,
   enforceFullCoverage,
+  ChapterPlanningError,
+  providerChapterPlan,
   minFeedUnitSeconds,
   normalizeGeneratedChapters,
-  planningChapterCount,
   shouldAtomizeParent,
   sliceSegments,
 } from "./atomization.helpers.js";
@@ -58,6 +60,12 @@ export const createAtomizationWorker = () => createWorker({
   queueName: QUEUE_NAMES.ATOMIZATION,
   concurrency: 1,
   timeoutMs: config.mediaJobTimeoutMs,
+  // A single parent can spend several minutes in a cut and in R2 uploads.
+  // Keep the BullMQ delivery lock bounded but comfortably above one phase;
+  // the lock-renewal listener in createWorker aborts the process immediately
+  // if Redis actually rejects a renewal.
+  lockDurationMs: 15 * 60_000,
+  lockRenewTimeMs: 60_000,
   processor: async (
     job: Job<AtomizationJob>,
     jobLogger,
@@ -71,14 +79,30 @@ export const createAtomizationWorker = () => createWorker({
             id: job.data.workRequestId,
             claimToken: job.data.workClaimToken,
             attemptId: job.data.workAttemptId,
+            fenceToken: job.data.workFenceToken!,
           }
         : undefined;
+	if (!stageClaim && (!governed || !governed.attemptId || !job.data.workFenceToken)) {
+	  throw new Error("Atomization requires a durable stage claim or governed attempt lineage");
+	}
     jobLogger.info("Processing atomization job", {
       contentItemId,
       reason: job.data.reason,
     });
 
     let runId: string | undefined;
+    // Keep the exact unit authority while an effect is in progress.  If the
+    // BullMQ delivery lock or a child process fails, the unit must be marked
+    // uncertain immediately; waiting for its two-minute CMS lease to expire
+    // leaves the next sequential chapter blocked for no useful reason.
+    let activeUnit:
+      | {
+          id: string;
+          claimToken: string;
+          fenceToken: string;
+          leaseName: string;
+        }
+      | undefined;
     let currentPhase:
       "planning" | "cutting" | "renditions" | "children" | "embedding" =
       "planning";
@@ -96,27 +120,41 @@ export const createAtomizationWorker = () => createWorker({
         contentItemId,
         { run_id: runId, status, phase, trigger: job.data.reason, ...extra },
         job.id,
-        signal,
+        status === "failed" ? AbortSignal.timeout(15_000) : signal,
       );
       runId = response.run_id;
     };
 
-    let stageHeartbeat: NodeJS.Timeout | undefined;
+    let stageHeartbeat: ContentStageLeaseHeartbeat | undefined;
     let stageBegun = false;
     try {
+      const parentLeases: Array<{
+        name: string;
+        initialLeaseExpiresAt: string;
+        heartbeat: () => Promise<{ lease_expires_at: string }>;
+      }> = [];
       if (stageClaim) {
         await cmsClient.beginContentStage(stageClaim, job.id);
         stageBegun = true;
-        stageHeartbeat = setInterval(
-          () =>
-            void cmsClient
-              .heartbeatContentStage(stageClaim, job.id)
-              .catch(() => undefined),
-          15_000,
-        );
-        stageHeartbeat.unref();
+        const renewed = await cmsClient.heartbeatContentStage(stageClaim, job.id);
+        parentLeases.push({ name: "content_stage", initialLeaseExpiresAt: renewed.lease_expires_at,
+          heartbeat: () => cmsClient.heartbeatContentStage(stageClaim, job.id),
+        });
       }
-      if (governed) await cmsClient.beginAtomizationWork(governed, job.id);
+      if (governed) {
+        await cmsClient.beginAtomizationWork(governed, job.id, signal);
+        const renewed = await cmsClient.heartbeatAtomizationWork(governed, job.id, signal);
+        parentLeases.push({ name: "governed_atomization", initialLeaseExpiresAt: renewed.lease_expires_at,
+          heartbeat: () => cmsClient.heartbeatAtomizationWork(governed, job.id),
+        });
+      }
+      if (parentLeases.length > 0) {
+        stageHeartbeat = startContentStageLeaseHeartbeats({
+          leases: parentLeases,
+          onRenewalFailure: (error, expiresAt, name) => jobLogger.warn("Atomization lease renewal failed", { lease: name, expiresAt, error: String(error) }),
+        });
+        signal = mergeAbortSignals(signal, stageHeartbeat.signal);
+      }
       await report("running", "planning");
       const input = await cmsClient.getAtomizationInput(
         contentItemId,
@@ -133,6 +171,7 @@ export const createAtomizationWorker = () => createWorker({
             "CMS atomization policy is disabled",
             job.id,
           );
+          stageHeartbeat?.removeLease("content_stage");
         }
         await report("completed", "planning");
         return;
@@ -156,6 +195,7 @@ export const createAtomizationWorker = () => createWorker({
             "Parent duration no longer requires atomization",
             job.id,
           );
+          stageHeartbeat?.removeLease("content_stage");
         }
         await report("completed", "planning");
         return;
@@ -166,30 +206,44 @@ export const createAtomizationWorker = () => createWorker({
         );
       }
 
-      const windows = buildWindows(input.segments);
-      const generated = await generateChaptersViaEnrichment(windows, {
-        requestId: job.id,
-        language: input.transcript.language,
-        // The policy value is an editorial density preference. A valid long
-        // parent still needs enough legal units to cover its full timeline.
-        maxChapters: planningChapterCount(input),
-        minSec: minFeedUnitSeconds(input),
-        maxSec: input.policy.hard_max_chapter_minutes * 60,
-        signal,
-      });
-      const normalizedChapters = normalizeGeneratedChapters(
-        generated,
-        windows,
-        input,
-      );
-      const chapters = enforceFullCoverage(normalizedChapters, input);
-      await cmsClient.saveAtomizationPlan(
-        contentItemId,
-        chapters,
-        job.id,
-        signal,
-      );
-      const planDigest = createHash("sha256")
+      const generationInput = {
+        tenant_id: input.item.tenant_id,
+        parent_content_item_id: contentItemId,
+        work_request_id: stageClaim?.request_id ?? governed!.id,
+        content_stage: stageClaim ? contentStageCorrelation(stageClaim) : undefined,
+      };
+      const resumed = await cmsClient.resolveAtomizationGeneration(generationInput, job.id, signal);
+      let chapters = resumed.generation?.plan ?? [];
+      if (!resumed.generation) {
+        const providerPlan = providerChapterPlan(input);
+        if (providerPlan) {
+          chapters = providerPlan;
+          jobLogger.info("Using provider chapter boundaries", { contentItemId, chapterCount: chapters.length });
+        } else {
+          const windows = buildWindows(input.segments);
+          const generated = await generateChaptersViaEnrichment(windows, {
+            requestId: job.id,
+            language: input.transcript.language,
+            // Context determines count. A density preference must not force
+            // an episode into equally sized, generically named parts.
+            providerChapters: input.provider_chapters ?? undefined,
+            minSec: minFeedUnitSeconds(input),
+            maxSec: input.policy.hard_max_chapter_minutes * 60,
+            signal,
+          }).catch((cause: unknown) => {
+            // This call precedes generation persistence, download and cuts.
+            // A failed planner response is not an uncertain media upload.
+            if (signal?.aborted) throw cause;
+            const detail = cause instanceof Error ? cause.message : "Planner unavailable";
+            throw new ChapterPlanningError(`Chapter planning failed: ${detail.slice(0, 1500)}`);
+          });
+          chapters = enforceFullCoverage(normalizeGeneratedChapters(generated, windows, input), input);
+          jobLogger.info("Using contextual transcript chapter boundaries", { contentItemId, chapterCount: chapters.length });
+        }
+      } else if (chapters.length === 0) {
+        throw new Error("Persisted generation has no recoverable plan; operator reconciliation required");
+      }
+      let planDigest = resumed.generation?.plan_digest ?? createHash("sha256")
         .update(JSON.stringify(chapters))
         .digest("hex");
       const coverageDigest = createHash("sha256")
@@ -199,11 +253,9 @@ export const createAtomizationWorker = () => createWorker({
           ),
         )
         .digest("hex");
-      const generationResponse = await cmsClient.createAtomizationGeneration(
+      const generationResponse = resumed.generation ? { generation: resumed.generation } : await cmsClient.createAtomizationGeneration(
         {
-          tenant_id: input.item.tenant_id,
-          parent_content_item_id: contentItemId,
-          work_request_id: governed?.id ?? uuidv4(),
+          ...generationInput,
           transcript_digest: createHash("sha256")
             .update(input.transcript.full_text)
             .digest("hex"),
@@ -218,6 +270,8 @@ export const createAtomizationWorker = () => createWorker({
         job.id,
         signal,
       );
+	      chapters = generationResponse.generation.plan ?? chapters;
+	      planDigest = generationResponse.generation.plan_digest ?? planDigest;
       if (governed)
         await cmsClient.checkpointAtomizationWork(
           {
@@ -229,8 +283,29 @@ export const createAtomizationWorker = () => createWorker({
             },
           },
           job.id,
+          signal,
         );
       await report("running", "cutting");
+
+      const existingUnits = await cmsClient.listAtomizationChapterUnits(
+        generationResponse.generation.id, job.id, signal,
+      );
+      if (existingUnits.units.length === chapters.length && existingUnits.units.every((unit) => unit.state === "verified" && unit.result)) {
+        const result = await cmsClient.finalizeAtomizationGeneration(
+          generationResponse.generation.id,
+          stageClaim ? contentStageCorrelation(stageClaim) : undefined,
+          job.id, signal,
+        );
+        if (stageClaim) stageHeartbeat?.removeLease("content_stage");
+        const completed = existingUnits.units.map((unit) => unit.result!);
+        await enqueueChapterEmbeddingJobs(result.children, completed, input);
+        if (governed) await cmsClient.checkpointAtomizationWork({
+          ...governed, phase: "owner_complete",
+          proof: { child_ids: result.children.map((child) => child.id), review_count: countReviewChapters(completed, input.policy.high_confidence_threshold) },
+        }, job.id, signal);
+        await report("completed", "embedding", { child_count: result.children.length });
+        return;
+      }
 
       const tempFiles: string[] = [];
       const tempDirs: string[] = [];
@@ -253,6 +328,7 @@ export const createAtomizationWorker = () => createWorker({
         );
         reservationHeartbeat.unref();
         const parentMedia = await resolveParentMediaForAtomization(input);
+        const downloadStartedAt = Date.now();
         const parentDownload = await downloadHttp(
           parentMedia.url,
           `${contentItemId}_atomize`,
@@ -261,6 +337,7 @@ export const createAtomizationWorker = () => createWorker({
           localReservation.sourceDir,
         );
         tempFiles.push(parentDownload.filePath);
+        jobLogger.info("Atomization source ready", { contentItemId, elapsedMs: Date.now() - downloadStartedAt });
         const mediaInfo = await getMediaInfo(parentDownload.filePath, { signal });
         const deliveryPolicy = (
           await cmsClient.resolveMediaDeliveryPolicy(
@@ -268,11 +345,13 @@ export const createAtomizationWorker = () => createWorker({
               tenant_id: input.item.tenant_id,
               source_type: input.item.source,
               media_kind: mediaInfo.visualAvailable ? "video" : "audio",
-              // Podcast episodes and talking-head parents are audio-first by
-              // default; only an explicitly HLS-active visual policy spends the
-              // ladder cost for a chapter.
+              // Keep the CMS suitability decision attached to the durable
+              // input.  A YouTube VIDEO can still be an audio-first podcast;
+              // using only the provider type here incorrectly routed those
+              // episodes through the expensive visual HLS ladder.
               suitability:
-                input.item.type === "PODCAST" ? "audio_first_show" : "unknown",
+                input.item.media_suitability ??
+                (input.item.type === "PODCAST" ? "audio_first_show" : "unknown"),
               short_form: true,
             },
             job.id,
@@ -281,19 +360,16 @@ export const createAtomizationWorker = () => createWorker({
         ).policy;
         const chapterUsesAdaptiveHls =
           mediaInfo.visualAvailable &&
+          input.item.media_suitability === "visual_dependent" &&
           deliveryPolicy.primary_mode === "hls" &&
           deliveryPolicy.allow_hls !== false &&
           deliveryPolicy.rollout_state === "active";
 
         const children: AtomizationChapter[] = [];
-        const existingUnits = await cmsClient.listAtomizationChapterUnits(
-          generationResponse.generation.id,
-          job.id,
-          signal,
-        );
         const existingByIndex = new Map(
           existingUnits.units.map((unit) => [unit.unit_index, unit]),
         );
+        const episodeSignal = signal;
         for (let i = 0; i < chapters.length; i += 1) {
           // Every chapter owns a distinct scratch set. It is removed as soon
           // as uploads have been accepted, so a long parent never retains all
@@ -304,8 +380,6 @@ export const createAtomizationWorker = () => createWorker({
             /[^a-zA-Z0-9_-]/g,
             "_",
           );
-          if (governed)
-            await cmsClient.heartbeatAtomizationWork(governed, job.id);
           const existingUnit = existingByIndex.get(i);
           if (existingUnit?.state === "verified" && existingUnit.result) {
             children.push(existingUnit.result);
@@ -319,7 +393,18 @@ export const createAtomizationWorker = () => createWorker({
             throw new Error(`atomization unit ${i} could not be claimed`);
           }
           const unitId = unitClaim.unit.id;
-          const unitToken = unitClaim.unit.claim_token ?? "";
+          const chapterStartedAt = Date.now();
+          const unitToken = unitClaim.unit.claim_token;
+          const unitFenceToken = unitClaim.unit.unit_fence_token ?? unitClaim.unit.fence_token;
+          if (!unitToken || !unitFenceToken || !unitClaim.unit.lease_expires_at) throw new Error("Malformed CMS chapter claim: missing lease credentials");
+          if (!stageHeartbeat) throw new Error("Atomization parent lease controller is unavailable");
+          const unitLeaseName = `chapter:${unitId}`;
+          stageHeartbeat.addLease({
+            name: unitLeaseName,
+            initialLeaseExpiresAt: unitClaim.unit.lease_expires_at,
+            heartbeat: () => cmsClient.heartbeatAtomizationChapterUnit(unitId, unitToken, unitFenceToken, job.id),
+          });
+          const signal = mergeAbortSignals(episodeSignal, stageHeartbeat.signal);
           const unitArtifactPrefix = `${contentItemId}/generations/${generationResponse.generation.id}/chapters/${i}/attempts/${unitClaim.unit.attempt_count}`;
           await cmsClient.transitionAtomizationChapterUnit(
             unitId,
@@ -328,6 +413,12 @@ export const createAtomizationWorker = () => createWorker({
             job.id,
             signal,
           );
+          activeUnit = {
+            id: unitId,
+            claimToken: unitToken,
+            fenceToken: unitFenceToken,
+            leaseName: unitLeaseName,
+          };
           const chapter = chapters[i]!;
           const audioOnly = !mediaInfo.visualAvailable;
           const clipPath = join(
@@ -350,8 +441,9 @@ export const createAtomizationWorker = () => createWorker({
                   parentContentItemId: contentItemId,
                   atomizationGenerationId: generationResponse.generation.id,
                   atomizationChapterUnitId: unitId,
-                  attemptId: governed?.attemptId,
-                  fenceToken: unitClaim.unit.fence_token ?? undefined,
+attemptId: stageClaim?.attempt_id ?? governed?.attemptId,
+                  outerFenceToken: stageClaim?.fence_token ?? job.data.workFenceToken,
+                  fenceToken: unitFenceToken,
                   sourcePath: parentDownload.filePath,
                   sourceInfo: mediaInfo,
                   allowSourcePassthrough: false,
@@ -402,6 +494,7 @@ export const createAtomizationWorker = () => createWorker({
             await cmsClient.checkpointAtomizationWork(
               { ...governed, phase: "first_cut", proof: { chapter_index: 0 } },
               job.id,
+              signal,
             );
 
           currentPhase = "renditions";
@@ -417,15 +510,17 @@ export const createAtomizationWorker = () => createWorker({
                   parentContentItemId: contentItemId,
                   atomizationGenerationId: generationResponse.generation.id,
                   atomizationChapterUnitId: unitId,
-                  attemptId: governed?.attemptId,
+attemptId: stageClaim?.attempt_id ?? governed?.attemptId,
+                  outerFenceToken: stageClaim?.fence_token ?? job.data.workFenceToken,
                   artifactRole: "delivery_progressive",
+                  durationMs: Math.round(cut.duration * 1000),
                   key: getStorageKey(unitArtifactPrefix, "processed", "mp4"),
                   filePath: clipPath,
                   contentType: "video/mp4",
                   inputDigest: createHash("sha256")
                     .update(`${planDigest}:${i}`)
                     .digest("hex"),
-                  fenceToken: unitClaim.unit.fence_token ?? undefined,
+                  fenceToken: unitFenceToken,
                   creatorRole: "aggregation-media-executor",
                 },
                 signal,
@@ -488,6 +583,12 @@ export const createAtomizationWorker = () => createWorker({
           let primaryUrl = mp4Url;
           let primaryType = audioOnly ? "audio" : "mp4";
           let hlsUploadManifestIds: string[] = [];
+          // Before the first HLS manifest is registered, an encode/validation
+          // failure has produced no externally-owned package.  In that case
+          // the already verified MP4/audio rendition is a safe serving route.
+          // Once upload starts, fail closed so a partial package cannot be
+          // silently published without its complete manifest receipt.
+          let hlsUploadStarted = false;
           try {
             if (audioOnly) {
               // The preferred Standard-or-lower native-audio rendition was
@@ -506,6 +607,7 @@ export const createAtomizationWorker = () => createWorker({
                 "required",
                 () => validateAdaptiveHlsPackage(hlsDir),
               );
+              hlsUploadStarted = true;
               const hlsUpload = await withResourceLease(
                 "media_io_package",
                 "required",
@@ -515,11 +617,12 @@ export const createAtomizationWorker = () => createWorker({
                     parentContentItemId: contentItemId,
                     atomizationGenerationId: generationResponse.generation.id,
                     atomizationChapterUnitId: unitId,
-                    attemptId: governed?.attemptId,
+attemptId: stageClaim?.attempt_id ?? governed?.attemptId,
+                  outerFenceToken: stageClaim?.fence_token ?? job.data.workFenceToken,
                       inputDigest: createHash("sha256")
                       .update(`${planDigest}:${i}:hls`)
                       .digest("hex"),
-                    fenceToken: unitClaim.unit.fence_token ?? undefined,
+                    fenceToken: unitFenceToken,
                   }),
               );
               if (!hlsUpload.url || hlsUpload.manifestIds.length === 0) {
@@ -536,19 +639,21 @@ export const createAtomizationWorker = () => createWorker({
                 validation_evidence: validation.evidence,
                 is_primary: true,
               });
-              if (hls.duration > 0) {
-                chapter.end_ms =
-                  chapter.start_ms + Math.round(hls.duration * 1000);
+              if (hls.duration > 0 && (Math.abs(hls.duration * 1000 - (chapter.end_ms - chapter.start_ms)) > 1000 || hls.duration < 270 || hls.duration > 2400)) {
+                throw new Error("HLS playback duration does not match the immutable chapter plan");
               }
             } else {
               renditions[0]!.is_primary = true;
             }
           } catch (hlsError) {
-            // A chapter whose resolved policy requires adaptive HLS must not
-            // silently publish a different delivery contract in the same
-            // generation. The next retry may create a new persisted route;
-            // this attempt remains failed and fenced.
-            if (chapterUsesAdaptiveHls) throw hlsError;
+            // HLS is the preferred route, not a reason to strand an episode.
+            // Encoding/validation failures happen before any HLS manifest is
+            // registered and may safely use the already verified MP4 fallback.
+            // Upload failures remain fail-closed because they may have left a
+            // partial externally-owned package that must be reconciled first.
+            if (hlsUploadStarted || (chapterUsesAdaptiveHls && deliveryPolicy.allow_mp4_fallback === false)) {
+              throw hlsError;
+            }
             jobLogger.warn("Optional HLS rendition failed; using MP4 fallback", {
               contentItemId,
               chapter: i,
@@ -581,7 +686,8 @@ export const createAtomizationWorker = () => createWorker({
                 parentContentItemId: contentItemId,
                 atomizationGenerationId: generationResponse.generation.id,
                 atomizationChapterUnitId: unitId,
-                attemptId: governed?.attemptId,
+attemptId: stageClaim?.attempt_id ?? governed?.attemptId,
+                  outerFenceToken: stageClaim?.fence_token ?? job.data.workFenceToken,
                 artifactRole: "thumbnail",
                 key: thumbKey,
                 filePath: thumbPath,
@@ -589,7 +695,7 @@ export const createAtomizationWorker = () => createWorker({
                 inputDigest: createHash("sha256")
                   .update(`${planDigest}:${i}:thumbnail`)
                   .digest("hex"),
-                fenceToken: unitClaim.unit.fence_token ?? undefined,
+                fenceToken: unitFenceToken,
                 creatorRole: "aggregation-media-executor",
               },
               signal,
@@ -627,10 +733,7 @@ export const createAtomizationWorker = () => createWorker({
               .filter(Boolean)
               .join(" "),
           });
-          await cmsClient.transitionAtomizationChapterUnit(
-            unitId,
-            "verified",
-            {
+          const unitReceipt = {
               claim_token: unitToken,
               result: children[children.length - 1],
               artifact_manifest_ids: [
@@ -641,16 +744,18 @@ export const createAtomizationWorker = () => createWorker({
                   ...(thumbManifestId ? [thumbManifestId] : []),
                 ]),
               ],
-            },
-            job.id,
-            signal,
-          );
+          };
+          await cmsClient.transitionAtomizationChapterUnit(unitId, "verifying", unitReceipt, job.id, signal);
+          await cmsClient.transitionAtomizationChapterUnit(unitId, "verified", unitReceipt, job.id, signal);
+          activeUnit = undefined;
           jobLogger.info("Chapter atomized", {
             contentItemId,
             chapter: i,
             playbackType: primaryType,
             durationSec: cut.duration,
+            elapsedMs: Date.now() - chapterStartedAt,
           });
+          stageHeartbeat.removeLease(unitLeaseName);
           // Object uploads have completed and the child payload contains only
           // remote URLs. Delete this chapter's working set before advancing.
           await Promise.all(
@@ -670,6 +775,7 @@ export const createAtomizationWorker = () => createWorker({
               proof: { chapter_count: children.length },
             },
             job.id,
+            signal,
           );
 
         await report("running", "children", {
@@ -685,10 +791,10 @@ export const createAtomizationWorker = () => createWorker({
           job.id,
           signal,
         );
-        if (stageHeartbeat) {
-          clearInterval(stageHeartbeat);
-          stageHeartbeat = undefined;
-        }
+        // Finalization records the exact outer receipt and moves the stage
+        // out of running. Do not keep renewing a capability that has already
+        // been consumed while post-finalization embedding/reporting continues.
+        if (stageClaim) stageHeartbeat?.removeLease("content_stage");
         if (governed)
           await cmsClient.checkpointAtomizationWork(
             {
@@ -697,6 +803,7 @@ export const createAtomizationWorker = () => createWorker({
               proof: { child_ids: result.children.map((child) => child.id) },
             },
             job.id,
+            signal,
           );
         await enqueueChapterEmbeddingJobs(result.children, children, input);
         if (governed)
@@ -707,6 +814,7 @@ export const createAtomizationWorker = () => createWorker({
               proof: { child_count: result.children.length },
             },
             job.id,
+            signal,
           );
         const reviewCount = countReviewChapters(
           children,
@@ -729,8 +837,9 @@ export const createAtomizationWorker = () => createWorker({
                 child_ids: result.children.map((child) => child.id),
                 review_count: reviewCount,
               },
-            },
+              },
             job.id,
+            signal,
           );
         jobLogger.info("Atomization completed", {
           contentItemId,
@@ -762,15 +871,54 @@ export const createAtomizationWorker = () => createWorker({
           {
             id: governed.id,
             claimToken: governed.claimToken,
+            fenceToken: governed.fenceToken,
             retryAfterSec: error.retryAfterSec,
             summary: error.message,
           },
           job.id,
+          signal,
         );
         await report("queued", currentPhase, { error_message: error.message });
         return;
       }
       try {
+        if (stageClaim && stageBegun) {
+          const hadActiveUnit = Boolean(activeUnit);
+          if (activeUnit) {
+            // Do not pass the already-aborted processor signal here.  This is
+            // the safety receipt that tells CMS to reconcile external work;
+            // it has its own bounded HTTP timeout and is fenced by the unit
+            // claim token.
+            await cmsClient.transitionAtomizationChapterUnit(
+              activeUnit.id,
+              "uncertain",
+              {
+                claim_token: activeUnit.claimToken,
+                fence_token: activeUnit.fenceToken,
+                failure_class: error instanceof Error ? error.name : "worker_failure",
+                summary: error instanceof Error ? error.message : "Atomization effect outcome requires reconciliation",
+              },
+              job.id,
+            ).catch((unitError) => {
+              jobLogger.warn("Failed to mark atomization unit uncertain", {
+                contentItemId,
+                unitId: activeUnit?.id,
+                error: unitError instanceof Error ? unitError.message : String(unitError),
+              });
+            });
+            stageHeartbeat?.removeLease(activeUnit.leaseName);
+            activeUnit = undefined;
+          }
+          if (!hadActiveUnit && error instanceof ChapterPlanningError) {
+            // Rejected before generation creation, scratch allocation or
+            // downloads. This is a planning failure, not an uncertain upload.
+            await cmsClient.failContentStage(stageClaim, "contextual_plan_invalid", error.message, job.id);
+          } else if (!hadActiveUnit && error instanceof CMSRequestError && (error.code === 'schema_contract_failure' || error.code === 'generation_plan_rejected' || error.code === 'generation_input_changed')) {
+            await cmsClient.failContentStage(stageClaim, error.code, error.message, job.id);
+          } else {
+            await cmsClient.uncertainContentStage(stageClaim, error instanceof Error ? error.message : 'Atomization effect outcome requires reconciliation', job.id);
+          }
+        }
         await report("failed", currentPhase, {
           error_message:
             error instanceof Error ? error.message : "Atomization failed",
@@ -786,7 +934,7 @@ export const createAtomizationWorker = () => createWorker({
       }
       throw error;
     } finally {
-      if (stageHeartbeat) clearInterval(stageHeartbeat);
+      if (stageHeartbeat) await stageHeartbeat.stop();
     }
   },
 });
@@ -877,6 +1025,7 @@ async function uploadHlsDirectory(
     attemptId?: string;
     inputDigest: string;
     fenceToken?: string;
+    outerFenceToken?: string;
   },
 ): Promise<{ url?: string; manifestIds: string[] }> {
   const files = await readdir(dir);

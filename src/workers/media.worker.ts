@@ -1243,6 +1243,7 @@ export async function processMediaJob(
       contentItemId,
       {
         media_url: mediaUrl,
+        defer_stage_completion: Boolean(job.data.contentStage),
         // Public playback fields are projected solely by generation activation.
         // This write records non-serving custody and suitability only.
         has_video:
@@ -1484,6 +1485,14 @@ export async function processMediaJob(
       hls_validation_digest: hlsPackage?.validationDigest,
     }, signal);
 
+    // The final persistence receipt relinquishes the lease. All fenced
+    // activation and checkpoints must finish before this call.
+    if (job.data.contentStage) {
+      await cmsClient.updateArtifacts(contentItemId, {
+        content_stage: job.data.contentStage,
+      }, job.id, signal);
+    }
+
     // 9a. Caption-first: if YouTube gave us a usable caption track, persist
     // it as the transcript now (the free fast-path). Human caption →
     // trusted/terminal; auto caption → displayed default, upgradeable via
@@ -1511,13 +1520,11 @@ export async function processMediaJob(
           chapters: chapters?.length ?? 0,
         });
       } catch (capErr) {
-        // Non-blocking: STT can still upgrade later; chapters/caption lost this run.
-        jobLogger.warn("Caption transcript write failed (non-blocking)", {
+        jobLogger.warn("Caption transcript import failed; generated STT is not a fallback", {
           contentItemId,
           error: capErr instanceof Error ? capErr.message : "Unknown error",
         });
-        captionState = "none";
-        captionText = undefined;
+        throw capErr;
       }
     }
 
@@ -1629,6 +1636,8 @@ export const createLegacyMediaWorker = () =>
     queueName: QUEUE_NAMES.MEDIA,
     concurrency: 2,
     timeoutMs: config.mediaJobTimeoutMs,
+    lockDurationMs: 15 * 60_000,
+    lockRenewTimeMs: 60_000,
     processor: processMediaJob,
   });
 
@@ -1637,6 +1646,8 @@ export const createPodsMediaWorker = () =>
     queueName: QUEUE_NAMES.PODS_MEDIA,
     concurrency: 2,
     timeoutMs: config.mediaJobTimeoutMs,
+    lockDurationMs: 15 * 60_000,
+    lockRenewTimeMs: 60_000,
     deadLetterQueueName: QUEUE_NAMES.PODS_STAGE_DLQ,
     processor: async (
       stageJob: Job<ContentStageJob>,

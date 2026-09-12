@@ -5,6 +5,7 @@ import {
 	compatibilityChapterChildren,
     countReviewChapters,
     enforceFullCoverage,
+    providerChapterPlan,
     normalizeGeneratedChapters,
     planningChapterCount,
     shouldAtomizeParent,
@@ -59,21 +60,56 @@ describe('atomization helpers', () => {
         })).toBe(6);
     });
 
-    it('fills planner gaps and splits an oversized span into legal coverage units', () => {
+    it('rejects gaps and oversized spans instead of inventing equal parts', () => {
         const windows = [
             { index: 0, start_sec: 0, text: 'opening' },
             { index: 1, start_sec: 3000, text: 'middle' },
             { index: 2, start_sec: 6000, text: 'closing' },
         ];
-        const chapters = enforceFullCoverage(normalizeGeneratedChapters(
+        expect(() => enforceFullCoverage(normalizeGeneratedChapters(
             [{ start_index: 1, end_index: 2, title: 'Too long middle', confidence: 0.9 }],
             windows,
             { ...baseInput, item: { ...baseInput.item, duration_sec: 7200 } },
-        ), { ...baseInput, item: { ...baseInput.item, duration_sec: 7200 } });
-        expect(chapters[0]?.start_ms).toBe(0);
-        expect(chapters.at(-1)?.end_ms).toBe(7_200_000);
-        expect(chapters.every(chapter => chapter.end_ms - chapter.start_ms <= 2_400_000)).toBe(true);
-        expect(chapters.every((chapter, index) => index === 0 || chapters[index - 1]?.end_ms === chapter.start_ms)).toBe(true);
+        ), { ...baseInput, item: { ...baseInput.item, duration_sec: 7200 } })).toThrow('replan before cutting');
+    });
+
+    it('keeps variable provider boundaries and titles, merging only undersized neighbors', () => {
+        const plan = providerChapterPlan({ ...baseInput, provider_chapters: [
+            { source: 'youtube', start: 0, end: 60, title: 'Opening' },
+            { source: 'youtube', start: 60, end: 900, title: 'Nuclear history' },
+            { source: 'youtube', start: 900, end: 2000, title: 'Safety and regulation' },
+            { source: 'youtube', start: 2000, end: 3600, title: 'Preparing for emergencies' },
+        ] });
+        expect(plan?.map(ch => [ch.title, ch.start_ms, ch.end_ms])).toEqual([
+            ['Nuclear history', 0, 900_000],
+            ['Safety and regulation', 900_000, 2_000_000],
+            ['Preparing for emergencies', 2_000_000, 3_600_000],
+        ]);
+        expect(plan?.[0].merged_short_provenance).toBe(true);
+    });
+
+    it('requires contextual replanning when provider markers are missing, stale, incomplete or oversized', () => {
+        for (const markers of [undefined, [],
+            [{ source: 'derived', start: 0, end: 3600, title: 'Old plan' }],
+            [{ source: 'youtube', start: 0, end: 3000, title: 'Incomplete' }],
+            [{ source: 'youtube', start: 0, end: 3600, title: 'Oversized' }],
+            [{ source: 'youtube', start: 300, end: 3600, title: 'Missing start' }],
+        ]) expect(providerChapterPlan({ ...baseInput, provider_chapters: markers })).toBeNull();
+    });
+
+    it('rejects empty generation rather than making a generic episode chapter', () => {
+        expect(() => normalizeGeneratedChapters([], [], baseInput)).toThrow('replan before cutting');
+    });
+
+    it('preserves semantic metadata when coverage is already legal', () => {
+        const plan = [
+            { title: 'History', start_ms: 0, end_ms: 1_200_000, summary: 'History summary' },
+            { title: 'Safety', start_ms: 1_200_000, end_ms: 3_600_000, summary: 'Safety summary' },
+        ];
+        expect(enforceFullCoverage(plan, baseInput)).toEqual(plan);
+        expect(() => enforceFullCoverage([
+            { ...plan[0], end_ms: 1_100_000 }, plan[1],
+        ], baseInput)).toThrow('replan before cutting');
     });
 
     it('preserves explicit chapter end indexes instead of stretching to the next chapter', () => {

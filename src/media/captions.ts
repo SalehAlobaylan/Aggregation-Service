@@ -68,8 +68,8 @@ interface YtInfoJson {
 
 /**
  * Read the info-json + caption files yt-dlp wrote and return chapters + the
- * best caption track. Never throws — returns empty chapters / no captions on
- * any problem so it can't break the download pipeline. Best-effort deletes the
+ * best caption track. Retrieval failures must not masquerade as caption
+ * absence and authorize paid STT. Best-effort deletes the
  * transient .info.json + .vtt files it consumed.
  */
 export async function extractCaptionsAndChapters(
@@ -82,6 +82,10 @@ export async function extractCaptionsAndChapters(
 
         const chapters = extractChapters(info);
         const captionsResult = await selectAndParseCaption(info, infoJsonPath, aux);
+        const advertised = Object.keys(info.subtitles ?? {}).length > 0 || Object.keys(info.automatic_captions ?? {}).length > 0;
+        if (advertised && !captionsResult) {
+            throw new Error('Provider advertises captions but no usable caption track was retrieved; retry caption acquisition before transcription');
+        }
 
         return {
             captions: captionsResult,
@@ -91,11 +95,11 @@ export async function extractCaptionsAndChapters(
             categories: Array.isArray(info.categories) ? info.categories : undefined,
         };
     } catch (err) {
-        logger.debug('Caption/chapter extraction skipped', {
+        logger.warn('Caption/chapter extraction failed', {
             infoJsonPath,
             error: err instanceof Error ? err.message : 'unknown',
         });
-        return { chapters: [] };
+        throw err;
     } finally {
         await cleanup(aux);
     }

@@ -107,11 +107,15 @@ export async function createAndUploadAdaptiveHlsPackage(input: {
     input.outputDir,
     generated.variants,
     "standard",
+    generated.audioBitrateKbps,
+    generated.audioPeakBandwidthKbps,
   );
   const high = await createHlsAccessMaster(
     input.outputDir,
     generated.variants,
     "high",
+    generated.audioBitrateKbps,
+    generated.audioPeakBandwidthKbps,
   );
   const validation = await validateAdaptiveHlsPackage(input.outputDir);
   const files = (await readdir(input.outputDir))

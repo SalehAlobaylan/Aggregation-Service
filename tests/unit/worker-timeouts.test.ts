@@ -8,6 +8,33 @@ import {
 } from "../../src/workers/base-worker.js";
 
 describe("worker timeout cancellation", () => {
+  it("propagates queue ownership loss before the timeout", async () => {
+    const ownership = new AbortController();
+    const reason = new Error("queue lock lost");
+    const run = runProcessorWithTimeout(
+      async (_job, _logger, signal) => new Promise<void>((resolve) => {
+        signal!.addEventListener("abort", () => resolve(), { once: true });
+      }),
+      { id: "lost" } as Job,
+      createLogger({ queue: "test" }),
+      { timeoutMs: 60000, queueName: "test", signal: ownership.signal },
+    );
+    ownership.abort(reason);
+    await expect(run).rejects.toBe(reason);
+  });
+
+  it("does not start effects when queue ownership is already lost", async () => {
+    const ownership = new AbortController();
+    ownership.abort(new Error("already lost"));
+    let started = false;
+    await expect(runProcessorWithTimeout(
+      async () => { started = true; },
+      { id: "lost" } as Job,
+      createLogger({ queue: "test" }),
+      { timeoutMs: 60000, queueName: "test", signal: ownership.signal },
+    )).rejects.toThrow("already lost");
+    expect(started).toBe(false);
+  });
   it("aborts the processor signal and waits for the processor to reject", async () => {
     let observedSignal: AbortSignal | undefined;
     const job = { id: "job-1", name: "test", data: {} } as unknown as Job;

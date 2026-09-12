@@ -96,6 +96,24 @@ const CMS_CIRCULATION_CLAIM_TIMEOUT_MS = 60_000;
 // and fingerprint checks in one transaction. Remote PostgreSQL can exceed the
 // generic control-plane deadline while a newly activated lane drains backlog.
 const CMS_CONTENT_STAGE_CLAIM_TIMEOUT_MS = 60_000;
+// Content-stage transitions are durable, fenced PostgreSQL transactions. A
+// slow remote Neon query must not be mistaken for a lost media effect after a
+// download or upload has already crossed the side-effect boundary. Keep the
+// ordinary control-plane deadline strict, but give begin/heartbeat/checkpoint
+// and terminal transitions enough time to return their authoritative result.
+const CMS_CONTENT_STAGE_TRANSITION_TIMEOUT_MS = 60_000;
+// Long-form atomization has a five-minute renewable lease, but the control
+// plane still has to tolerate a slow Neon transaction (especially while the
+// workflow snapshotters are competing for connections).  Using the generic
+// ten-second request timeout for a checkpoint turns a successful media effect
+// into an "unknown" attempt and unnecessarily requeues the episode.
+const CMS_LONG_FORM_CONTROL_TIMEOUT_MS = 60_000;
+// Artifact registration/verification is part of the long-form media effect.
+// A CMAF package can issue hundreds of small, fenced manifest transactions
+// while Neon is contended by workflow snapshotters.  The old ten-second
+// transport deadline converted a slow-but-valid manifest write into an
+// aborted upload, leaving the object and its durable intent out of sync.
+const CMS_ARTIFACT_TIMEOUT_MS = 60_000;
 const CMS_MAX_SUCCESS_BODY_BYTES = 2 << 20;
 const CMS_MAX_ERROR_BODY_BYTES = 16 << 10;
 
@@ -103,8 +121,10 @@ export class CMSRequestError extends Error {
   constructor(
     readonly status: number,
     readonly retryable: boolean,
+    readonly code?: string,
+    readonly correlationId?: string,
   ) {
-    super(`CMS request failed with status ${status}`);
+    super(`CMS request failed with status ${status}${code ? ` (${code})` : ''}${correlationId ? ` [${correlationId}]` : ''}`);
     this.name = "CMSRequestError";
   }
 }
@@ -207,6 +227,7 @@ async function contentStageTransition<T = void>(
     | "atomization-not-required",
   extra: Record<string, unknown>,
   requestId?: string,
+  parentSignal?: AbortSignal,
 ): Promise<T> {
   return makeProtectedRequest<T>(
     "POST",
@@ -216,6 +237,8 @@ async function contentStageTransition<T = void>(
       ...extra,
     },
     requestId,
+    parentSignal,
+    CMS_CONTENT_STAGE_TRANSITION_TIMEOUT_MS,
   );
 }
 
@@ -229,6 +252,18 @@ function buildHeaders(requestId?: string): Record<string, string> {
     "X-Service-Name": "aggregation-service",
     "X-Request-ID": requestId || uuidv4(),
   };
+}
+
+function assertLongFormClaimCredentials(unit: {
+  claim_token?: string | null;
+  unit_fence_token?: string | null;
+  fence_token?: string | null;
+  lease_expires_at?: string | null;
+  attempt_count?: number;
+}): void {
+  if (!unit.claim_token || !unit.unit_fence_token || !unit.fence_token || !unit.lease_expires_at || typeof unit.attempt_count !== "number" || !Number.isInteger(unit.attempt_count) || unit.attempt_count < 1) {
+    throw new Error("CMS returned an incomplete long-form execution claim");
+  }
 }
 
 /**
@@ -260,13 +295,24 @@ async function makeRequest<T>(
   if (!response.ok) {
     // Drain only a small bounded prefix so keep-alive resources are not
     // retained, but never return or log upstream-controlled error text.
-    await readBoundedText(response, CMS_MAX_ERROR_BODY_BYTES).catch(() => "");
+    const errorText = await readBoundedText(response, CMS_MAX_ERROR_BODY_BYTES).catch(() => "");
+    let code: string | undefined;
+    let correlationId: string | undefined;
+    let declaredRetryable: boolean | undefined;
+    try {
+      const detail = JSON.parse(errorText) as Record<string, unknown>;
+      if (typeof detail.code === 'string' && /^[a-z][a-z0-9_]{0,79}$/.test(detail.code)) code = detail.code;
+      if (typeof detail.correlation_id === 'string' && /^[a-f0-9-]{36}$/i.test(detail.correlation_id)) correlationId = detail.correlation_id;
+      if (code && typeof detail.retryable === 'boolean') declaredRetryable = detail.retryable;
+    } catch { /* Older CMS versions return unstructured errors. */ }
     reqLogger.error(`CMS API error: ${response.status}`, undefined, {
       status: response.status,
+      code, correlationId,
     });
     throw new CMSRequestError(
       response.status,
-      response.status === 429 || response.status >= 500,
+      declaredRetryable ?? (response.status === 429 || response.status >= 500),
+      code, correlationId,
     );
   }
 
@@ -394,20 +440,23 @@ export const cmsClient = {
   async contentStageAccepted(
     claim: ContentStageClaim,
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
     await contentStageTransition(claim, "accepted", {}, requestId);
   },
   async beginContentStage(
     claim: ContentStageClaim,
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
-    await contentStageTransition(claim, "begin", {}, requestId);
+    await contentStageTransition(claim, "begin", {}, requestId, parentSignal);
   },
   async heartbeatContentStage(
     claim: ContentStageClaim,
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<{ lease_expires_at: string }> {
-    return contentStageTransition<{ lease_expires_at: string }>(claim, "heartbeat", {}, requestId);
+    return contentStageTransition<{ lease_expires_at: string }>(claim, "heartbeat", {}, requestId, parentSignal);
   },
   async checkpointContentStage(
     claim: ContentStageClaim,
@@ -426,6 +475,7 @@ export const cmsClient = {
       },
       requestId,
       parentSignal,
+      CMS_CONTENT_STAGE_TRANSITION_TIMEOUT_MS,
     );
   },
   async deferContentStage(
@@ -512,51 +562,63 @@ export const cmsClient = {
     };
   },
   async beginAtomizationWork(
-    input: { id: string; claimToken: string },
+    input: { id: string; claimToken: string; fenceToken: string },
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
     await makeProtectedRequest(
       "POST",
       `/atomization-work/${encodeURIComponent(input.id)}/begin`,
-      { claim_token: input.claimToken },
+      { claim_token: input.claimToken, fence_token: input.fenceToken },
       requestId,
+      parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async heartbeatAtomizationWork(
-    input: { id: string; claimToken: string },
+    input: { id: string; claimToken: string; fenceToken: string },
     requestId?: string,
-  ): Promise<void> {
-    await makeProtectedRequest(
+    parentSignal?: AbortSignal,
+  ): Promise<{ lease_expires_at: string }> {
+    return makeProtectedRequest(
       "POST",
       `/atomization-work/${encodeURIComponent(input.id)}/heartbeat`,
-      { claim_token: input.claimToken },
+      { claim_token: input.claimToken, fence_token: input.fenceToken },
       requestId,
+      parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async deferAtomizationWork(
     input: {
       id: string;
       claimToken: string;
+      fenceToken: string;
       retryAfterSec: number;
       summary: string;
     },
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
     await makeProtectedRequest(
       "POST",
       `/atomization-work/${encodeURIComponent(input.id)}/defer`,
       {
         claim_token: input.claimToken,
+        fence_token: input.fenceToken,
         retry_after_sec: input.retryAfterSec,
         summary: input.summary,
       },
       requestId,
+      parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async checkpointAtomizationWork(
     input: {
       id: string;
       claimToken: string;
+      fenceToken: string;
       phase:
         | "plan_persisted"
         | "first_cut"
@@ -567,12 +629,15 @@ export const cmsClient = {
       proof: Record<string, unknown>;
     },
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
     await makeProtectedRequest(
       "POST",
       `/atomization-work/${encodeURIComponent(input.id)}/checkpoint`,
-      { claim_token: input.claimToken, phase: input.phase, proof: input.proof },
+      { claim_token: input.claimToken, fence_token: input.fenceToken, phase: input.phase, proof: input.proof },
       requestId,
+      parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async claimPipelineRepair(requestId?: string): Promise<{
@@ -1807,6 +1872,7 @@ export const cmsClient = {
       undefined,
       requestId,
       parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
 
@@ -1883,6 +1949,7 @@ export const cmsClient = {
       data,
       requestId,
       parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
 
@@ -1897,6 +1964,7 @@ export const cmsClient = {
       input,
       requestId,
       parentSignal,
+      CMS_ARTIFACT_TIMEOUT_MS,
     );
   },
   async transitionArtifactManifest(
@@ -1912,29 +1980,34 @@ export const cmsClient = {
       { ...input, state },
       requestId,
       parentSignal,
+      CMS_ARTIFACT_TIMEOUT_MS,
     );
   },
   async getArtifactManifest(
     id: string,
     requestId?: string,
     parentSignal?: AbortSignal,
+    includeCredentials = false,
   ): Promise<ArtifactManifest> {
+    const suffix = includeCredentials ? "?credentials=true" : "";
     return makeProtectedRequest<ArtifactManifest>(
       "GET",
-      `/artifact-manifests/${encodeURIComponent(id)}`,
+      `/artifact-manifests/${encodeURIComponent(id)}${suffix}`,
       undefined,
       requestId,
       parentSignal,
+      CMS_ARTIFACT_TIMEOUT_MS,
     );
   },
   async listArtifactManifests(
-    params: { state?: string; stale?: boolean; tenant_id?: string } = {},
+    params: { state?: string; stale?: boolean; atomization?: boolean; tenant_id?: string } = {},
     requestId?: string,
     parentSignal?: AbortSignal,
   ): Promise<{ manifests: ArtifactManifest[] }> {
     const query = new URLSearchParams();
     if (params.state) query.set("state", params.state);
     if (params.stale) query.set("stale", "true");
+    if (params.atomization) query.set("atomization", "true");
     if (params.tenant_id) query.set("tenant_id", params.tenant_id);
     const suffix = query.size > 0 ? `?${query.toString()}` : "";
     return makeProtectedRequest<{ manifests: ArtifactManifest[] }>(
@@ -1943,6 +2016,7 @@ export const cmsClient = {
       undefined,
       requestId,
       parentSignal,
+      CMS_ARTIFACT_TIMEOUT_MS,
     );
   },
   async resolveMediaDeliveryPolicy(
@@ -2084,7 +2158,9 @@ export const cmsClient = {
       unit: TranscriptionSegmentUnit;
       generation: TranscriptionGeneration;
     };
-    return value.unit && value.generation ? value : null;
+    if (!value.unit || !value.generation) return null;
+    assertLongFormClaimCredentials(value.unit);
+    return value;
   },
   async transitionTranscriptionSegment(
     id: string,
@@ -2104,12 +2180,13 @@ export const cmsClient = {
   async heartbeatTranscriptionSegment(
     id: string,
     claimToken: string,
+    fenceToken: string,
     requestId?: string,
   ): Promise<void> {
     await makeProtectedRequest(
       "POST",
       `/transcription-segments/${encodeURIComponent(id)}/heartbeat`,
-      { claim_token: claimToken },
+      { claim_token: claimToken, fence_token: fenceToken },
       requestId,
     );
   },
@@ -2137,7 +2214,11 @@ export const cmsClient = {
       input,
       requestId,
       parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
+  },
+  async resolveAtomizationGeneration(input: Record<string, unknown>, requestId?: string, parentSignal?: AbortSignal): Promise<{ generation: AtomizationGeneration | null }> {
+    return makeProtectedRequest("POST", "/atomization-generations", { ...input, resolve_only: true }, requestId, parentSignal, CMS_LONG_FORM_CONTROL_TIMEOUT_MS);
   },
   async claimAtomizationChapterUnit(
     requestId?: string,
@@ -2151,13 +2232,17 @@ export const cmsClient = {
       "/atomization-chapter-units/claim",
       generationId ? { generation_id: generationId } : {},
       requestId,
+      undefined,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
     if (!raw) return null;
     const value = raw as {
       unit: AtomizationChapterUnit;
       generation: AtomizationGeneration;
     };
-    return value.unit && value.generation ? value : null;
+    if (!value.unit || !value.generation) return null;
+    assertLongFormClaimCredentials(value.unit);
+    return value;
   },
   async transitionAtomizationChapterUnit(
     id: string,
@@ -2172,18 +2257,22 @@ export const cmsClient = {
       input,
       requestId,
       parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async heartbeatAtomizationChapterUnit(
     id: string,
     claimToken: string,
+    fenceToken: string,
     requestId?: string,
-  ): Promise<void> {
-    await makeProtectedRequest(
+  ): Promise<{ lease_expires_at: string }> {
+    return makeProtectedRequest(
       "POST",
       `/atomization-chapter-units/${encodeURIComponent(id)}/heartbeat`,
-      { claim_token: claimToken },
+      { claim_token: claimToken, fence_token: fenceToken },
       requestId,
+      undefined,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async listAtomizationChapterUnits(
@@ -2197,6 +2286,7 @@ export const cmsClient = {
       undefined,
       requestId,
       parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
   async finalizeAtomizationGeneration(
@@ -2217,6 +2307,7 @@ export const cmsClient = {
       contentStage ? { content_stage: contentStage } : {},
       requestId,
       parentSignal,
+      CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
 

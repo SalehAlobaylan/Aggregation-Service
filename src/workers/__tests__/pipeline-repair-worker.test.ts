@@ -1,3 +1,4 @@
+import { describe, it, expect } from 'vitest';
 import { pipelineRepairQueueJobId } from '../pipeline-repair.worker.js';
 
 describe('pipeline repair queue identity', () => {

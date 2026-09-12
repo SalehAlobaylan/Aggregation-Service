@@ -10,6 +10,7 @@ import {
   resourcePermits,
   resourceDeferrals,
 } from "../observability/metrics.js";
+import { logger } from "../observability/logger.js";
 
 export type WorkloadClass =
   | "software_encode"
@@ -174,14 +175,30 @@ export async function acquireResourceLease(
     workload,
     async heartbeat(): Promise<boolean> {
       if (released) return false;
-      const ok = await redis.eval(
-        HEARTBEAT,
-        1,
-        key(),
-        id,
-        Date.now() + LEASE_MS,
-      );
-      return Number(ok) === 1;
+      try {
+        const ok = await redis.eval(
+          HEARTBEAT,
+          1,
+          key(),
+          id,
+          Date.now() + LEASE_MS,
+        );
+        const healthy = Number(ok) === 1;
+        if (!healthy) {
+          logger.warn("Media resource lease heartbeat was rejected", {
+            workload,
+            lease: id,
+          });
+        }
+        return healthy;
+      } catch (error) {
+        logger.warn("Media resource lease heartbeat failed", {
+          workload,
+          lease: id,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     },
     async release(): Promise<void> {
       if (released) return;

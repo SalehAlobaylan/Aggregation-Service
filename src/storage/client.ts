@@ -14,6 +14,9 @@ import {
   type _Object as S3Object,
   type ObjectIdentifier,
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
+import { Agent as HttpAgent } from "node:http";
+import { Agent as HttpsAgent } from "node:https";
 import { createReadStream } from "fs";
 import { stat } from "fs/promises";
 import { lookup } from "mime-types";
@@ -61,6 +64,38 @@ if (coldClient) attachOpCounter(coldClient, "cold");
 
 // Backwards-compat alias for existing callers that imported s3Client directly.
 const s3Client = primaryClient;
+
+/**
+ * A streamed PutObject can leave a reused TLS socket in a bad-record state
+ * after a R2 edge reset.  The shared client is still ideal for ordinary HEAD
+ * and LIST traffic, but upload retries must use a fresh transport and a fresh
+ * socket pool.  This keeps a transient connection failure from poisoning all
+ * subsequent renditions in the same atomization attempt.
+ */
+function createUploadClient(tier: StorageTier): S3Client {
+  const endpoint = tier === "cold" ? config.coldStorageEndpoint : config.storageEndpoint;
+  const region = tier === "cold" ? config.coldStorageRegion : config.storageRegion;
+  const accessKeyId = tier === "cold" ? config.coldStorageAccessKey : config.storageAccessKey;
+  const secretAccessKey = tier === "cold" ? config.coldStorageSecretKey : config.storageSecretKey;
+  if (!endpoint || !accessKeyId || !secretAccessKey) {
+    throw new Error(`${tier} storage tier is not configured`);
+  }
+  const client = new S3Client({
+    endpoint,
+    region,
+    credentials: { accessKeyId, secretAccessKey },
+    forcePathStyle: true,
+    requestHandler: new NodeHttpHandler({
+      // Do not reuse a socket after a streaming TLS reset.  Each retry owns
+      // this handler and is destroyed immediately after the request settles.
+      httpAgent: new HttpAgent({ keepAlive: false, maxSockets: 8 }),
+      httpsAgent: new HttpsAgent({ keepAlive: false, maxSockets: 8 }),
+      requestTimeout: 0,
+    }),
+  });
+  attachOpCounter(client, tier);
+  return client;
+}
 
 export function isColdTierConfigured(): boolean {
   return Boolean(
@@ -269,17 +304,25 @@ export async function uploadFile(
   signal?: AbortSignal,
   cacheControl?: string,
 ): Promise<string> {
-  const { client, bucket } = bindingFor(tier);
-  const maxRetries = 3;
+  const { bucket } = bindingFor(tier);
+  // Five short, independently-connected attempts are safer than three
+  // retries over one poisoned keep-alive socket.  The manifest wrapper still
+  // marks the object uncertain if every attempt fails, so this never weakens
+  // the external-effect fence.
+  const retryDelaysMs = [1_000, 2_000, 4_000, 8_000] as const;
+  const maxRetries = retryDelaysMs.length + 1;
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     if (signal?.aborted) throw signal.reason;
+    const client = createUploadClient(tier);
+    let fileStream: ReturnType<typeof createReadStream> | undefined;
     try {
       const fileStats = await stat(filePath);
-      const fileStream = createReadStream(filePath);
+      const stream = createReadStream(filePath);
+      fileStream = stream;
       const abortStream = () =>
-        fileStream.destroy(
+        stream.destroy(
           signal?.reason instanceof Error ? signal.reason : undefined,
         );
       signal?.addEventListener("abort", abortStream, { once: true });
@@ -325,7 +368,7 @@ export async function uploadFile(
 
       if (attempt < maxRetries && !signal?.aborted) {
         await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(resolve, Math.pow(2, attempt) * 1000);
+          const timer = setTimeout(resolve, retryDelaysMs[attempt - 1]);
           signal?.addEventListener(
             "abort",
             () => {
@@ -336,6 +379,11 @@ export async function uploadFile(
           );
         });
       }
+    } finally {
+      fileStream?.destroy();
+      // Destroy the per-attempt handler so a reset socket cannot be reused by
+      // the next rendition or linger until the process exits.
+      client.destroy();
     }
   }
 
@@ -351,11 +399,13 @@ export async function uploadBuffer(
   contentType: string,
   tier: StorageTier = "primary",
 ): Promise<string> {
-  const { client, bucket } = bindingFor(tier);
-  const maxRetries = 3;
+  const { bucket } = bindingFor(tier);
+  const retryDelaysMs = [1_000, 2_000, 4_000, 8_000] as const;
+  const maxRetries = retryDelaysMs.length + 1;
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const client = createUploadClient(tier);
     try {
       const params: PutObjectCommandInput = {
         Bucket: bucket,
@@ -388,9 +438,11 @@ export async function uploadBuffer(
 
       if (attempt < maxRetries) {
         await new Promise((resolve) =>
-          setTimeout(resolve, Math.pow(2, attempt) * 1000),
+          setTimeout(resolve, retryDelaysMs[attempt - 1]),
         );
       }
+    } finally {
+      client.destroy();
     }
   }
 
@@ -476,16 +528,19 @@ export async function readObjectDigest(
   key: string,
   maxBytes: number,
   tier: StorageTier = "primary",
+  signal?: AbortSignal,
 ): Promise<{ bytes: number; sha256: string }> {
   const { createHash } = await import("node:crypto");
   const { client, bucket } = bindingFor(tier);
   const response = await client.send(
     new GetObjectCommand({ Bucket: bucket, Key: key }),
+    { abortSignal: signal },
   );
   if (!response.Body) throw new Error("storage object has no body");
   const hash = createHash("sha256");
   let bytes = 0;
   for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+    signal?.throwIfAborted();
     bytes += chunk.length;
     if (bytes > maxBytes)
       throw new Error("storage object exceeds migration artifact limit");

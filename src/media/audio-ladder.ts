@@ -34,6 +34,7 @@ export interface CreateAudioDeliveryLadderInput {
   atomizationChapterUnitId?: string;
   attemptId?: string;
   fenceToken?: string;
+  outerFenceToken?: string;
   sourcePath: string;
   sourceInfo: MediaInfo;
   sourceArtifact?: { url: string; manifestId: string; bytes?: number };
@@ -129,7 +130,9 @@ export async function createAndUploadAudioDeliveryLadder(
         atomizationChapterUnitId: input.atomizationChapterUnitId,
         attemptId: input.attemptId,
         fenceToken: input.fenceToken,
+        outerFenceToken: input.outerFenceToken,
         artifactRole: input.artifactRole,
+        durationMs: Math.round(output.duration * 1000),
         key: `${input.storagePrefix}/audio-${output.tier}-${output.targetBitrateKbps}k.m4a`,
         filePath: output.outputPath,
         contentType: "audio/mp4",

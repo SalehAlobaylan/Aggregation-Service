@@ -43,6 +43,8 @@ export interface ManifestUploadInput {
   tier?: StorageTier;
   inputDigest: string;
   fenceToken?: string;
+  outerFenceToken?: string;
+  durationMs?: number;
   creatorRole: string;
 }
 
@@ -63,11 +65,12 @@ export interface ManifestUploadReceipt {
   providerCacheControl?: string;
 }
 
-async function digestFile(filePath: string): Promise<LocalDigest> {
+async function digestFile(filePath: string, signal?: AbortSignal): Promise<LocalDigest> {
   const sha256 = createHash("sha256");
   const md5 = createHash("md5");
   let bytes = 0;
-  for await (const chunk of createReadStream(filePath)) {
+  signal?.throwIfAborted();
+  for await (const chunk of createReadStream(filePath, { signal })) {
     const value = chunk as Buffer;
     bytes += value.length;
     sha256.update(value);
@@ -143,7 +146,8 @@ export async function uploadFileWithManifest(
       ? (config.coldStorageBucket ?? config.storageBucket)
       : config.storageBucket;
   const url = getPublicUrl(input.key, tier);
-  const digest = await digestFile(input.filePath);
+  const digest = await digestFile(input.filePath, signal);
+  signal?.throwIfAborted();
   const bytes = digest.bytes;
   const producerEventId = uuidv4();
   const manifest = await cmsClient.createArtifactManifest(
@@ -165,10 +169,13 @@ export async function uploadFileWithManifest(
       content_type: input.contentType,
       cache_control: input.cacheControl,
       size_bytes: bytes,
+      duration_ms: input.durationMs,
       sha256: digest.sha256,
       creator_role: input.creatorRole,
       producer_event_id: producerEventId,
       fence_token: input.fenceToken,
+      unit_fence_token: input.atomizationChapterUnitId || input.transcriptionSegmentUnitId ? input.fenceToken : undefined,
+      outer_fence_token: input.outerFenceToken,
       input_digest: input.inputDigest,
     },
     producerEventId,
@@ -307,7 +314,13 @@ export async function registerExistingObjectWithManifest(
       tenant_id: input.tenantId ?? "default",
       content_item_id: input.contentItemId,
       parent_content_item_id: input.parentContentItemId,
+      atomization_generation_id: input.atomizationGenerationId,
+      atomization_chapter_unit_id: input.atomizationChapterUnitId,
+      transcription_generation_id: input.transcriptionGenerationId,
+      transcription_segment_unit_id: input.transcriptionSegmentUnitId,
+      attempt_id: input.attemptId,
       artifact_role: input.artifactRole,
+      package_manifest_id: input.packageManifestId,
       storage_tier: tier,
       bucket,
       object_key: input.key,
@@ -318,7 +331,10 @@ export async function registerExistingObjectWithManifest(
       creator_role: input.creatorRole,
       producer_event_id: producerEventId,
       fence_token: input.fenceToken,
+      unit_fence_token: input.atomizationChapterUnitId || input.transcriptionSegmentUnitId ? input.fenceToken : undefined,
+      outer_fence_token: input.outerFenceToken,
       input_digest: input.inputDigest,
+      duration_ms: input.durationMs,
       recovery_class: "existing_object_repair",
       verification_evidence: {
         existing_object_recovery: true,

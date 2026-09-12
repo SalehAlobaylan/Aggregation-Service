@@ -399,8 +399,6 @@ export const createNormalizeWorker = () => createWorker({
 					const atomizationStageRequired = missingStages.includes('pods_atomization');
 					const embeddingStageRequired = !hasStageDisposition || missingStages.includes('news_text_embedding') || missingStages.includes('pods_text_embedding');
 					const requiresMediaJob =
-						normalized.type === 'VIDEO' ||
-						normalized.type === 'PODCAST' ||
 						(normalized.type === 'ARTICLE' && sourceType === 'TELEGRAM' && telegramMediaKind === 'photo');
 					const runMediaPipeline = requiresMediaJob && mediaStageRequired;
 					const sourceUrl = normalized.mediaUrl || normalized.originalUrl;
@@ -414,8 +412,6 @@ export const createNormalizeWorker = () => createWorker({
                         // neither it nor a provider-supplied duration proves
                         // that the referenced bytes satisfy the feed contract.
 						const mediaReady = Boolean((normalized.metadata as Record<string, unknown>)?.mediaReady) &&
-							normalized.type !== 'VIDEO' &&
-							normalized.type !== 'PODCAST' &&
 							typeof normalized.durationSec === 'number';
 
 						if (mediaReady && normalized.mediaUrl) {
@@ -488,7 +484,7 @@ export const createNormalizeWorker = () => createWorker({
                                         downloadRef,
                                         operations: ['download', 'transcode', 'thumbnail'],
                                     },
-                                    { priority: normalized.type === 'VIDEO' ? 2 : 3, jobId: mediaJobId }
+                                    { priority: 3, jobId: mediaJobId }
                                 );
 
                                 mediaEnqueued++;

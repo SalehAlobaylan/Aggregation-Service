@@ -17,21 +17,50 @@ import { getQueue } from '../queues/index.js';
 import { cmsClient } from '../cms/client.js';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
-import { deleteObject, getObjectMetadata, type StorageTier } from '../storage/client.js';
+import { getObjectMetadata, readObjectDigest, type StorageTier } from '../storage/client.js';
 
 async function reconcileUncertainArtifactManifests(requestId?: string): Promise<{ adopted: number; failed: number; deleted: number }> {
-    const { manifests } = await cmsClient.listArtifactManifests({
-        state: 'uploading,uploaded,uncertain',
-        stale: true,
-    }, requestId);
     const result = { adopted: 0, failed: 0, deleted: 0 };
+    // Atomization units have a nested, renewable lease.  Once that lease is
+    // expired, waiting for the broad source-artifact quarantine window makes
+    // a sequential Pods episode look permanently stuck after a worker crash.
+    // Reconcile those manifests on the next sweep, while retaining the longer
+    // observation window for legacy/source artifacts below.
+    const lists = await Promise.all([
+        cmsClient.listArtifactManifests({
+            state: 'uploading,uploaded,uncertain',
+            stale: true,
+            atomization: true,
+        }, requestId),
+        cmsClient.listArtifactManifests({
+            state: 'uploading,uploaded,uncertain',
+            stale: true,
+        }, requestId),
+    ]);
+    const seen = new Set<string>();
+    const manifests = lists.flatMap(({ manifests: rows }) => rows).filter((manifest) => {
+        if (seen.has(manifest.id)) return false;
+        seen.add(manifest.id);
+        return true;
+    });
     for (const manifest of manifests) {
+      try {
+        const credentialed = await cmsClient.getArtifactManifest(manifest.id, requestId, undefined, true);
+        if (!credentialed.fence_token) {
+            logger.warn('Artifact credential projection was incomplete; reconciliation withheld', { manifestId: manifest.id });
+            continue;
+        }
         const tier = manifest.storage_tier === 'cold' ? 'cold' : 'primary';
+        const configuredBucket = tier === 'cold' ? (config.coldStorageBucket ?? config.storageBucket) : config.storageBucket;
+        if (manifest.bucket !== configuredBucket) {
+            logger.warn('Artifact belongs to a different configured bucket; reconciliation withheld', { manifestId: manifest.id, bucket: manifest.bucket });
+            continue;
+        }
         const metadata = await getObjectMetadata(manifest.object_key, tier as StorageTier);
         const correlation = {
             tenant_id: manifest.tenant_id,
             producer_event_id: manifest.producer_event_id,
-            fence_token: manifest.fence_token ?? undefined,
+            fence_token: credentialed.fence_token,
         };
         if (!metadata.exists) {
             await cmsClient.transitionArtifactManifest(manifest.id, 'failed', {
@@ -44,44 +73,35 @@ async function reconcileUncertainArtifactManifests(requestId?: string): Promise<
         const sizeMatches = manifest.size_bytes <= 0 || metadata.size === manifest.size_bytes;
         const typeMatches = !manifest.content_type || !metadata.contentType || metadata.contentType === manifest.content_type;
         if (!sizeMatches || !typeMatches) {
-            // Delete first while the manifest remains retryable. If provider
-            // deletion fails, the next reconciliation sweep still sees the
-            // uncertain/uploaded row; moving it to cleanup_eligible first
-            // would strand an object because that state is intentionally not
-            // part of the uncertain-manifest claim.
-            await deleteObject(manifest.object_key, tier as StorageTier);
-            await cmsClient.transitionArtifactManifest(manifest.id, 'cleanup_eligible', {
-                ...correlation,
-                cleanup_after_sec: 0,
-                terminal_proof: {
-                    reconciled: true,
-                    reason: 'provider_metadata_mismatch',
-                    expected_size: manifest.size_bytes,
-                    observed_size: metadata.size,
-                    expected_content_type: manifest.content_type,
-                    observed_content_type: metadata.contentType,
-                },
-            }, requestId);
-            await cmsClient.transitionArtifactManifest(manifest.id, 'deleted', correlation, requestId);
-            result.deleted += 1;
+            logger.warn('Conflicting artifact retained for operator reconciliation', { manifestId: manifest.id });
             continue;
         }
-        if (manifest.state === 'uploading') {
-            await cmsClient.transitionArtifactManifest(manifest.id, 'uploaded', {
-                ...correlation,
-                size_bytes: metadata.size,
-                etag: metadata.etag,
-                public_url: manifest.public_url,
-            }, requestId);
+        let observedChecksum = metadata.checksumSha256;
+        if (manifest.atomization_chapter_unit_id || manifest.attempt_id) {
+            if (!manifest.sha256 || manifest.size_bytes <= 0) {
+                logger.warn('Artifact has no immutable digest; operator reconciliation required', { manifestId: manifest.id });
+                continue;
+            }
+            // R2 may not return native SHA256 on HEAD. Hash a bounded stream,
+            // never download to scratch, recut, overwrite or delete the object.
+            const observed = await readObjectDigest(manifest.object_key, manifest.size_bytes, tier, AbortSignal.timeout(300_000));
+            if (observed.bytes !== manifest.size_bytes || observed.sha256 !== manifest.sha256) {
+                logger.warn('Artifact checksum conflict retained for inspection', { manifestId: manifest.id });
+                continue;
+            }
+            observedChecksum = observed.sha256;
         }
         await cmsClient.transitionArtifactManifest(manifest.id, 'verified', {
             ...correlation,
             size_bytes: metadata.size,
             etag: metadata.etag,
             content_type: metadata.contentType ?? manifest.content_type,
-            verification_evidence: { reconciled: true, provider_head_verified: true },
+            verification_evidence: { reconciled: true, provider_head_verified: true, provider_checksum_sha256: observedChecksum },
         }, requestId);
         result.adopted += 1;
+      } catch (error) {
+        logger.warn('Artifact observation deferred without changing objects', { manifestId: manifest.id, error: error instanceof Error ? error.message : String(error) });
+      }
     }
     return result;
 }

@@ -110,6 +110,7 @@ export async function generateChaptersViaEnrichment(
         maxChapters?: number;
         minSec?: number;
         maxSec?: number;
+        providerChapters?: { start: number; end?: number; title: string; source: string }[];
         signal?: AbortSignal;
     } = {},
 ): Promise<GeneratedChapterPlan[]> {
@@ -123,6 +124,7 @@ export async function generateChaptersViaEnrichment(
             max_sec: opts.maxSec,
             with_summary: true,
             language: opts.language,
+            provider_chapters: opts.providerChapters,
         }),
         headers: {
             'Content-Type': 'application/json',

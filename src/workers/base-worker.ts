@@ -14,6 +14,15 @@ export interface WorkerConfig {
     queueName: string;
     concurrency?: number;
     timeoutMs?: number;
+    /**
+     * BullMQ's delivery lock is separate from the CMS durable lease.  Long
+     * media effects must get a longer lock window so a transient Redis
+     * renewal failure cannot requeue a still-running process.  The processor
+     * remains responsible for aborting when the lock is actually lost.
+     */
+    lockDurationMs?: number;
+    lockRenewTimeMs?: number;
+    maxStalledCount?: number;
     processor: (job: Job, jobLogger: ReturnType<typeof createLogger>, signal?: AbortSignal) => Promise<void>;
     /**
      * Control ticks are disposable scheduler wakeups, not durable operational
@@ -37,6 +46,9 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
         queueName,
         concurrency = config.workerConcurrency,
         timeoutMs = config.defaultJobTimeoutMs,
+        lockDurationMs,
+        lockRenewTimeMs,
+        maxStalledCount = config.maxStalledCount,
         processor,
         shouldDeadLetter = () => true,
         shouldDeferFailure = () => false,
@@ -45,7 +57,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
 
     const worker = new Worker(
         queueName,
-        async (job: Job) => {
+        async (job: Job, _token?: string, signal?: AbortSignal) => {
             const jobLogger = createLogger({
                 jobId: job.id,
                 queue: queueName,
@@ -59,6 +71,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
                     timeoutMs,
                     queueName,
                     jobId: job.id,
+                    signal,
                 });
 
                 const durationSec = (Date.now() - startTime) / 1000;
@@ -77,8 +90,12 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
         {
             connection: getRedisConnection(),
             concurrency,
+            // Keep the historic short lock for ordinary stages.  Long media
+            // workers opt into a bounded workload-aware window below.
+            ...(lockDurationMs !== undefined ? { lockDuration: lockDurationMs } : {}),
+            ...(lockRenewTimeMs !== undefined ? { lockRenewTime: lockRenewTimeMs } : {}),
             stalledInterval: config.stalledIntervalMs,
-            maxStalledCount: config.maxStalledCount,
+            maxStalledCount,
             // Role startup validates the complete worker cohort before any
             // BullMQ blocking connection is allowed to consume work.
             autorun: false,
@@ -120,6 +137,28 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
         });
     });
 
+    // BullMQ reports a failed renewal but otherwise leaves the processor
+    // running.  That is unsafe for media effects: the job is moved back to
+    // `wait` after the lock expires while ffmpeg/upload can still mutate
+    // storage.  Cancel the processor immediately so its AbortSignal tears
+    // down child processes and the durable CMS attempt can reconcile before
+    // another delivery starts.
+    worker.on('lockRenewalFailed', (jobIds: string[]) => {
+        for (const jobId of jobIds) {
+            const cancelled = worker.cancelJob(
+                jobId,
+                `BullMQ delivery lock renewal failed for ${queueName}`,
+            );
+            logger.warn('BullMQ delivery lock renewal failed; processor cancelled', {
+                queue: queueName,
+                jobId,
+                cancelled,
+                lockDurationMs: lockDurationMs ?? 30_000,
+                lockRenewTimeMs: lockRenewTimeMs ?? (lockDurationMs ?? 30_000) / 2,
+            });
+        }
+    });
+
     worker.on('error', (error: Error) => {
         logger.error(`Worker error in queue ${queueName}`, error);
     });
@@ -134,6 +173,7 @@ export function createWorker(workerConfig: WorkerConfig): Worker {
 }
 
 interface ProcessorTimeoutOptions {
+    signal?: AbortSignal;
     timeoutMs: number;
     queueName: string;
     jobId?: string;
@@ -180,6 +220,11 @@ export async function runProcessorWithTimeout(
     const timeout = new Promise<'timed_out'>((resolve) => {
         timeoutWake = () => resolve('timed_out');
     });
+    const onAbort = () => timeoutWake?.();
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+    const onOwnershipLost = () => controller.abort(options.signal?.reason ?? new Error('Queue ownership lost'));
+    options.signal?.addEventListener('abort', onOwnershipLost, { once: true });
+    if (options.signal?.aborted) onOwnershipLost();
     const timer = setTimeout(() => {
         controller.abort(timeoutError);
         timeoutWake?.();
@@ -187,6 +232,7 @@ export async function runProcessorWithTimeout(
     timer.unref();
 
     try {
+        controller.signal.throwIfAborted();
         const operation = processor(job, jobLogger, controller.signal);
         const outcome = await Promise.race([
             operation.then(
@@ -204,7 +250,7 @@ export async function runProcessorWithTimeout(
                 new Promise<'grace_expired'>((resolve) => setTimeout(() => resolve('grace_expired'), cancellationGraceMs)),
             ]);
             if (afterAbort === 'grace_expired') {
-                jobLogger.error('Processor ignored cancellation; terminating worker role', timeoutError, {
+                jobLogger.error('Processor ignored cancellation; terminating worker role', controller.signal.reason, {
                     cancellationGraceMs,
                     queueName: options.queueName,
                 });
@@ -215,13 +261,16 @@ export async function runProcessorWithTimeout(
             }
             // Even a cooperative processor that resolved after its deadline
             // cannot report a successful timed-out job.
-            throw timeoutError;
+            throw controller.signal.reason;
         }
         if (outcome.kind === 'failed') {
             throw outcome.error;
         }
+        controller.signal.throwIfAborted();
     } finally {
         clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onOwnershipLost);
+        controller.signal.removeEventListener('abort', onAbort);
         activeProcessorControllers.delete(controller);
     }
 }

@@ -24,6 +24,10 @@ const DURATION_BUCKET_MS = [5, 10, 15, 20, 30, 40].map(
   (minutes) => minutes * 60_000,
 );
 
+export class ChapterPlanningError extends Error {
+  override name = "ChapterPlanningError";
+}
+
 // Stage-6 review-reason code taxonomy (S4/S5). Kept in sync with CMS
 // models.StudioReviewCode* and deriveStudioReviewCodes; CMS re-derives when a
 // chapter arrives without codes, so this is the authoritative forward path.
@@ -163,16 +167,10 @@ export function normalizeGeneratedChapters(
     .filter((ch) => byIndex.has(ch.start_index))
     .sort((a, b) => a.start_index - b.start_index);
 
-  if (sorted.length === 0 && input.item.duration_sec) {
-    sorted.push({
-      start_index: windows[0]?.index ?? 0,
-      end_index: windows[windows.length - 1]?.index ?? 0,
-      title: String(input.item.title ?? "Episode"),
-      summary: null,
-      confidence: 0.65,
-      standalone_score: 0.65,
-      needs_review_reason: PLANNER_FALLBACK_REASON,
-    });
+  if (sorted.length === 0 || sorted.length !== generated.length ||
+      sorted.some((chapter, index) => !chapter.title?.trim() ||
+        (index > 0 && chapter.start_index === sorted[index - 1]!.start_index))) {
+    throw new ChapterPlanningError("Contextual chapter plan is empty or invalid; replan before cutting");
   }
 
   const durationMs = (input.item.duration_sec ?? 0) * 1000;
@@ -191,7 +189,10 @@ export function normalizeGeneratedChapters(
       (durationMs > 0
         ? durationMs / 1000
         : start + input.policy.soft_max_chapter_minutes * 60);
-    const startMs = Math.max(0, Math.round(start * 1000));
+    // Captions often start a few seconds after the media begins. The first
+    // window's chapter owns that opening silence, not a fabricated new part.
+    const startMs = i === 0 && chapter.start_index === windows[0]?.index
+      ? 0 : Math.max(0, Math.round(start * 1000));
     const endMs = Math.max(startMs + 1000, Math.round(endSec * 1000));
     const boundedEndMs = durationMs > 0 ? Math.min(endMs, durationMs) : endMs;
     const hardMaxMs = input.policy.hard_max_chapter_minutes * 60_000;
@@ -220,133 +221,71 @@ export function normalizeGeneratedChapters(
 }
 
 /**
- * Make the planner advisory at boundaries, never authoritative over coverage.
- * We retain usable contextual spans, deterministically fill omissions, and
- * split any oversized span into equal legal units.  This deliberately runs
- * after short-span merging so it cannot create an illegal final tail.
+ * Validate coverage without inventing topic boundaries or relabeling spans.
+ * An unusable plan must fail before expensive effects, never become equally
+ * timed "Part N" clips carrying unrelated summaries and confidence scores.
  */
 export function enforceFullCoverage(
   chapters: AtomizationChapter[],
   input: AtomizationInputResponse,
 ): AtomizationChapter[] {
   const durationMs = Math.round((input.item.duration_sec ?? 0) * 1000);
-  if (durationMs <= 0) return chapters;
+  if (durationMs <= 0 || chapters.length === 0) {
+    throw new ChapterPlanningError("Contextual chapter plan has no complete coverage");
+  }
   const minMs = minFeedUnitMs(input);
   const hardMaxMs = input.policy.hard_max_chapter_minutes * 60_000;
-  if (hardMaxMs < minMs) return chapters;
-
-  const ordered = [...chapters]
-    .map((chapter) => ({
-      ...chapter,
-      start_ms: Math.max(0, Math.min(durationMs, chapter.start_ms)),
-      end_ms: Math.max(0, Math.min(durationMs, chapter.end_ms)),
-    }))
-    .filter((chapter) => chapter.end_ms > chapter.start_ms)
-    .sort((a, b) => a.start_ms - b.start_ms || a.end_ms - b.end_ms);
-  const covered: AtomizationChapter[] = [];
+  const ordered = [...chapters].sort((a, b) => a.start_ms - b.start_ms);
   let cursor = 0;
-
-  const fallback = (
-    start: number,
-    end: number,
-    reason: string,
-  ): AtomizationChapter => ({
-    title: `${String(input.item.title ?? "Episode")} — Part ${covered.length + 1}`,
-    summary: null,
-    start_ms: start,
-    end_ms: end,
-    confidence: 0.65,
-    context_label: null,
-    boundary_reason: reason,
-    standalone_score: 0.65,
-    contains_sponsor_intro: false,
-    needs_review_reason: PLANNER_FALLBACK_REASON,
-  });
-
-  const appendLegal = (candidate: AtomizationChapter) => {
-    const start = Math.max(cursor, candidate.start_ms);
-    const end = Math.max(start, candidate.end_ms);
-    if (end <= start) return;
-    const count = Math.max(1, Math.ceil((end - start) / hardMaxMs));
-    const base = Math.floor((end - start) / count);
-    let partStart = start;
-    for (let index = 0; index < count; index += 1) {
-      const partEnd = index === count - 1 ? end : partStart + base;
-      // Splitting by ceil(max) guarantees every part is <= hard max.
-      // Long-form parents are >2400s, so the resulting equal parts also
-      // exceed the legal minimum. For malformed tiny gaps, preserve a
-      // hidden review span rather than claim it is feed-ready.
-      const partDuration = partEnd - partStart;
-      covered.push({
-        ...candidate,
-        title:
-          count > 1
-            ? `${candidate.title} — Part ${index + 1}`
-            : candidate.title,
-        start_ms: partStart,
-        end_ms: partEnd,
-        needs_review_reason:
-          partDuration < minMs
-            ? (candidate.needs_review_reason ?? MIN_CHAPTER_REVIEW_REASON)
-            : candidate.needs_review_reason,
-      });
-      partStart = partEnd;
-    }
-    cursor = end;
-  };
-
   for (const chapter of ordered) {
-    if (chapter.start_ms > cursor)
-      appendLegal(fallback(cursor, chapter.start_ms, "coverage_gap_fallback"));
-    appendLegal({
-      ...chapter,
-      start_ms: Math.min(chapter.start_ms, cursor),
-      end_ms: chapter.end_ms,
-    });
+    const span = chapter.end_ms - chapter.start_ms;
+    if (!Number.isSafeInteger(chapter.start_ms) || !Number.isSafeInteger(chapter.end_ms) ||
+        chapter.start_ms !== cursor || chapter.end_ms > durationMs ||
+        span < minMs || span > hardMaxMs || !chapter.title?.trim() ||
+        chapter.needs_review_reason?.includes(PLANNER_FALLBACK_REASON)) {
+      throw new ChapterPlanningError("Contextual chapter plan has gaps, overlaps or illegal durations; replan before cutting");
+    }
+    cursor = chapter.end_ms;
   }
-  if (cursor < durationMs)
-    appendLegal(fallback(cursor, durationMs, "coverage_tail_fallback"));
+  if (cursor !== durationMs) throw new ChapterPlanningError("Contextual chapter plan does not cover the full parent");
+  return ordered;
+}
 
-  const legalCoverage =
-    covered.length > 0 &&
-    covered[0]!.start_ms === 0 &&
-    covered[covered.length - 1]!.end_ms === durationMs &&
-    covered.every((chapter) => {
-      const duration = chapter.end_ms - chapter.start_ms;
-      return duration >= minMs && duration <= hardMaxMs;
+/** Provider timestamps and titles are preferable to a newly invented plan.
+ * Only complete, valid original marker sets qualify. Short sections may merge
+ * at an existing boundary; oversized sections go back to contextual planning.
+ */
+export function providerChapterPlan(input: AtomizationInputResponse): AtomizationChapter[] | null {
+  const markers = input.provider_chapters;
+  if (!Array.isArray(markers) || markers.length === 0) return null;
+  const durationMs = Math.round((input.item.duration_sec ?? 0) * 1000);
+  const chapters: AtomizationChapter[] = [];
+  let cursor = 0;
+  for (let index = 0; index < markers.length; index += 1) {
+    const marker = markers[index]!;
+    if (!marker || marker.source !== "youtube" || typeof marker.title !== "string" ||
+        !marker.title.trim() || !Number.isFinite(marker.start)) return null;
+    const end = marker.end ?? markers[index + 1]?.start ?? durationMs / 1000;
+    if (!Number.isFinite(end)) return null;
+    const startMs = Math.round(marker.start * 1000);
+    const endMs = Math.round(end * 1000);
+    if (startMs !== cursor || endMs <= startMs || endMs > durationMs) return null;
+    chapters.push({
+      title: marker.title.trim(), start_ms: startMs, end_ms: endMs,
+      boundary_reason: "provider_chapter", confidence: 0.9, standalone_score: 0.9,
+      contains_sponsor_intro: (input.sponsor_segments ?? []).some(
+        (segment) => segment.start < end && segment.end > marker.start,
+      ),
     });
-  if (legalCoverage) return covered;
-
-  // A planner can leave a tiny tail or create adjacent spans that cannot be
-  // merged without crossing the hard maximum. Repartition the complete
-  // timeline deterministically in that exceptional case. This preserves
-  // the full-coverage product contract and guarantees that a legal parent
-  // cannot reach CMS finalization with an unpublishable short unit.
-  const count = minimumCoverageChapterCount(
-    durationMs / 1000,
-    hardMaxMs / 1000,
-  );
-  if (count <= 0 || hardMaxMs < minMs * 2) return covered;
-  const base = Math.floor(durationMs / count);
-  const remainder = durationMs % count;
-  let start = 0;
-  return Array.from({ length: count }, (_, index) => {
-    const end = start + base + (index < remainder ? 1 : 0);
-    const source =
-      covered[Math.min(index, covered.length - 1)] ??
-      fallback(start, end, PLANNER_FALLBACK_REASON);
-    const chapter: AtomizationChapter = {
-      ...source,
-      title: `${String(input.item.title ?? "Episode")} — Part ${index + 1}`,
-      start_ms: start,
-      end_ms: end,
-      needs_review_reason:
-        source.needs_review_reason ??
-        "Coverage was deterministically rebalanced.",
-    };
-    start = end;
-    return chapter;
-  });
+    cursor = endMs;
+  }
+  if (cursor !== durationMs) return null;
+  try {
+    return annotateReviewCodes(enforceFullCoverage(mergeShortChapters(chapters, input), input),
+      input.effective_policy?.high_confidence_threshold ?? input.policy.high_confidence_threshold);
+  } catch {
+    return null;
+  }
 }
 
 export function mergeShortChapters(

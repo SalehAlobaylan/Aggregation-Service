@@ -428,7 +428,7 @@ describe("normalize worker characterization", () => {
     mocks.reportSourceRun.mockResolvedValue(undefined);
   });
 
-  it("routes video content to the media queue", async () => {
+  it("retains video metadata without bypassing CMS media admission", async () => {
     const media = mediaQueue();
     const ai = aiQueue();
     mocks.getQueue.mockImplementation((name: string) => {
@@ -460,17 +460,7 @@ describe("normalize worker characterization", () => {
       logger(),
     );
 
-    expect(media.add).toHaveBeenCalledWith(
-      "media-VIDEO-content-1",
-      expect.objectContaining({
-        contentItemId: "content-1",
-        contentType: "VIDEO",
-        sourceType: "YOUTUBE",
-        sourceUrl: "https://youtube.com/watch?v=abc123",
-        operations: ["download", "transcode", "thumbnail"],
-      }),
-      { priority: 2, jobId: "media-content-1" },
-    );
+    expect(media.add).not.toHaveBeenCalled();
     expect(ai.add).not.toHaveBeenCalled();
   });
 

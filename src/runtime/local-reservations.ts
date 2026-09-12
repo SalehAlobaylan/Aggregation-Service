@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import { getRedisConnection } from "../queues/redis.js";
 import { config } from "../config/index.js";
 import { ResourceDeferredError } from "./resource-admission.js";
+import { logger } from "../observability/logger.js";
 
 const RESERVATION_TTL_MS = 90_000;
 const SAFETY_RESERVE_BYTES = 2 * 1024 * 1024 * 1024;
@@ -184,11 +185,19 @@ export async function reserveLocalScratch(
       )) === 1;
       if (ok) await redis.pexpire(metaKey, RESERVATION_TTL_MS);
       if (!ok && !reservationAbort.signal.aborted) {
+        logger.warn("Local scratch reservation heartbeat was rejected", {
+          attemptId: safeAttempt,
+          reservationId: id,
+        });
         reservationAbort.abort(new Error("local scratch reservation lease lost"));
       }
       return ok;
     } catch {
       if (!reservationAbort.signal.aborted) {
+        logger.warn("Local scratch reservation heartbeat failed", {
+          attemptId: safeAttempt,
+          reservationId: id,
+        });
         reservationAbort.abort(new Error("local scratch reservation heartbeat failed"));
       }
       return false;

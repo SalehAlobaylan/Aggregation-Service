@@ -688,7 +688,7 @@ export async function downloadYouTube(
 
       // Caption-first: read chapters, the best caption track, plus
       // heatmap / SponsorBlock / categories from the info-json + .vtt
-      // files yt-dlp just wrote (no extra request). Best-effort.
+      // files yt-dlp just wrote (no extra request). Fail closed on caption errors.
       const { captions, chapters, heatmap, sponsorSegments, categories } =
         await extractCaptionsAndChapters(
           getTempPath(contentItemId, "info.json", tempDir),
@@ -747,6 +747,9 @@ export async function downloadYouTube(
       return undefined;
     const restoredDownload = await restoreExistingDownload();
     if (restoredDownload) {
+      if (!restoredDownload.captions) {
+        throw new YouTubeAccessDeferredError(failureClass, "Cached media has no caption evidence; fresh provider caption lookup is required before transcription");
+      }
       logger.warn(
         "YouTube challenged fresh download; reusing validated same-item source",
         { contentItemId, format: restoredDownload.format },
@@ -754,61 +757,12 @@ export async function downloadYouTube(
       return restoredDownload;
     }
     if (cachedFallback) {
-      logger.warn(
-        "YouTube challenged extraction; downloading bounded same-item cached format",
-        {
-          contentItemId,
-          format: cachedFallback.extension,
-          formatId: cachedFallback.formatId,
-          height: cachedFallback.height,
-          videoCodec: cachedFallback.videoCodec,
-        },
+      // A signed media URL proves neither caption absence nor a completed
+      // caption lookup. Do not transfer a long source just to fail that check.
+      throw new YouTubeAccessDeferredError(
+        failureClass,
+        "Cached media URL has no caption evidence; retry provider extraction before downloading",
       );
-      try {
-        const fallbackDownload = await downloadHttp(
-          cachedFallback.url,
-          contentItemId,
-          cachedFallback.extension,
-          signal,
-          tempDir,
-        );
-        try {
-          const validated = await assertYouTubeSourceProfile(
-            fallbackDownload,
-            signal,
-          );
-          if (!expectedVideoId)
-            throw new Error("cached YouTube fallback lacks requested video identity");
-          await persistYouTubeSourceEvidence(
-            contentItemId,
-            expectedVideoId,
-            validated.filePath,
-            tempDir,
-          );
-          return validated;
-        } catch (fallbackError) {
-          await unlink(fallbackDownload.filePath).catch(() => undefined);
-          throw fallbackError;
-        }
-      } catch (fallbackError) {
-        const fallbackMessage =
-          fallbackError instanceof Error
-            ? fallbackError.message
-            : String(fallbackError);
-        const fallbackClass = classifyYouTubeFailure(fallbackMessage);
-        if (
-          fallbackClass === "rate_limited" ||
-          fallbackClass === "attestation_required"
-        ) {
-          throw new YouTubeAccessDeferredError(
-            fallbackClass === "rate_limited"
-              ? "rate_limited"
-              : "attestation_required",
-            "Cached YouTube media URL is no longer usable; fresh provider access is required",
-          );
-        }
-        throw fallbackError;
-      }
     }
     throw new YouTubeAccessDeferredError(
       failureClass,
@@ -832,31 +786,6 @@ export async function downloadYouTube(
     await discardExistingBackup();
     return result;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("Unable to download video subtitles")) {
-      logger.warn(
-        "YouTube subtitle download failed; retrying media without subtitles",
-        {
-          url,
-          contentItemId,
-          error: message,
-        },
-      );
-      try {
-        const { stdout } = await runYtDlp(buildArgs(false, false), url, {
-          signal,
-        });
-        const result = await parseResult(stdout);
-        await discardExistingBackup();
-        return result;
-      } catch (subtitleRetryError) {
-        const recovered = await recoverProviderAccess(subtitleRetryError);
-        if (recovered) return recovered;
-        await restoreExistingDownload();
-        throw subtitleRetryError;
-      }
-    }
-
     const recovered = await recoverProviderAccess(err);
     if (recovered) return recovered;
     await restoreExistingDownload();
@@ -889,6 +818,8 @@ export async function downloadYouTubeAudio(
     "-o",
     outputPath,
     "--no-playlist",
+    "--write-info-json",
+    ...SUBTITLE_ARGS,
     "--print-json",
     url,
   ];
@@ -920,22 +851,18 @@ export async function downloadYouTubeAudio(
     }
     throw error;
   }
-  try {
-    const metadata = JSON.parse(stdout.trim().split("\n").pop() || "{}");
-
-    return {
-      filePath: outputPath,
-      format: "m4a",
-      duration: metadata.duration,
-      title: metadata.title,
-      thumbnailUrl: metadata.thumbnail,
-    };
-  } catch {
-    return {
-      filePath: outputPath,
-      format: "m4a",
-    };
-  }
+  const metadata = JSON.parse(stdout.trim().split("\n").pop() || "{}");
+  const signals = await extractCaptionsAndChapters(
+    getTempPath(contentItemId, "info.json", tempDir),
+  );
+  return {
+    filePath: outputPath,
+    format: "m4a",
+    duration: metadata.duration,
+    title: metadata.title,
+    thumbnailUrl: metadata.thumbnail,
+    ...signals,
+  };
 }
 
 /**
@@ -959,15 +886,22 @@ export async function downloadHttp(
 
   logger.debug("Starting HTTP download", { url, contentItemId, ext });
 
+  const stalled = new AbortController();
+  const downloadSignal = signal ? AbortSignal.any([signal, stalled.signal]) : stalled.signal;
+  const abortStalled = () => stalled.abort(new Error("Media download made no progress for 30 seconds"));
+  let progressTimer = setTimeout(abortStalled, MEDIA_RESPONSE_TIMEOUT_MS);
+  progressTimer.unref();
   const { response, close } = await safeFetchResponse(url, {
-    timeoutMs: MEDIA_RESPONSE_TIMEOUT_MS,
-    signal,
+    // A source can be hundreds of MB. Bound inactivity, not the entire
+    // transfer to the response-header timeout; the owner lease still aborts it.
+    timeoutMs: config.mediaJobTimeoutMs,
+    signal: downloadSignal,
     rateLimit: false,
     headers: {
       "User-Agent": "WahbBot/1.0 (Media Download)",
       Accept: "audio/*,video/*,application/octet-stream,*/*;q=0.5",
     },
-  });
+  }).catch((error) => { clearTimeout(progressTimer); throw error; });
 
   try {
     if (!response.ok) {
@@ -1001,6 +935,9 @@ export async function downloadHttp(
     let bytesWritten = 0;
     const capCounter = new Transform({
       transform(chunk, _encoding, callback) {
+        clearTimeout(progressTimer);
+        progressTimer = setTimeout(abortStalled, MEDIA_RESPONSE_TIMEOUT_MS);
+        progressTimer.unref();
         bytesWritten += chunk.length;
         if (bytesWritten > MAX_MEDIA_DOWNLOAD_BYTES) {
           callback(
@@ -1016,13 +953,13 @@ export async function downloadHttp(
 
     try {
       // @ts-expect-error - Undici fetch body is a Web ReadableStream.
-      await pipeline(response.body, capCounter, fileStream, { signal });
+      await pipeline(response.body, capCounter, fileStream, { signal: downloadSignal });
     } catch (error) {
       await cleanupTempFile(outputPath).catch(() => {});
       throw error;
     }
 
-    if (signal?.aborted) throw signal.reason;
+    if (downloadSignal.aborted) throw downloadSignal.reason;
     const fileStats = await stat(outputPath);
 
     logger.info("HTTP download complete", {
@@ -1036,6 +973,7 @@ export async function downloadHttp(
       format: ext,
     };
   } finally {
+    clearTimeout(progressTimer);
     await close();
   }
 }

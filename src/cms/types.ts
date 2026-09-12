@@ -181,6 +181,7 @@ export interface UpdateStatusRequest {
  * PATCH /internal/content-items/:id/artifacts
  */
 export interface UpdateArtifactsRequest {
+  defer_stage_completion?: boolean;
   media_url?: string;
   thumbnail_url?: string;
   duration_sec?: number;
@@ -373,6 +374,7 @@ export interface MediaDeliveryPolicy {
   allow_passthrough?: boolean;
   allow_remux?: boolean;
   allow_hls?: boolean;
+  allow_mp4_fallback?: boolean;
   require_adaptive_hls?: boolean;
   generate_audio_alternate?: boolean;
   generate_progressive_fallback?: boolean;
@@ -420,6 +422,7 @@ export interface TranscriptionSegmentUnit {
   state: DurableUnitState;
   attempt_count: number;
   claim_token?: string | null;
+  unit_fence_token?: string | null;
   fence_token?: string | null;
   lease_expires_at?: string | null;
 }
@@ -438,19 +441,28 @@ export interface TranscriptionGeneration {
 }
 
 export interface AtomizationChapterUnit {
+  lease_expires_at?: string | null;
   id: string;
   generation_id: string;
   unit_index: number;
   start_ms: number;
   end_ms: number;
+  plan_digest?: string;
+  transcript_slice_digest?: string;
   state: DurableUnitState;
   attempt_count: number;
   claim_token?: string | null;
+  unit_fence_token?: string | null;
   fence_token?: string | null;
+  artifact_manifest_ids?: string[];
   result?: AtomizationChapter;
 }
 
 export interface AtomizationGeneration {
+  plan_digest?: string;
+  content_stage_request_id?: string;
+  processing_generation?: number;
+  plan?: AtomizationChapter[];
   id: string;
   parent_content_item_id: string;
   work_request_id: string;
@@ -483,6 +495,18 @@ export interface AtomizationInputResponse {
     source_manifest_key?: string | null;
     source_manifest_content_type?: string | null;
     source_manifest_storage_tier?: string | null;
+    /** CMS' durable suitability decision.  This is distinct from the
+     * provider type: a video file from a podcast can still be audio-first and
+     * must not be routed through the expensive visual HLS ladder. */
+    media_suitability?:
+      | "audio_first_talking_head"
+      | "audio_first_show"
+      | "visual_dependent"
+      | "unsuitable"
+      | "unknown"
+      | string
+      | null;
+    media_suitability_confidence?: number | null;
   };
   policy: AtomizationPolicy;
   effective_policy?: AtomizationPolicy;
@@ -498,6 +522,8 @@ export interface AtomizationInputResponse {
   segments: AtomizationSegment[];
   sponsor_segments?: { start: number; end: number; category: string }[];
   existing_chapters: unknown[];
+  /** Original provider markers, not mutable Studio or old-generation rows. */
+  provider_chapters?: { start: number; end?: number; title: string; source: string }[] | null;
 }
 
 export interface AtomizedChildResponse {

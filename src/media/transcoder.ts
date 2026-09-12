@@ -609,6 +609,10 @@ export async function transcodeAudioLadderToM4a(
     args.push("-ss", String(Math.max(0, options.startSec)));
   args.push("-i", inputPath);
   for (const output of outputs) {
+    // AAC's requested bitrate is an average, not a hard upper bound. Leave
+    // encoding headroom while still validating the measured output against
+    // the unchanged policy ceiling below (no tolerance-based acceptance).
+    const encoderBitrateKbps = Math.max(1, Math.floor(output.targetBitrateKbps * 0.95));
     args.push(
       "-map",
       "0:a:0",
@@ -618,7 +622,7 @@ export async function transcodeAudioLadderToM4a(
       "-profile:a",
       "aac_low",
       "-b:a",
-      `${output.targetBitrateKbps}k`,
+      `${encoderBitrateKbps}k`,
       "-ac",
       "2",
       "-ar",
@@ -1011,9 +1015,14 @@ export interface AdaptiveHlsResult {
     height: number;
     width: number;
     bitrateKbps: number;
+    /** Peak video segment rate, measured from the generated CMAF files. */
+    peakBandwidthKbps: number;
     playlist: string;
   }>;
   audioPlaylist: string;
+  /** Measured shared-audio average and peak rates used by master declarations. */
+  audioBitrateKbps: number;
+  audioPeakBandwidthKbps: number;
   duration: number;
 }
 
@@ -1027,6 +1036,8 @@ export async function createHlsAccessMaster(
   outputDir: string,
   variants: AdaptiveHlsResult["variants"],
   tier: "standard" | "high",
+  audioBitrateKbps = 128,
+  audioPeakBandwidthKbps = audioBitrateKbps,
 ): Promise<{ file: string; maxHeight: number; maxBandwidthKbps: number }> {
   const selected = variants.filter(
     (variant) => tier === "high" || variant.height <= 540,
@@ -1044,7 +1055,7 @@ export async function createHlsAccessMaster(
       '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="AAC",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"',
       ...selected.map(
         (variant) =>
-          `#EXT-X-STREAM-INF:BANDWIDTH=${Math.ceil(variant.bitrateKbps * 1100)},AVERAGE-BANDWIDTH=${variant.bitrateKbps * 1000},CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=${variant.width}x${variant.height},AUDIO="audio"\n${variant.playlist}`,
+          `#EXT-X-STREAM-INF:BANDWIDTH=${Math.ceil((variant.peakBandwidthKbps + audioPeakBandwidthKbps) * 1000)},AVERAGE-BANDWIDTH=${Math.ceil((variant.bitrateKbps + audioBitrateKbps) * 1000)},CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=${variant.width}x${variant.height},AUDIO="audio"\n${variant.playlist}`,
       ),
     ].join("\n") + "\n";
   await writeFile(join(outputDir, file), master);
@@ -1201,22 +1212,35 @@ export async function createAdaptiveHlsPackage(
         (sum, match) => sum + Number(match[1]),
         0,
       );
-      const segments = raw
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.endsWith(".m4s"));
-      const bytes = (
-        await Promise.all(
-          segments.map((segment) =>
-            stat(join(outputDir, segment)).then((entry) => entry.size),
-          ),
-        )
-      ).reduce((sum, size) => sum + size, 0);
+      const segments = [
+        ...raw.matchAll(/#EXTINF:([0-9.]+)[^\n]*\n([^\n]+)/g),
+      ].map((match) => ({
+        duration: Number(match[1]),
+        ref: match[2]?.trim() ?? "",
+      }));
+      const segmentSizes = await Promise.all(
+        segments.map(async (segment) => ({
+          duration: segment.duration,
+          size: (await stat(join(outputDir, segment.ref))).size,
+        })),
+      );
+      const bytes = segmentSizes.reduce((sum, segment) => sum + segment.size, 0);
       const produced = await getMediaInfo(join(outputDir, playlist), options);
       const averageKbps =
         duration > 0
           ? Math.max(1, Math.ceil((bytes * 8) / duration / 1000))
           : bitrate.get(h)!;
+      // HLS BANDWIDTH is a peak segment rate, not a target encoder rate.
+      // Encoders can legally overshoot a target, especially on keyframes, so
+      // measure every generated segment before writing the master playlist.
+      const peakBandwidthKbps = Math.max(
+        averageKbps,
+        ...segmentSizes
+          .filter((segment) => segment.duration > 0)
+          .map((segment) =>
+            Math.ceil((segment.size * 8) / segment.duration / 1000),
+          ),
+      );
       return {
         height: produced.height ?? h,
         width:
@@ -1225,9 +1249,39 @@ export async function createAdaptiveHlsPackage(
             (((probe.width ?? 16) / Math.max(1, probe.height ?? 9)) * h) / 2,
           ) * 2,
         bitrateKbps: averageKbps,
+        peakBandwidthKbps,
         playlist,
       };
     }),
+  );
+  const audioPlaylistPath = join(outputDir, "audio.m3u8");
+  const audioRaw = await readFile(audioPlaylistPath, "utf8");
+  const audioSegments = [
+    ...audioRaw.matchAll(/#EXTINF:([0-9.]+)[^\n]*\n([^\n]+)/g),
+  ].map((match) => ({
+    duration: Number(match[1]),
+    ref: match[2]?.trim() ?? "",
+  }));
+  const audioSizes = await Promise.all(
+    audioSegments.map(async (segment) => ({
+      duration: segment.duration,
+      size: (await stat(join(outputDir, segment.ref))).size,
+    })),
+  );
+  const audioDuration = audioSegments.reduce(
+    (sum, segment) => sum + (Number.isFinite(segment.duration) ? segment.duration : 0),
+    0,
+  );
+  const audioBytes = audioSizes.reduce((sum, segment) => sum + segment.size, 0);
+  const audioBitrateKbps =
+    audioDuration > 0
+      ? Math.max(1, Math.ceil((audioBytes * 8) / audioDuration / 1000))
+      : 128;
+  const audioPeakBandwidthKbps = Math.max(
+    audioBitrateKbps,
+    ...audioSizes
+      .filter((segment) => segment.duration > 0)
+      .map((segment) => Math.ceil((segment.size * 8) / segment.duration / 1000)),
   );
   const master =
     [
@@ -1237,7 +1291,7 @@ export async function createAdaptiveHlsPackage(
       '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="AAC",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"',
       ...variants.map(
         (v) =>
-          `#EXT-X-STREAM-INF:BANDWIDTH=${Math.ceil(v.bitrateKbps * 1100)},AVERAGE-BANDWIDTH=${v.bitrateKbps * 1000},CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=${v.width}x${v.height},AUDIO="audio"\n${v.playlist}`,
+          `#EXT-X-STREAM-INF:BANDWIDTH=${Math.ceil((v.peakBandwidthKbps + audioPeakBandwidthKbps) * 1000)},AVERAGE-BANDWIDTH=${Math.ceil((v.bitrateKbps + audioBitrateKbps) * 1000)},CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=${v.width}x${v.height},AUDIO="audio"\n${v.playlist}`,
       ),
     ].join("\n") + "\n";
   const masterPlaylistPath = join(outputDir, "master.m3u8");
@@ -1288,6 +1342,8 @@ export async function createAdaptiveHlsPackage(
     progressiveFallbackPath,
     variants,
     audioPlaylist: "audio.m3u8",
+    audioBitrateKbps,
+    audioPeakBandwidthKbps,
     duration: probe.duration,
   };
 }
