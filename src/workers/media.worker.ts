@@ -1206,6 +1206,7 @@ export async function processMediaJob(
     if (downloadResult.categories?.length)
       downloadMeta["categories"] = downloadResult.categories;
     const boundedCaptions = downloadResult.captions;
+    if (downloadResult.captionOutcome) downloadMeta['caption_acquisition_outcome'] = downloadResult.captionOutcome;
     if (
       boundedCaptions &&
       boundedCaptions.segments.length > 0 &&

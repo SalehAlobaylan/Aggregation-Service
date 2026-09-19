@@ -36,6 +36,7 @@ import type { TranscriptChapter } from "../cms/types.js";
 import { getMediaInfo, type MediaInfo } from "./transcoder.js";
 
 export interface DownloadResult {
+  captionOutcome?: 'available' | 'unavailable';
   filePath: string;
   format: string;
   duration?: number;
@@ -689,7 +690,7 @@ export async function downloadYouTube(
       // Caption-first: read chapters, the best caption track, plus
       // heatmap / SponsorBlock / categories from the info-json + .vtt
       // files yt-dlp just wrote (no extra request). Fail closed on caption errors.
-      const { captions, chapters, heatmap, sponsorSegments, categories } =
+      const { captions, chapters, heatmap, sponsorSegments, categories, captionOutcome } =
         await extractCaptionsAndChapters(
           getTempPath(contentItemId, "info.json", tempDir),
         );
@@ -712,6 +713,7 @@ export async function downloadYouTube(
         title: metadata.title,
         thumbnailUrl: metadata.thumbnail,
         captions,
+        captionOutcome,
         chapters,
         heatmap,
         sponsorSegments,

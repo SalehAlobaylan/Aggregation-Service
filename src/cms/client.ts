@@ -359,9 +359,10 @@ export const cmsClient = {
     requestId?: string,
     stages?: string[],
   ): Promise<ContentStageClaim | null> {
-    const query = stages?.length
-      ? `?stages=${encodeURIComponent(stages.join(","))}`
-      : "";
+    const params = new URLSearchParams();
+    if (stages?.length) params.set("stages", stages.join(","));
+    if (lane === "pods") params.set("chapter_plan_version", "1");
+    const query = params.size ? `?${params}` : "";
     const raw = await makeProtectedRequest<unknown>(
       "POST",
       `/content-stages/${lane}/claim${query}`,
@@ -2217,7 +2218,7 @@ export const cmsClient = {
       CMS_LONG_FORM_CONTROL_TIMEOUT_MS,
     );
   },
-  async resolveAtomizationGeneration(input: Record<string, unknown>, requestId?: string, parentSignal?: AbortSignal): Promise<{ generation: AtomizationGeneration | null }> {
+  async resolveAtomizationGeneration(input: Record<string, unknown>, requestId?: string, parentSignal?: AbortSignal): Promise<{ generation: AtomizationGeneration | null; applied_plan?: NonNullable<AtomizationGeneration['plan']> }> {
     return makeProtectedRequest("POST", "/atomization-generations", { ...input, resolve_only: true }, requestId, parentSignal, CMS_LONG_FORM_CONTROL_TIMEOUT_MS);
   },
   async claimAtomizationChapterUnit(

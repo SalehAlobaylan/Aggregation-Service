@@ -42,6 +42,7 @@ export interface SponsorSegment {
 }
 
 export interface CaptionExtractionResult {
+    captionOutcome: 'available' | 'unavailable';
     captions?: ExtractedCaptions;
     chapters: TranscriptChapter[];
     heatmap?: HeatmapPoint[];
@@ -88,6 +89,7 @@ export async function extractCaptionsAndChapters(
         }
 
         return {
+            captionOutcome: captionsResult ? 'available' : 'unavailable',
             captions: captionsResult,
             chapters,
             heatmap: extractHeatmap(info),

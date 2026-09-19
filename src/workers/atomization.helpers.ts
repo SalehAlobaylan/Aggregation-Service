@@ -28,6 +28,20 @@ export class ChapterPlanningError extends Error {
   override name = "ChapterPlanningError";
 }
 
+// A frozen generation outranks newly applied drafts. Missing frozen evidence
+// is an error, never permission to substitute a plan or call a paid planner.
+export function persistedChapterPlan(resolved: {
+  generation: { plan?: AtomizationChapter[] } | null;
+  applied_plan?: AtomizationChapter[];
+}): { plan: AtomizationChapter[]; origin: 'manual' | 'unavailable' } | null {
+  const plan = resolved.generation ? resolved.generation.plan : resolved.applied_plan;
+  if (!resolved.generation && resolved.applied_plan === undefined) return null;
+  if (!Array.isArray(plan) || plan.length === 0) {
+    throw new ChapterPlanningError('Persisted plan is unavailable; ownership reconciliation is required before planning');
+  }
+  return { plan, origin: resolved.generation ? 'unavailable' : 'manual' };
+}
+
 // Stage-6 review-reason code taxonomy (S4/S5). Kept in sync with CMS
 // models.StudioReviewCode* and deriveStudioReviewCodes; CMS re-derives when a
 // chapter arrives without codes, so this is the authoritative forward path.

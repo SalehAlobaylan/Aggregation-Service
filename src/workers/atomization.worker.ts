@@ -42,6 +42,7 @@ import {
   enforceFullCoverage,
   ChapterPlanningError,
   providerChapterPlan,
+  persistedChapterPlan,
   minFeedUnitSeconds,
   normalizeGeneratedChapters,
   shouldAtomizeParent,
@@ -213,10 +214,13 @@ export const createAtomizationWorker = () => createWorker({
         content_stage: stageClaim ? contentStageCorrelation(stageClaim) : undefined,
       };
       const resumed = await cmsClient.resolveAtomizationGeneration(generationInput, job.id, signal);
-      let chapters = resumed.generation?.plan ?? [];
-      if (!resumed.generation) {
+      const persisted = persistedChapterPlan(resumed);
+      let chapters = persisted?.plan ?? [];
+      let planOrigin: string = persisted?.origin ?? 'contextual';
+      if (!persisted) {
         const providerPlan = providerChapterPlan(input);
         if (providerPlan) {
+          planOrigin = 'provider';
           chapters = providerPlan;
           jobLogger.info("Using provider chapter boundaries", { contentItemId, chapterCount: chapters.length });
         } else {
@@ -240,8 +244,6 @@ export const createAtomizationWorker = () => createWorker({
           chapters = enforceFullCoverage(normalizeGeneratedChapters(generated, windows, input), input);
           jobLogger.info("Using contextual transcript chapter boundaries", { contentItemId, chapterCount: chapters.length });
         }
-      } else if (chapters.length === 0) {
-        throw new Error("Persisted generation has no recoverable plan; operator reconciliation required");
       }
       let planDigest = resumed.generation?.plan_digest ?? createHash("sha256")
         .update(JSON.stringify(chapters))
@@ -266,6 +268,7 @@ export const createAtomizationWorker = () => createWorker({
           plan_digest: planDigest,
           coverage_digest: coverageDigest,
           chapters,
+          plan_origin: planOrigin,
         },
         job.id,
         signal,
