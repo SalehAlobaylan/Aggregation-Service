@@ -10,6 +10,7 @@ import { join } from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { createHash } from 'crypto';
+import { podsResetDeleteResponse, validatePodsResetStorageBindings, type PodsResetObjectIdentity, type PodsResetStorageBinding } from '../../storage/pods-reset.js';
 import {
     getQueue,
     QUEUE_NAMES,
@@ -19,7 +20,7 @@ import {
     type NewsCirculationJob,
     type SourceGraphJob,
 } from '../../queues/index.js';
-import { deleteContentObjects, deleteContentObjectsExact, deleteObject, getStorageKey, objectExists, readObjectBuffer, readObjectDigest, recoveryArtifactEncryptionVerified, uploadEncryptedMigrationArtifact, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
+import { deleteContentObjects, deleteContentObjectsExact, deleteObject, deletePodsResetObjectsExact, inventoryPodsResetObjects, podsResetConfiguredStorageBindings, podsResetConfiguredTiers, podsResetStorageVersionModel, getStorageKey, objectExists, readObjectBuffer, readObjectDigest, recoveryArtifactEncryptionVerified, uploadEncryptedMigrationArtifact, uploadEncryptedRecoveryArtifact, uploadFile } from '../../storage/client.js';
 import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
@@ -299,6 +300,85 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		const job = await queue.add('recovery-reseed-' + lane, { trigger: 'manual', tenantId: body.tenant_id, recovery: { runId: body.run_id, manifestHash: body.manifest_hash, lane, sourceIds, lookbackHours, maxItems, preserveCheckpoints: true } } satisfies NewsCirculationJob, { priority: 1, jobId: body.idempotency_key });
 		return reply.send({ data: { queued: true, job_id: job.id ?? body.idempotency_key, lane, checkpoint_mode: 'preserve', lookback_hours: lookbackHours, max_items: maxItems, fencing_token: body.fencing_token } });
 		*/
+	});
+
+	fastify.post<{ Body: { tenant_id?: string; content_ids?: string[] } }>('/internal/pods-reset/inventory', async (request, reply) => {
+		const body = request.body ?? {};
+		const ids = Array.isArray(body.content_ids) ? body.content_ids.map(value => String(value)) : [];
+		if (!body.tenant_id || ids.length === 0 || ids.length > 30 || ids.some(id => !CANONICAL_UUID.test(id)) || new Set(ids).size !== ids.length) {
+			return reply.status(400).send({ message: 'a tenant and 1–30 unique canonical content IDs are required' });
+		}
+
+		try {
+			const configuredTiers = podsResetConfiguredTiers();
+			const versionModel = podsResetStorageVersionModel();
+			const items = [];
+			let objectCount = 0;
+			for (const id of ids) {
+				const item = await cmsClient.getContentItem(id);
+				if (item.tenant_id !== body.tenant_id) return reply.status(404).send({ message: 'content item is not available in the requested tenant' });
+				if (item.type !== 'VIDEO' && item.type !== 'PODCAST') return reply.status(409).send({ message: 'Pods reset inventory is limited to VIDEO and PODCAST items' });
+				const objects = await inventoryPodsResetObjects(id);
+				objectCount += objects.length;
+				if (objectCount > 1000) return reply.status(413).send({ message: 'Pods reset inventory exceeds the 1000-object bound' });
+				items.push({ content_item_id: id, objects });
+			}
+			return reply.send({ data: { complete: true, configured_tiers: configuredTiers, storage_bindings: podsResetConfiguredStorageBindings(), version_model: versionModel, items } });
+		} catch (error) {
+			logger.warn('Pods reset inventory failed closed', { error: error instanceof Error ? error.message : 'unknown' });
+			return reply.status(503).send({ message: 'complete Pods reset storage inventory is unavailable' });
+		}
+	});
+
+	fastify.post<{ Body: { run_id?: string; tenant_id?: string; content_item_id?: string; manifest_hash?: string; fencing_token?: string; execution_token?: string; storage_bindings?: Array<{ storage_tier?: string; bucket?: string; endpoint_fingerprint?: string }>; objects?: Array<{ storage_tier?: string; bucket?: string; object_key?: string; etag?: string; size_bytes?: number }> } }>('/internal/pods-reset/delete-media-item', async (request, reply) => {
+		const body = request.body ?? {};
+		const id = String(body.content_item_id ?? '');
+		const objects = Array.isArray(body.objects) ? body.objects : [];
+		const rawBindings = Array.isArray(body.storage_bindings) ? body.storage_bindings : [];
+		const storageBindings: PodsResetStorageBinding[] = rawBindings.map((binding) => ({
+			storage_tier: String(binding.storage_tier ?? '') as PodsResetStorageBinding['storage_tier'],
+			bucket: String(binding.bucket ?? ''),
+			endpoint_fingerprint: String(binding.endpoint_fingerprint ?? ''),
+		}));
+		if (!body.run_id || !CANONICAL_UUID.test(String(body.run_id)) || !body.tenant_id || !CANONICAL_UUID.test(id) || !body.manifest_hash || !body.fencing_token || !CANONICAL_UUID.test(String(body.fencing_token)) || !body.execution_token || !CANONICAL_UUID.test(String(body.execution_token)) || objects.length > 1000) {
+			return reply.status(400).send({ message: 'invalid bounded Pods reset object deletion request' });
+		}
+		if (!validatePodsResetStorageBindings(podsResetConfiguredTiers(), storageBindings)) {
+			return reply.status(400).send({ message: 'invalid frozen storage account and bucket bindings' });
+		}
+		const expected: PodsResetObjectIdentity[] = [];
+		const seen = new Set<string>();
+		for (const object of objects) {
+			const storage_tier = object.storage_tier;
+			const bucket = String(object.bucket ?? '');
+			const object_key = String(object.object_key ?? '');
+			const etag = String(object.etag ?? '').replace(/^\"|\"$/g, '');
+			const size_bytes = object.size_bytes;
+			if ((storage_tier !== 'primary' && storage_tier !== 'cold') || !bucket || !object_key.startsWith(`content/${id}/`) || !etag || !Number.isSafeInteger(size_bytes) || Number(size_bytes) < 0) {
+				return reply.status(400).send({ message: 'invalid exact object identity in Pods reset manifest' });
+			}
+			const identity = `${storage_tier}\n${bucket}\n${object_key}`;
+			if (seen.has(identity)) return reply.status(400).send({ message: 'duplicate object identity in Pods reset manifest' });
+			seen.add(identity);
+			expected.push({ storage_tier, bucket, object_key, etag, size_bytes: Number(size_bytes) });
+		}
+
+		try {
+			await cmsClient.authorizePodsResetObjectDeletion({
+				run_id: String(body.run_id), tenant_id: body.tenant_id, content_item_id: id,
+				manifest_hash: String(body.manifest_hash), fencing_token: String(body.fencing_token),
+				execution_token: String(body.execution_token), storage_bindings: storageBindings, objects: expected,
+			});
+			const item = await cmsClient.getContentItem(id);
+			if (item.tenant_id !== body.tenant_id || item.status !== 'ARCHIVED' || item.feed_visibility !== 'hidden') {
+				return reply.status(409).send({ message: 'CMS retirement state is not established for this item' });
+			}
+			const result = await deletePodsResetObjectsExact(id, expected, storageBindings);
+			return reply.send(podsResetDeleteResponse(id, String(body.fencing_token), result));
+		} catch (error) {
+			logger.warn('Pods reset exact object deletion failed closed', { contentItemId: id, error: error instanceof Error ? error.message : 'unknown' });
+			return reply.status(409).send({ message: 'Pods reset object deletion was not proven safe or complete' });
+		}
 	});
 
 	fastify.post<{ Body: { run_id?: string; tenant_id?: string; content_ids?: string[]; saga_items?: Array<{ id?: string; provider_objects?: string[]; no_full_rollback?: boolean }>; manifest_hash?: string; idempotency_key?: string; item_idempotency_keys?: Record<string, string>; fencing_token?: string } }>('/internal/recovery/purge-media', async (request, reply) => {

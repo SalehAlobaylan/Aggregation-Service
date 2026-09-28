@@ -19,6 +19,8 @@ export interface ManifestUploadInput {
   transcriptionGenerationId?: string;
   transcriptionSegmentUnitId?: string;
   attemptId?: string;
+  /** Stable idempotency identity for retries of immutable producer work. */
+  producerEventId?: string;
   artifactRole:
     | "source"
     | "analysis_audio"
@@ -149,7 +151,7 @@ export async function uploadFileWithManifest(
   const digest = await digestFile(input.filePath, signal);
   signal?.throwIfAborted();
   const bytes = digest.bytes;
-  const producerEventId = uuidv4();
+  const producerEventId = input.producerEventId ?? uuidv4();
   const manifest = await cmsClient.createArtifactManifest(
     {
       tenant_id: input.tenantId ?? "default",

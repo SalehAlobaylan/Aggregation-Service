@@ -44,7 +44,7 @@ export const createQualityWorker = () => createWorker({
                 key: data.keyToDelete,
                 tier: data.tier,
             });
-            await deleteOldVersion(data.keyToDelete, data.tier);
+            await deleteOldVersion(data.contentItemId, data.tenantId, data.keyToDelete, data.tier);
             return;
         }
 
@@ -91,6 +91,7 @@ export const createQualityWorker = () => createWorker({
             if (queue) {
                 const cleanup: QualityCleanupJob = {
                     contentItemId: data.contentItemId,
+                    tenantId: data.tenantId,
                     keyToDelete: result.oldKey,
                     tier: result.tier,
                 };

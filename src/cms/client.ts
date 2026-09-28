@@ -1862,6 +1862,35 @@ export const cmsClient = {
     );
   },
 
+  /** Ask CMS to fence and authorize one exact reset object batch. */
+  async authorizePodsResetObjectDeletion(data: {
+    run_id: string;
+    tenant_id: string;
+    content_item_id: string;
+    manifest_hash: string;
+    fencing_token: string;
+    execution_token: string;
+    storage_bindings: Array<{
+      storage_tier: "primary" | "cold";
+      bucket: string;
+      endpoint_fingerprint: string;
+    }>;
+    objects: Array<{
+      storage_tier: "primary" | "cold";
+      bucket: string;
+      object_key: string;
+      etag: string;
+      size_bytes: number;
+    }>;
+  }, requestId?: string): Promise<{ authorized: boolean }> {
+    return makeProtectedRequest<{ authorized: boolean }>(
+      "POST",
+      "/pods-reset/authorize-object-deletion",
+      data,
+      requestId,
+    );
+  },
+
   async getAtomizationInput(
     id: string,
     requestId?: string,
@@ -2001,7 +2030,7 @@ export const cmsClient = {
     );
   },
   async listArtifactManifests(
-    params: { state?: string; stale?: boolean; atomization?: boolean; tenant_id?: string } = {},
+    params: { state?: string; stale?: boolean; atomization?: boolean; tenant_id?: string; object_key?: string; bucket?: string; storage_tier?: string } = {},
     requestId?: string,
     parentSignal?: AbortSignal,
   ): Promise<{ manifests: ArtifactManifest[] }> {
@@ -2010,6 +2039,9 @@ export const cmsClient = {
     if (params.stale) query.set("stale", "true");
     if (params.atomization) query.set("atomization", "true");
     if (params.tenant_id) query.set("tenant_id", params.tenant_id);
+    if (params.object_key) query.set("object_key", params.object_key);
+    if (params.bucket) query.set("bucket", params.bucket);
+    if (params.storage_tier) query.set("storage_tier", params.storage_tier);
     const suffix = query.size > 0 ? `?${query.toString()}` : "";
     return makeProtectedRequest<{ manifests: ArtifactManifest[] }>(
       "GET",

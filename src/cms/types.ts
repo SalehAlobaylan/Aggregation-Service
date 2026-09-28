@@ -332,6 +332,7 @@ export interface ArtifactManifest {
   transcription_segment_unit_id?: string | null;
   attempt_id?: string | null;
   producer_event_id: string;
+  creator_role?: string;
   fence_token?: string | null;
   artifact_role: string;
   storage_tier: string;
@@ -717,6 +718,9 @@ export interface UpdateContentItemQualityRequest {
   old_size_bytes?: number;
   old_storage_key?: string;
   new_storage_key?: string;
+  new_manifest_id?: string;
+  new_producer_event_id?: string;
+  new_fence_token?: string;
   event_reason?: string;
 }
 

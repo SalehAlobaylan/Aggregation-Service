@@ -331,6 +331,7 @@ export interface QualityReencodeJob {
  */
 export interface QualityCleanupJob {
   contentItemId: string;
+  tenantId: string;
   keyToDelete: string;
   tier: "primary" | "cold";
 }

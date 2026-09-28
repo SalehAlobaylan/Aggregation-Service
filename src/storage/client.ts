@@ -17,12 +17,24 @@ import {
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { Agent as HttpAgent } from "node:http";
 import { Agent as HttpsAgent } from "node:https";
+import { createHash } from "node:crypto";
 import { createReadStream } from "fs";
 import { stat } from "fs/promises";
 import { lookup } from "mime-types";
 import { config } from "../config/index.js";
 import { logger } from "../observability/logger.js";
 import { attachOpCounter } from "./op-counter.js";
+import {
+  comparePodsResetInventory,
+  MAX_PODS_RESET_OBJECTS,
+  requireSupportedPodsResetVersionModel,
+  type PodsResetInventoryRow,
+  type PodsResetObjectIdentity,
+  type PodsResetStorageBinding,
+  type PodsResetTier,
+  samePodsResetStorageBindings,
+  validatePodsResetStorageBindings,
+} from "./pods-reset.js";
 
 // -----------------------------------------------------------------------------
 // Two-tier storage: primary (hot) is the bucket every upload lands in. cold is
@@ -73,10 +85,14 @@ const s3Client = primaryClient;
  * subsequent renditions in the same atomization attempt.
  */
 function createUploadClient(tier: StorageTier): S3Client {
-  const endpoint = tier === "cold" ? config.coldStorageEndpoint : config.storageEndpoint;
-  const region = tier === "cold" ? config.coldStorageRegion : config.storageRegion;
-  const accessKeyId = tier === "cold" ? config.coldStorageAccessKey : config.storageAccessKey;
-  const secretAccessKey = tier === "cold" ? config.coldStorageSecretKey : config.storageSecretKey;
+  const endpoint =
+    tier === "cold" ? config.coldStorageEndpoint : config.storageEndpoint;
+  const region =
+    tier === "cold" ? config.coldStorageRegion : config.storageRegion;
+  const accessKeyId =
+    tier === "cold" ? config.coldStorageAccessKey : config.storageAccessKey;
+  const secretAccessKey =
+    tier === "cold" ? config.coldStorageSecretKey : config.storageSecretKey;
   if (!endpoint || !accessKeyId || !secretAccessKey) {
     throw new Error(`${tier} storage tier is not configured`);
   }
@@ -654,6 +670,237 @@ export async function listContentObjects(
   return out;
 }
 
+/** Complete exact-key inventory for an item in every configured storage tier. */
+export async function inventoryPodsResetObjects(
+  contentItemId: string,
+): Promise<PodsResetInventoryRow[]> {
+  if (!/^[0-9a-f-]{36}$/i.test(contentItemId))
+    throw new Error("invalid content item identity");
+  const bindings = podsResetConfiguredStorageBindings();
+  const tiers = bindings.map((binding) => binding.storage_tier);
+  const result: PodsResetInventoryRow[] = [];
+  for (const storage_tier of tiers) {
+    const { bucket } = bindingFor(storage_tier);
+    const prefix = `content/${contentItemId}/`;
+    for await (const page of listAllObjects(prefix, storage_tier)) {
+      for (const object of page) {
+        const object_key = String(object.Key ?? "");
+        if (!object_key.startsWith(prefix))
+          throw new Error(
+            "provider returned an object outside the content prefix",
+          );
+        const etag = String(object.ETag ?? "").replace(/^\"|\"$/g, "");
+        if (!etag) throw new Error(`object has no stable ETag: ${object_key}`);
+        if (!Number.isSafeInteger(object.Size) || Number(object.Size) < 0)
+          throw new Error(`object has no stable size: ${object_key}`);
+        result.push({
+          content_item_id: contentItemId,
+          storage_tier,
+          bucket,
+          object_key,
+          etag,
+          size_bytes: Number(object.Size),
+        });
+        if (result.length > MAX_PODS_RESET_OBJECTS)
+          throw new Error(
+            `Pods reset inventory exceeds ${MAX_PODS_RESET_OBJECTS} objects`,
+          );
+      }
+    }
+  }
+  return result.sort((a, b) =>
+    `${a.storage_tier}\n${a.bucket}\n${a.object_key}`.localeCompare(
+      `${b.storage_tier}\n${b.bucket}\n${b.object_key}`,
+    ),
+  );
+}
+
+export function podsResetConfiguredTiers(): PodsResetTier[] {
+  const anyColdSettings = Boolean(
+    config.coldStorageEndpoint ||
+    config.coldStorageBucket ||
+    config.coldStorageAccessKey ||
+    config.coldStorageSecretKey,
+  );
+  if (config.coldStorageEnabled && !isColdTierConfigured())
+    throw new Error(
+      "cold storage is enabled but its inventory credentials are incomplete",
+    );
+  if (!config.coldStorageEnabled && anyColdSettings)
+    throw new Error(
+      "cold storage settings are present but disabled; reset cannot prove a complete tier inventory",
+    );
+  return isColdTierConfigured() ? ["primary", "cold"] : ["primary"];
+}
+
+/**
+ * Frozen reset inventory binds every configured tier, including empty ones,
+ * to its bucket and non-secret provider endpoint identity. Credential rotation
+ * does not change the physical storage identity; changing R2 account/endpoint
+ * or bucket does.
+ */
+export function podsResetConfiguredStorageBindings(): PodsResetStorageBinding[] {
+  const tiers = podsResetConfiguredTiers();
+  return tiers
+    .map((storage_tier) => {
+      const endpoint =
+        storage_tier === "cold"
+          ? config.coldStorageEndpoint
+          : config.storageEndpoint;
+      if (!endpoint) throw new Error(`${storage_tier} storage endpoint is missing`);
+      const parsed = new URL(endpoint);
+      const endpointIdentity = `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, "")}`;
+      return {
+        storage_tier,
+        bucket: bindingFor(storage_tier).bucket,
+        endpoint_fingerprint: createHash("sha256")
+          .update(endpointIdentity)
+          .digest("hex"),
+      };
+    })
+    .sort((left, right) => left.storage_tier.localeCompare(right.storage_tier));
+}
+
+/**
+ * Pods reset recognizes only Cloudflare R2's current-key delete model. R2 may
+ * expose a UUID for an upload through other interfaces, but this S3 adapter
+ * cannot address that upload UUID as a delete precondition. Other providers
+ * are rejected until their exact inventory/delete semantics are qualified.
+ */
+export function podsResetStorageVersionModel(): string {
+  podsResetConfiguredTiers();
+  const endpoints = [config.storageEndpoint];
+  if (isColdTierConfigured()) endpoints.push(config.coldStorageEndpoint!);
+  return requireSupportedPodsResetVersionModel(endpoints);
+}
+
+/**
+ * Delete only frozen Pods reset identities. Provider listing is repeated just
+ * before deletion, unknown keys and changed objects block the operation, and
+ * readback must prove the full item prefix is empty in every configured tier.
+ */
+export async function deletePodsResetObjectsExact(
+  contentItemId: string,
+  expected: PodsResetObjectIdentity[],
+  expectedBindings: PodsResetStorageBinding[],
+): Promise<{
+  storageBindings: PodsResetStorageBinding[];
+  deletedCount: number;
+  freedBytes: number;
+  objectsAbsent: boolean;
+  deletedObjects: PodsResetObjectIdentity[];
+  alreadyAbsentObjects: PodsResetObjectIdentity[];
+}> {
+  podsResetStorageVersionModel();
+  const configuredBindings = podsResetConfiguredStorageBindings();
+  if (
+    !validatePodsResetStorageBindings(
+      configuredBindings.map((binding) => binding.storage_tier),
+      expectedBindings,
+    ) ||
+    !samePodsResetStorageBindings(expectedBindings, configuredBindings)
+  ) {
+    throw new Error("storage account or bucket binding changed after approval");
+  }
+  const current = await inventoryPodsResetObjects(contentItemId);
+  if (
+    !samePodsResetStorageBindings(
+      expectedBindings,
+      podsResetConfiguredStorageBindings(),
+    )
+  ) {
+    throw new Error("storage account or bucket binding changed during inventory");
+  }
+  const diff = comparePodsResetInventory(expected, current);
+  if (diff.changed.length || diff.unlisted.length) {
+    throw new Error("Pods reset object inventory changed after approval");
+  }
+
+  let deletedCount = 0;
+  let freedBytes = 0;
+  const deletedObjects: PodsResetObjectIdentity[] = [];
+  const primary = bindingFor("primary");
+  const cold = configuredBindings.some((binding) => binding.storage_tier === "cold")
+    ? bindingFor("cold")
+    : undefined;
+  const identitiesByTierAndKey = new Map<string, PodsResetObjectIdentity>();
+  for (const object of expected) {
+    identitiesByTierAndKey.set(
+      `${object.storage_tier}\n${object.bucket}\n${object.object_key}`,
+      object,
+    );
+  }
+  // The provider has no cross-request compare-and-delete transaction. Re-HEAD
+  // the immutable manifest identity immediately before deletion and block if
+  // a writer replaced it after listing.
+  for (let i = 0; i < diff.deletable.length; i += 16) {
+    await Promise.all(
+      diff.deletable.slice(i, i + 16).map(async (object) => {
+        const resolved = object.storage_tier === "primary" ? primary : cold;
+        if (!resolved)
+          throw new Error(
+            "approved cold object has no configured cold storage tier",
+          );
+        if (resolved.bucket !== object.bucket)
+          throw new Error("storage bucket binding changed after approval");
+        const head = await resolved.client.send(
+          new HeadObjectCommand({
+            Bucket: resolved.bucket,
+            Key: object.object_key,
+          }),
+        );
+        const etag = String(head.ETag ?? "").replace(/^\"|\"$/g, "");
+        if (
+          etag !== object.etag ||
+          Number(head.ContentLength ?? 0) !== object.size_bytes
+        )
+          throw new Error(
+            `object fingerprint changed before delete: ${object.object_key}`,
+          );
+      }),
+    );
+  }
+  for (const tier of ["primary", "cold"] as const) {
+    const keys = diff.deletable
+      .filter((object) => object.storage_tier === tier)
+      .map((object) => object.object_key);
+    if (keys.length === 0) continue;
+    const result = await deleteObjectsByKeys(keys, tier);
+    if (result.errors.length) throw new Error(result.errors.join("; "));
+    deletedCount += result.deletedCount;
+    freedBytes += result.freedBytes;
+    for (const key of result.deletedKeys) {
+      const identity = identitiesByTierAndKey.get(
+        `${tier}\n${bindingFor(tier).bucket}\n${key}`,
+      );
+      if (!identity)
+        throw new Error(
+          "provider reported deletion outside the approved manifest",
+        );
+      deletedObjects.push(identity);
+    }
+  }
+
+  const remaining = await inventoryPodsResetObjects(contentItemId);
+  const finalBindings = podsResetConfiguredStorageBindings();
+  if (!samePodsResetStorageBindings(expectedBindings, finalBindings)) {
+    throw new Error("storage account or bucket binding changed before absence readback");
+  }
+  const objectsAbsent = remaining.length === 0;
+  if (!objectsAbsent)
+    throw new Error(
+      "Pods reset provider readback found remaining item objects",
+    );
+  return {
+    storageBindings: finalBindings,
+    deletedCount,
+    freedBytes,
+    objectsAbsent,
+    deletedObjects,
+    alreadyAbsentObjects: diff.missing,
+  };
+}
+
 /**
  * Delete a single object. Returns the freed bytes (best-effort via HEAD).
  */
@@ -686,29 +933,33 @@ export async function deleteObjectsByKeys(
   deletedCount: number;
   freedBytes: number;
   errors: string[];
+  deletedKeys: string[];
 }> {
   if (keys.length === 0) {
-    return { deletedCount: 0, freedBytes: 0, errors: [] };
+    return { deletedCount: 0, freedBytes: 0, errors: [], deletedKeys: [] };
   }
 
   const { client, bucket } = bindingFor(tier);
   let deletedCount = 0;
   let freedBytes = 0;
   const errors: string[] = [];
+  const deletedKeys: string[] = [];
 
   const sizeMap = new Map<string, number>();
-  await Promise.all(
-    keys.map(async (key) => {
-      try {
-        const head = await client.send(
-          new HeadObjectCommand({ Bucket: bucket, Key: key }),
-        );
-        sizeMap.set(key, head.ContentLength ?? 0);
-      } catch {
-        // ignore — object may not exist
-      }
-    }),
-  );
+  for (let i = 0; i < keys.length; i += 16) {
+    await Promise.all(
+      keys.slice(i, i + 16).map(async (key) => {
+        try {
+          const head = await client.send(
+            new HeadObjectCommand({ Bucket: bucket, Key: key }),
+          );
+          sizeMap.set(key, head.ContentLength ?? 0);
+        } catch {
+          // ignore — object may not exist
+        }
+      }),
+    );
+  }
 
   for (let i = 0; i < keys.length; i += 1000) {
     const batch = keys.slice(i, i + 1000);
@@ -724,6 +975,7 @@ export async function deleteObjectsByKeys(
         if (deleted.Key) {
           deletedCount += 1;
           freedBytes += sizeMap.get(deleted.Key) ?? 0;
+          deletedKeys.push(deleted.Key);
         }
       }
       for (const err of resp.Errors ?? []) {
@@ -734,7 +986,7 @@ export async function deleteObjectsByKeys(
     }
   }
 
-  return { deletedCount, freedBytes, errors };
+  return { deletedCount, freedBytes, errors, deletedKeys };
 }
 
 /**
@@ -963,6 +1215,8 @@ export const storageClient = {
   uploadStream,
   listAllObjects,
   listContentObjects,
+  inventoryPodsResetObjects,
+  podsResetConfiguredTiers,
   computeStorageUsage,
   deleteObject,
   deleteObjectsByKeys,

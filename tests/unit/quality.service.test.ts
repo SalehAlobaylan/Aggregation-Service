@@ -10,10 +10,21 @@
  *   - DEFAULT_ENCODE_PROFILE: matches the historical hard-coded recipe
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { createHash } from 'node:crypto';
 
 const cmsMocks = vi.hoisted(() => ({
     getContentItem: vi.fn(),
     recordStorageArtifactEvent: vi.fn(),
+    listArtifactManifests: vi.fn(),
+    getArtifactManifest: vi.fn(),
+    transitionArtifactManifest: vi.fn(),
+}));
+const manifestMocks = vi.hoisted(() => ({
+    uploadFileWithManifest: vi.fn(),
+}));
+const storageMocks = vi.hoisted(() => ({
+    deleteObjectsByKeys: vi.fn(),
+    objectExists: vi.fn(),
 }));
 
 // Mock the config import so keyFromUrl has stable prefixes regardless of env.
@@ -48,7 +59,21 @@ vi.mock('../../src/cms/client.js', () => ({
     cmsClient: {
         getContentItem: cmsMocks.getContentItem,
         recordStorageArtifactEvent: cmsMocks.recordStorageArtifactEvent,
+        listArtifactManifests: cmsMocks.listArtifactManifests,
+        getArtifactManifest: cmsMocks.getArtifactManifest,
+        transitionArtifactManifest: cmsMocks.transitionArtifactManifest,
     },
+}));
+vi.mock('../../src/storage/client.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../../src/storage/client.js')>();
+    return {
+        ...actual,
+        deleteObjectsByKeys: storageMocks.deleteObjectsByKeys,
+        objectExists: storageMocks.objectExists,
+    };
+});
+vi.mock('../../src/storage/manifest.js', () => ({
+    uploadFileWithManifest: manifestMocks.uploadFileWithManifest,
 }));
 
 // We import after the mock so the module sees our fake config.
@@ -58,6 +83,8 @@ import {
     versionedKey,
     keyFromUrl,
     sourceKeyCandidates,
+    qualityReencodeManifestInput,
+    deleteOldVersion,
 } from '../../src/services/quality.service.js';
 import {
     buildEncodeOptions,
@@ -121,6 +148,76 @@ describe('versionedKey', () => {
         expect(versionedKey(id, 2)).toBe(`content/${id}/processed.v2.mp4`);
         expect(versionedKey(id, 3)).toBe(`content/${id}/processed.v3.mp4`);
         expect(versionedKey(id, 7)).toBe(`content/${id}/processed.v7.mp4`);
+    });
+});
+
+describe('quality re-encode artifact reservation', () => {
+    it('binds the CMS artifact reservation to the exact item, source version and profile', () => {
+        const input = qualityReencodeManifestInput({
+            tenantId: 'tenant-a',
+            contentItemId: '11111111-2222-3333-4444-555555555555',
+            sourceKey: 'content/item/processed.v4.mp4',
+            mediaVersion: 4,
+            targetProfileId: 7,
+            tier: 'primary',
+            key: 'content/item/processed.v5.mp4',
+            filePath: '/tmp/result.mp4',
+        });
+        const expectedDigest = createHash('sha256').update(JSON.stringify({
+            tenant_id: 'tenant-a',
+            content_item_id: '11111111-2222-3333-4444-555555555555',
+            source_key: 'content/item/processed.v4.mp4',
+            media_version: 4,
+            target_profile_id: 7,
+            storage_tier: 'primary',
+            object_key: 'content/item/processed.v5.mp4',
+        })).digest('hex');
+
+        expect(input).toEqual(expect.objectContaining({
+            tenantId: 'tenant-a',
+            contentItemId: '11111111-2222-3333-4444-555555555555',
+            artifactRole: 'playback_mp4',
+            key: 'content/item/processed.v5.mp4',
+            filePath: '/tmp/result.mp4',
+            contentType: 'video/mp4',
+            tier: 'primary',
+            inputDigest: expectedDigest,
+            producerEventId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+            fenceToken: expect.stringMatching(/^[0-9a-f-]{36}$/),
+            creatorRole: 'aggregation_quality_worker',
+        }));
+        const retry = qualityReencodeManifestInput({
+            tenantId: 'tenant-a',
+            contentItemId: '11111111-2222-3333-4444-555555555555',
+            sourceKey: 'content/item/processed.v4.mp4',
+            mediaVersion: 4,
+            targetProfileId: 7,
+            tier: 'primary',
+            key: 'content/item/processed.v5.mp4',
+            filePath: '/tmp/result.mp4',
+        });
+        expect(retry.producerEventId).toBe(input.producerEventId);
+        expect(retry.fenceToken).toBe(input.fenceToken);
+        expect(qualityReencodeManifestInput({
+            tenantId: 'tenant-b',
+            contentItemId: '11111111-2222-3333-4444-555555555555',
+            sourceKey: 'content/item/processed.v4.mp4',
+            mediaVersion: 4,
+            targetProfileId: 7,
+            tier: 'primary',
+            key: 'content/item/processed.v5.mp4',
+            filePath: '/tmp/result.mp4',
+        }).producerEventId).not.toBe(input.producerEventId);
+        expect(qualityReencodeManifestInput({
+            tenantId: 'tenant-a',
+            contentItemId: '11111111-2222-3333-4444-555555555555',
+            sourceKey: 'content/item/processed.v4.mp4',
+            mediaVersion: 4,
+            targetProfileId: 7,
+            tier: 'cold',
+            key: 'content/item/processed.v5.mp4',
+            filePath: '/tmp/result.mp4',
+        }).producerEventId).not.toBe(input.producerEventId);
     });
 });
 
@@ -197,6 +294,111 @@ describe('reencodeOneItem terminal lifecycle guards', () => {
             storage_state_reason: 'quality_reencode_source_object_missing',
             storage_recovery_status: 'at_risk',
         }));
+    });
+});
+
+describe('quality old-version cleanup lifecycle', () => {
+    const contentItemId = '11111111-2222-3333-4444-555555555555';
+    const oldKey = `content/${contentItemId}/processed.v4.mp4`;
+    const currentKey = `content/${contentItemId}/processed.v5.mp4`;
+    const manifest = {
+        id: '22222222-3333-4444-5555-666666666666',
+        tenant_id: 'tenant-a',
+        content_item_id: contentItemId,
+        producer_event_id: '33333333-4444-5555-6666-777777777777',
+        creator_role: 'aggregation_quality_worker',
+        fence_token: '44444444-5555-6666-7777-888888888888',
+        artifact_role: 'playback_mp4',
+        storage_tier: 'primary',
+        bucket: 'wahb-media',
+        object_key: oldKey,
+        state: 'verified',
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        cmsMocks.getContentItem.mockResolvedValue({
+            id: contentItemId,
+            tenant_id: 'tenant-a',
+            media_url: `http://primary.example.com/wahb-media/${currentKey}`,
+        });
+        cmsMocks.listArtifactManifests.mockResolvedValue({ manifests: [{ id: manifest.id }] });
+        cmsMocks.getArtifactManifest.mockResolvedValue(manifest);
+        cmsMocks.transitionArtifactManifest.mockImplementation(async (_id: string, state: string) => ({ ...manifest, state }));
+        storageMocks.deleteObjectsByKeys.mockResolvedValue({ errors: [] });
+        storageMocks.objectExists.mockResolvedValue(false);
+    });
+
+    it('marks an old quality manifest cleanup-eligible, deletes exact bytes, verifies absence, then marks deleted', async () => {
+        await deleteOldVersion(contentItemId, 'tenant-a', oldKey, 'primary');
+
+        expect(cmsMocks.listArtifactManifests).toHaveBeenCalledWith({
+            tenant_id: 'tenant-a', object_key: oldKey, bucket: 'wahb-media', storage_tier: 'primary',
+        });
+        expect(cmsMocks.transitionArtifactManifest.mock.calls.map((call) => call[1])).toEqual(['cleanup_eligible', 'deleted']);
+        expect(storageMocks.deleteObjectsByKeys).toHaveBeenCalledWith([oldKey], 'primary');
+        expect(storageMocks.objectExists).toHaveBeenCalledWith(oldKey, 'primary');
+        expect(cmsMocks.transitionArtifactManifest.mock.calls[0][2]).toEqual(expect.objectContaining({
+            producer_event_id: manifest.producer_event_id,
+            fence_token: manifest.fence_token,
+            terminal_proof: expect.objectContaining({ quality_version_superseded: true, current_media_key: currentKey }),
+        }));
+        expect(cmsMocks.transitionArtifactManifest.mock.calls[1][2]).toEqual(expect.objectContaining({
+            producer_event_id: manifest.producer_event_id,
+            fence_token: manifest.fence_token,
+            terminal_proof: { provider_head_verified: true, object_present: false, quality_cleanup: true },
+        }));
+    });
+
+    it('resumes a cleanup-eligible manifest after deletion without repeating the eligibility transition', async () => {
+        cmsMocks.getArtifactManifest.mockResolvedValue({ ...manifest, state: 'cleanup_eligible' });
+
+        await deleteOldVersion(contentItemId, 'tenant-a', oldKey, 'primary');
+
+        expect(cmsMocks.transitionArtifactManifest.mock.calls.map((call) => call[1])).toEqual(['deleted']);
+        expect(storageMocks.deleteObjectsByKeys).toHaveBeenCalledWith([oldKey], 'primary');
+    });
+
+    it('treats a deleted manifest as idempotent only when provider absence is confirmed', async () => {
+        cmsMocks.getArtifactManifest.mockResolvedValue({ ...manifest, state: 'deleted' });
+
+        await deleteOldVersion(contentItemId, 'tenant-a', oldKey, 'primary');
+
+        expect(storageMocks.objectExists).toHaveBeenCalledWith(oldKey, 'primary');
+        expect(storageMocks.deleteObjectsByKeys).not.toHaveBeenCalled();
+        expect(cmsMocks.transitionArtifactManifest).not.toHaveBeenCalled();
+    });
+
+    it('refuses malformed keys and the current media pointer before touching storage', async () => {
+        await expect(deleteOldVersion(contentItemId, 'tenant-a', `content/${contentItemId}/other.mp4`, 'primary'))
+            .rejects.toThrow('exact tenant-owned content key');
+        cmsMocks.getContentItem.mockResolvedValue({
+            id: contentItemId,
+            tenant_id: 'tenant-a',
+            media_url: `http://primary.example.com/wahb-media/${oldKey}`,
+        });
+        await expect(deleteOldVersion(contentItemId, 'tenant-a', oldKey, 'primary'))
+            .rejects.toThrow('not the current media pointer');
+        expect(storageMocks.deleteObjectsByKeys).not.toHaveBeenCalled();
+    });
+
+    it('keeps the manifest cleanup-eligible when provider absence is not proven', async () => {
+        storageMocks.objectExists.mockResolvedValue(true);
+
+        await expect(deleteOldVersion(contentItemId, 'tenant-a', oldKey, 'primary'))
+            .rejects.toThrow('provider readback still finds');
+
+        expect(cmsMocks.transitionArtifactManifest.mock.calls.map((call) => call[1])).toEqual(['cleanup_eligible']);
+        expect(storageMocks.deleteObjectsByKeys).toHaveBeenCalledWith([oldKey], 'primary');
+    });
+
+    it('does not delete when the CMS manifest belongs to another tenant or item', async () => {
+        cmsMocks.getArtifactManifest.mockResolvedValue({ ...manifest, content_item_id: '99999999-2222-3333-4444-555555555555' });
+
+        await expect(deleteOldVersion(contentItemId, 'tenant-a', oldKey, 'primary'))
+            .rejects.toThrow('does not prove exact item ownership');
+
+        expect(storageMocks.deleteObjectsByKeys).not.toHaveBeenCalled();
     });
 });
 

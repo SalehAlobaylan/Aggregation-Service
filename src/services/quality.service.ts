@@ -6,6 +6,7 @@
  * so the same code path can be exercised by manual one-shot HTTP calls during
  * dev / debugging.
  */
+import { createHash } from 'node:crypto';
 import { join } from 'path';
 import { mkdir, stat } from 'fs/promises';
 import { config } from '../config/index.js';
@@ -21,7 +22,7 @@ import {
     objectExists,
     type StorageTier,
 } from '../storage/client.js';
-import { uploadFile } from '../storage/client.js';
+import { uploadFileWithManifest } from '../storage/manifest.js';
 import {
     SAFE_FALLBACK_ENCODE_PROFILE,
     type EncodeProfile,
@@ -548,13 +549,22 @@ export async function reencodeOneItem(args: {
         const outInfo = await getMediaInfo(tempOut, { signal }).catch(() => null);
         if (outInfo?.bitrateKbps) result.newBitrateKbps = outInfo.bitrateKbps;
 
-        // 5. Upload to the next versioned key on the same tier. Versioning
-        // avoids CDN cache poisoning and lets us delete the prior key after a
-        // grace window. The version counter is read from the DB (media_version)
-        // — no in-memory cache, so concurrent workers and restarts are safe.
+        // 5. Upload to the next application-versioned key on the same tier.
+        // Reserve the exact artifact with CMS before touching R2 so a Pods
+        // retirement fence can serialize this maintenance writer.
         const newVersion = item.media_version + 1;
         const newKey = versionedKey(contentItemId, newVersion);
-        await uploadFile(newKey, tempOut, 'video/mp4', tier, signal);
+        const manifestInput = qualityReencodeManifestInput({
+            tenantId: item.tenant_id,
+            contentItemId,
+            sourceKey,
+            mediaVersion: item.media_version,
+            targetProfileId: profile.id,
+            tier,
+            key: newKey,
+            filePath: tempOut,
+        });
+        const manifestReceipt = await uploadFileWithManifest(manifestInput, signal);
         result.newKey = newKey;
         result.oldKey = sourceKey;
 
@@ -571,6 +581,9 @@ export async function reencodeOneItem(args: {
             old_size_bytes: result.originalSizeBytes || item.file_size_bytes,
             old_storage_key: sourceKey,
             new_storage_key: newKey,
+            new_manifest_id: manifestReceipt.manifestId,
+            new_producer_event_id: manifestInput.producerEventId,
+            new_fence_token: manifestInput.fenceToken,
             event_reason: contentRole ? `storage_quality_reencode:${contentRole}` : 'storage_quality_reencode',
         });
         result.mediaUrl = newUrl;
@@ -628,16 +641,120 @@ export function versionedKey(contentItemId: string, version: number): string {
     return `content/${contentItemId}/processed.v${version}.mp4`;
 }
 
+function stableQualityManifestUUID(kind: string, digest: string): string {
+    const bytes = createHash('sha256')
+        .update(`wahb:quality-manifest:${kind}:${digest}`)
+        .digest()
+        .subarray(0, 16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const value = bytes.toString('hex');
+    return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+export function qualityReencodeManifestInput(args: {
+    tenantId: string;
+    contentItemId: string;
+    sourceKey: string;
+    mediaVersion: number;
+    targetProfileId: number;
+    tier: StorageTier;
+    key: string;
+    filePath: string;
+}) {
+    const inputDigest = createHash('sha256').update(JSON.stringify({
+        tenant_id: args.tenantId,
+        content_item_id: args.contentItemId,
+        source_key: args.sourceKey,
+        media_version: args.mediaVersion,
+        target_profile_id: args.targetProfileId,
+        storage_tier: args.tier,
+        object_key: args.key,
+    })).digest('hex');
+    return {
+        tenantId: args.tenantId,
+        contentItemId: args.contentItemId,
+        artifactRole: 'playback_mp4' as const,
+        key: args.key,
+        filePath: args.filePath,
+        contentType: 'video/mp4',
+        tier: args.tier,
+        inputDigest,
+        producerEventId: stableQualityManifestUUID('producer', inputDigest),
+        fenceToken: stableQualityManifestUUID('fence', inputDigest),
+        creatorRole: 'aggregation_quality_worker',
+    };
+}
+
 /**
  * Delete a key on the given tier. Used by the cleanup queue after the grace
  * period to drop the pre-re-encode artifact. The tier MUST match the tier the
  * new versioned key was written to — otherwise we risk deleting an unrelated
  * object on the wrong bucket (or no-op'ing when we should clean up cold).
  */
-export async function deleteOldVersion(key: string, tier: StorageTier): Promise<void> {
-    const r = await deleteObjectsByKeys([key], tier);
-    if (r.errors.length > 0) {
-        logger.warn('Quality cleanup: delete had errors', { errors: r.errors });
+export async function deleteOldVersion(contentItemId: string, tenantId: string, key: string, tier: StorageTier): Promise<void> {
+    const canonicalId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const canonicalObject = new RegExp(`^content/${contentItemId}/processed(?:\\.v(?:[2-9]|[1-9][0-9]+))?\\.mp4$`);
+    if (!canonicalId.test(contentItemId) || !tenantId.trim() || !canonicalObject.test(key)) {
+        throw new Error('Quality cleanup requires an exact tenant-owned content key');
+    }
+    const item = await cmsClient.getContentItem(contentItemId);
+    if (item.tenant_id !== tenantId) throw new Error('Quality cleanup tenant does not own the content item');
+    const bucket = tier === 'cold' ? (config.coldStorageBucket ?? config.storageBucket) : config.storageBucket;
+    const { manifests } = await cmsClient.listArtifactManifests({
+        tenant_id: tenantId,
+        object_key: key,
+        bucket,
+        storage_tier: tier,
+    });
+    if (manifests.length > 1) throw new Error('Quality cleanup key has multiple manifest owners');
+    const listedManifest = manifests[0];
+    const manifest = listedManifest
+        ? await cmsClient.getArtifactManifest(listedManifest.id, undefined, undefined, true)
+        : undefined;
+    if (manifest && (
+        manifest.tenant_id !== tenantId ||
+        manifest.content_item_id !== contentItemId ||
+        manifest.object_key !== key ||
+        manifest.bucket !== bucket ||
+        manifest.storage_tier !== tier ||
+        manifest.creator_role !== 'aggregation_quality_worker' ||
+        manifest.artifact_role !== 'playback_mp4'
+    )) {
+        throw new Error('Quality cleanup manifest does not prove exact item ownership');
+    }
+    if (manifest?.state === 'deleted') {
+        if (await objectExists(key, tier)) throw new Error('deleted quality manifest still has a provider object');
+        return;
+    }
+    if (manifest && !['verified', 'active', 'cleanup_eligible'].includes(manifest.state)) {
+        throw new Error(`Quality cleanup is not allowed from manifest state ${manifest.state}`);
+    }
+    const currentKey = keyFromUrl(item.media_url);
+    if (!currentKey || currentKey === key) {
+        throw new Error('Quality cleanup cannot prove that the key is not the current media pointer');
+    }
+    const correlation = manifest ? {
+        tenant_id: tenantId,
+        producer_event_id: manifest.producer_event_id,
+        fence_token: manifest.fence_token,
+    } : undefined;
+    if (manifest && (manifest.state === 'verified' || manifest.state === 'active')) {
+        await cmsClient.transitionArtifactManifest(manifest.id, 'cleanup_eligible', {
+            ...correlation,
+            cleanup_after_sec: 0,
+            terminal_proof: { quality_version_superseded: true, current_media_key: currentKey },
+        });
+    }
+    const deletion = await deleteObjectsByKeys([key], tier);
+    if (deletion.errors.length > 0) throw new Error(deletion.errors.join('; '));
+    if (await objectExists(key, tier)) throw new Error('Quality cleanup provider readback still finds the old object');
+    if (manifest) {
+        const deleted = await cmsClient.transitionArtifactManifest(manifest.id, 'deleted', {
+            ...correlation,
+            terminal_proof: { provider_head_verified: true, object_present: false, quality_cleanup: true },
+        });
+        if (deleted.state !== 'deleted') throw new Error('Quality cleanup manifest did not reach deleted state');
     }
 }
 

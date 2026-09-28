@@ -56,6 +56,53 @@ async function reconcileUncertainArtifactManifests(requestId?: string): Promise<
             logger.warn('Artifact belongs to a different configured bucket; reconciliation withheld', { manifestId: manifest.id, bucket: manifest.bucket });
             continue;
         }
+        if (manifest.creator_role === 'aggregation_quality_worker') {
+            // Quality output has an immutable per-input fence but no lease
+            // claim. Never reconcile while the initial upload may still be
+            // writing; uploaded/uncertain means the producer observed its
+            // effect boundary and stopped or lost its response.
+            if (manifest.state === 'uploading') continue;
+            if (manifest.state !== 'uploaded' && manifest.state !== 'uncertain') continue;
+            if (!manifest.fence_token || credentialed.fence_token !== manifest.fence_token || !manifest.producer_event_id || !manifest.sha256 || !/^[a-f0-9]{64}$/i.test(manifest.sha256) || manifest.size_bytes <= 0) {
+                logger.warn('Quality artifact lacks stable immutable reconciliation evidence', { manifestId: manifest.id });
+                continue;
+            }
+            const metadata = await getObjectMetadata(manifest.object_key, tier as StorageTier);
+            if (!metadata.exists) {
+                // Absence is not terminal proof: a bounded quality retry may
+                // still be responsible for completing the same immutable key.
+                continue;
+            }
+            const observedContentType = (metadata.contentType ?? '').split(';', 1)[0].trim().toLowerCase();
+            const intendedContentType = (manifest.content_type ?? '').split(';', 1)[0].trim().toLowerCase();
+            if (metadata.size !== manifest.size_bytes || !intendedContentType || observedContentType !== intendedContentType) {
+                logger.warn('Quality artifact metadata conflicts with its immutable intent', { manifestId: manifest.id });
+                continue;
+            }
+            const observedEtag = (metadata.etag ?? '').replace(/^"|"$/g, '').toLowerCase();
+            const intendedEtag = (manifest.etag ?? '').replace(/^"|"$/g, '').toLowerCase();
+            if (!observedEtag || (intendedEtag && observedEtag !== intendedEtag)) {
+                logger.warn('Quality artifact provider receipt conflicts with its immutable intent', { manifestId: manifest.id });
+                continue;
+            }
+            const observed = await readObjectDigest(manifest.object_key, manifest.size_bytes, tier as StorageTier, AbortSignal.timeout(300_000));
+            if (observed.bytes !== manifest.size_bytes || observed.sha256 !== manifest.sha256.toLowerCase()) {
+                logger.warn('Quality artifact checksum conflict retained for inspection', { manifestId: manifest.id });
+                continue;
+            }
+            await cmsClient.transitionArtifactManifest(manifest.id, 'verified', {
+                tenant_id: manifest.tenant_id,
+                producer_event_id: manifest.producer_event_id,
+                fence_token: manifest.fence_token,
+                size_bytes: metadata.size,
+                etag: metadata.etag,
+                sha256: observed.sha256,
+                content_type: metadata.contentType,
+                verification_evidence: { reconciled: true, provider_head_verified: true, provider_checksum_sha256: observed.sha256 },
+            }, requestId);
+            result.adopted += 1;
+            continue;
+        }
         const metadata = await getObjectMetadata(manifest.object_key, tier as StorageTier);
         const correlation = {
             tenant_id: manifest.tenant_id,
