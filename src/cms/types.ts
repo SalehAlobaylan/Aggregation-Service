@@ -111,6 +111,20 @@ export interface CreateContentItemRequest {
   tenant_id?: string;
   content_source_id?: string;
   source_run_request_id?: string;
+  source_upstream_item_id?: string;
+  source_upstream_fingerprint?: string;
+  source_observation_id?: string;
+  content_reset_reconstruction_grant?: string;
+  source_run_attribution?: {
+    request_id: string;
+    attempt_id: string;
+    execution_unit_id: string;
+    unit_job_id: string;
+    attempt_fence_token: string;
+    execution_lease_token: string;
+    page_id: string;
+    batch_id: string;
+  };
   original_url: string;
 
   media_url?: string | null;
@@ -131,6 +145,8 @@ export interface CreateContentItemResponse {
   status: ContentStatus;
   created: boolean; // true if newly created, false if already existed
   retired?: boolean; // identity is a Retention tombstone; never enqueue downstream work
+  /** CMS confirms the row carries this fenced source-run batch attribution. */
+  source_run_attributed?: boolean;
   created_at: string;
   processing_generation: number;
   disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
@@ -864,6 +880,7 @@ export interface StorageCandidate {
   file_size_bytes: number;
   view_count: number;
   created_at: string;
+  updated_at: string;
   published_at?: string;
   parent_content_item_id?: string;
   is_feed_unit?: boolean;
@@ -907,6 +924,7 @@ export interface ArchiveItemsResponse {
 
 export interface MoveToColdItem {
   id: string;
+  expected_updated_at: string;
   media_url?: string;
   thumbnail_url?: string;
   new_size_bytes?: number;

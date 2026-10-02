@@ -157,6 +157,7 @@ export const podcastFetcher: Fetcher = {
                     totalFetched: items.length,
                     skipped,
                     errors,
+					truncated: (feed.items?.length ?? 0) > items.length + skipped + errors,
                 },
             };
         } catch (error) {

@@ -19,13 +19,14 @@ const SOURCE_CACHE_TTL = 300; // 5 minutes
  * - Caches the mapping for future lookups
  */
 export async function upsertContentItem(
-  item: NormalizedItem,
-  requestId?: string,
-	lineage?: { tenantId: string; contentSourceId: string; sourceRunRequestId?: string; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string },
+	item: NormalizedItem,
+	requestId?: string,
+	lineage?: { tenantId: string; contentSourceId: string; sourceRunRequestId?: string; upstreamObservationId?: string; upstreamItemId?: string; upstreamFingerprint?: string; reconstructionGrant?: string; sourceRunAttribution?: CreateContentItemRequest['source_run_attribution']; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string },
 ): Promise<{
 	contentItemId: string;
 	created: boolean;
 	retired: boolean;
+	sourceRunAttributed: boolean;
 	status: ContentStatus;
 	disposition: "created" | "changed" | "no_change" | "retired" | "unknown";
 	activeStages: string[];
@@ -55,6 +56,11 @@ export async function upsertContentItem(
 		tenant_id: lineage?.tenantId,
 		content_source_id: lineage?.contentSourceId,
 		source_run_request_id: lineage?.sourceRunRequestId,
+		source_upstream_item_id: lineage?.upstreamObservationId ? lineage.upstreamItemId : undefined,
+		source_upstream_fingerprint: lineage?.upstreamObservationId ? lineage.upstreamFingerprint : undefined,
+		source_observation_id: lineage?.upstreamObservationId,
+		content_reset_reconstruction_grant: lineage?.reconstructionGrant,
+		source_run_attribution: lineage?.sourceRunAttribution,
     media_url: item.mediaUrl,
     thumbnail_url: item.thumbnailUrl,
     original_url: item.originalUrl,
@@ -78,7 +84,7 @@ export async function upsertContentItem(
 			idempotencyKey: item.idempotencyKey,
 			contentItemId,
 		});
-		return { contentItemId, created: false, retired: true, status: response.status, disposition: "retired", activeStages: [], deliveryMode: response.delivery_mode ?? "legacy", nextRequiredStages: [], lifecycleReconciliationRequired: false };
+		return { contentItemId, created: false, retired: true, sourceRunAttributed: false, status: response.status, disposition: "retired", activeStages: [], deliveryMode: response.delivery_mode ?? "legacy", nextRequiredStages: [], lifecycleReconciliationRequired: false };
 	}
 
     // Cache the mapping
@@ -100,6 +106,7 @@ export async function upsertContentItem(
 		contentItemId,
 		created,
 		retired: false,
+		sourceRunAttributed: response.source_run_attributed === true,
 		status: response.status,
 		disposition: response.disposition ?? "unknown",
 		activeStages: response.active_stages ?? [],

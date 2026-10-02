@@ -322,7 +322,7 @@ export async function runSweepForTenant(
 						manifest_hash: options.manifestHash,
 						correlation_id: options.correlationId,
 						owner_request_id: options.ownerRequestId,
-						evidence: { old_size_bytes: candidate.file_size_bytes, old_media_url: candidate.media_url ?? null, from_tier: 'primary', to_tier: 'cold' },
+						evidence: { updated_at: candidate.updated_at, old_size_bytes: candidate.file_size_bytes, old_media_url: candidate.media_url ?? null, old_thumbnail_url: candidate.thumbnail_url ?? null, artifacts, from_tier: 'primary', to_tier: 'cold' },
 					});
 					if (!saga.created) throw new Error(`storage operation saga already exists in ${saga.state}; reconciliation required`);
                     const moveResult = await moveObjectBetweenTiers(
@@ -366,6 +366,7 @@ export async function runSweepForTenant(
                     freedBytes += moveResult.bytesMoved || candidate.file_size_bytes;
                     movedItems.push({
                         id: candidate.id,
+                        expected_updated_at: candidate.updated_at,
                         media_url: moveResult.newPrimaryUrls['processed'] ?? moveResult.newPrimaryUrls['original'],
                         thumbnail_url: moveResult.newPrimaryUrls['thumbnail'],
                         new_size_bytes: moveResult.bytesMoved,
@@ -421,7 +422,7 @@ export async function runSweepForTenant(
 						manifest_hash: options.manifestHash,
 						correlation_id: options.correlationId,
 						owner_request_id: options.ownerRequestId,
-						evidence: { old_size_bytes: candidate.file_size_bytes, old_media_url: candidate.media_url ?? null, artifacts },
+						evidence: { updated_at: candidate.updated_at, old_size_bytes: candidate.file_size_bytes, old_media_url: candidate.media_url ?? null, old_thumbnail_url: candidate.thumbnail_url ?? null, artifacts },
 					});
 					if (!saga.created) throw new Error(`storage operation saga already exists in ${saga.state}; reconciliation required`);
                     const result = await deleteContentObjects(candidate.id, artifacts);
@@ -437,6 +438,9 @@ export async function runSweepForTenant(
 					await cmsClient.markStorageSagaObjectApplied(saga.id, {
 						deleted_count: result.deletedCount,
 						freed_bytes: result.freedBytes,
+						objects_absent: result.objectsAbsent,
+						requested_artifacts_absent: result.requestedArtifactsAbsent,
+						errors: result.errors,
 						artifacts,
 					});
                     deletedCount += result.deletedCount;

@@ -44,6 +44,10 @@ export interface FetchResult {
         totalFetched: number;
         skipped: number;
         errors: number;
+		/** Returned rows do not cover the complete provider page. */
+		truncated?: boolean;
+		/** No provider observation occurred (for example local rate limiting). */
+		unavailable?: boolean;
         /** Human-readable failure reason when a fetch yields nothing (surfaced in UI). */
         reason?: string;
     };

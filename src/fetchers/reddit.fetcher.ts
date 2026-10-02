@@ -155,7 +155,7 @@ export const redditFetcher: Fetcher = {
             return {
                 items: [],
                 hasMore: false,
-                metadata: { totalFetched: 0, skipped: 0, errors: 0 },
+                metadata: { totalFetched: 0, skipped: 0, errors: 0, unavailable: true, reason: 'rate_limited' },
             };
         }
 

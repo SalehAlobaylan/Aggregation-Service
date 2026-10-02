@@ -1034,10 +1034,11 @@ export const cmsClient = {
       providerVersion: string;
       providerPageId: string;
       providerCursor?: string;
+      disposition: "deferred" | "observed";
       items: Array<{ upstreamItemId: string; upstreamFingerprint: string }>;
     },
     requestId?: string,
-  ): Promise<{ created: number }> {
+  ): Promise<{ created: number; observationIds: Record<string, string> }> {
     const raw = await makeProtectedRequest<unknown>(
       "POST",
       `/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/upstream-observations`,
@@ -1050,6 +1051,7 @@ export const cmsClient = {
         provider_version: input.providerVersion,
         provider_page_id: input.providerPageId,
         provider_cursor: input.providerCursor ?? "",
+        disposition: input.disposition,
         items: input.items.map((item) => ({
           upstream_item_id: item.upstreamItemId,
           upstream_fingerprint: item.upstreamFingerprint,
@@ -1058,9 +1060,82 @@ export const cmsClient = {
       requestId,
     );
     return z
-      .object({ ok: z.literal(true), created: z.number().int().nonnegative() })
+      .object({
+        ok: z.literal(true),
+        created: z.number().int().nonnegative(),
+        observation_ids: z.record(z.string(), z.string().uuid()),
+      })
       .strict()
+      .transform(({ created, observation_ids }) => ({ created, observationIds: observation_ids }))
       .parse(raw);
+  },
+
+  async issueContentResetReconstructionGrant(
+	input: {
+		tenantId: string;
+		requestId: string;
+		attemptId: string;
+		unitId: string;
+		unitJobId: string;
+		attemptFenceToken: string;
+		executionLeaseToken: string;
+		pageId: string;
+		batchId: string;
+		campaignId: string;
+		revisionId: string;
+		observationId: string;
+	},
+	requestId?: string,
+  ): Promise<{ grantId?: string; referenceId?: string; grant?: string; grantKind: "replacement" | "new_identity" | "existing_instance"; existingContentItemId?: string; targetContentItemId?: string | null; sourceObservationId: string; replacementInstanceGeneration: number; expiresAt?: string }> {
+	const raw = await makeProtectedRequest<unknown>(
+		"POST",
+		`/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/content-reset-grants`,
+		{
+			tenant_id: input.tenantId,
+			campaign_id: input.campaignId,
+			revision_id: input.revisionId,
+			source_observation_id: input.observationId,
+			unit_job_id: input.unitJobId,
+			attempt_fence_token: input.attemptFenceToken,
+			execution_lease_token: input.executionLeaseToken,
+			page_id: input.pageId,
+			batch_id: input.batchId,
+		},
+		requestId,
+	);
+	const capability = z.object({
+		grant_id: z.string().uuid(),
+		grant: z.string().min(32),
+		grant_kind: z.enum(["replacement", "new_identity"]),
+		target_content_item_id: z.string().uuid().nullable(),
+		source_observation_id: z.string().uuid(),
+		replacement_instance_generation: z.number().int().positive(),
+		expires_at: z.string().datetime({ offset: true }),
+	}).strict().transform((value) => ({
+		grantId: value.grant_id,
+		grant: value.grant,
+		grantKind: value.grant_kind,
+		targetContentItemId: value.target_content_item_id,
+		sourceObservationId: value.source_observation_id,
+		replacementInstanceGeneration: value.replacement_instance_generation,
+		expiresAt: value.expires_at,
+	}));
+	const reference = z.object({
+		reference_id: z.string().uuid(),
+		grant_kind: z.literal("existing_instance"),
+		existing_content_item_id: z.string().uuid(),
+		source_observation_id: z.string().uuid(),
+		replacement_instance_generation: z.number().int().positive(),
+	}).strict().transform((value) => ({
+		referenceId: value.reference_id,
+		grantKind: value.grant_kind,
+		existingContentItemId: value.existing_content_item_id,
+		sourceObservationId: value.source_observation_id,
+		replacementInstanceGeneration: value.replacement_instance_generation,
+	}));
+	const result = z.union([capability, reference]).parse(raw);
+	if (result.sourceObservationId !== input.observationId) throw new Error("CMS replay resolution is bound to another observation");
+	return result;
   },
 
   async recordSourceRunUpstreamObservationDisposition(
@@ -1073,6 +1148,7 @@ export const cmsClient = {
       attemptFenceToken: string;
       executionLeaseToken: string;
       observationId: string;
+      upstreamItemId: string;
       disposition: "materialized" | "filtered";
       contentItemId?: string;
       filterClass?:
@@ -1082,7 +1158,8 @@ export const cmsClient = {
         | "moderation_rejected"
         | "normalization_unsupported"
         | "exact_duplicate"
-        | "duration_below_minimum";
+        | "duration_below_minimum"
+        | "retired_source_identity";
     },
     requestId?: string,
   ): Promise<{ created: boolean }> {
@@ -1094,6 +1171,7 @@ export const cmsClient = {
         unit_job_id: input.unitJobId,
         attempt_fence_token: input.attemptFenceToken,
         execution_lease_token: input.executionLeaseToken,
+        upstream_item_id: input.upstreamItemId,
         disposition: input.disposition,
         content_item_id: input.contentItemId ?? "",
         filter_class: input.filterClass ?? "",

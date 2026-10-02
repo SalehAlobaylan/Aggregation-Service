@@ -49,6 +49,8 @@ export interface FetchJob {
   idempotencyKey?: string;
   /** Present only for a CMS-issued, fenced source-run execution unit. */
   sourceRun?: SourceRunExecutionEnvelope;
+  /** CMS-bound campaign authority for a scoped fresh-start replay. */
+  contentResetReplay?: ContentResetReplayContext;
   /** Internal routing context for a CMS-admitted fetch page; not evidence. */
   sourceRunCoordinatorUnitId?: string;
   sourceRunPageId?: string;
@@ -82,6 +84,8 @@ export interface NormalizeJob {
   idempotencyKey?: string;
   /** Present only when this batch was authorized beneath a fetch-page unit. */
   sourceRun?: SourceRunExecutionEnvelope;
+  /** CMS-bound campaign authority for a scoped fresh-start replay. */
+  contentResetReplay?: ContentResetReplayContext;
   sourceRunPageId?: string;
   sourceRunBatchId?: string;
 }
@@ -140,7 +144,10 @@ export interface RawItem {
   fetchedAt: string;
   /** CMS-reserved replay identity. Never accepted from a dashboard/provider. */
   upstreamObservationId?: string;
+  upstreamFingerprint?: string;
 }
+
+export type ContentResetReplayContext = import('../contracts/content-reset-replay.js').ContentResetReplayContext;
 
 /**
  * Media Job - handles media download, transcoding, and upload

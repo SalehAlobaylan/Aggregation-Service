@@ -1001,6 +1001,7 @@ export async function deleteContentObjects(
   freedBytes: number;
   errors: string[];
   objectsAbsent: boolean;
+  requestedArtifactsAbsent: boolean;
 }> {
   const all = await listContentObjects(contentItemId, tier);
   let keys = all.map((o) => o.Key!).filter(Boolean);
@@ -1010,6 +1011,7 @@ export async function deleteContentObjects(
   }
   const result = await deleteObjectsByKeys(keys, tier);
   let objectsAbsent = false;
+  let requestedArtifactsAbsent = false;
   if (result.errors.length === 0) {
     try {
       const remaining = await listContentObjects(contentItemId, tier);
@@ -1023,6 +1025,8 @@ export async function deleteContentObjects(
           : remaining.map((object) => object.Key ?? "").filter(Boolean);
       if (selectedRemaining.length > 0) {
         result.errors.push("provider readback found remaining content objects");
+      } else {
+        requestedArtifactsAbsent = true;
       }
     } catch (error) {
       result.errors.push(
@@ -1030,7 +1034,7 @@ export async function deleteContentObjects(
       );
     }
   }
-  return { ...result, objectsAbsent };
+  return { ...result, objectsAbsent, requestedArtifactsAbsent };
 }
 
 /** Classify canonical, versioned, HLS, and repair artifacts by lifecycle family. */
@@ -1178,8 +1182,19 @@ export async function moveObjectBetweenTiers(
         src.contentType ?? "application/octet-stream",
         to,
       );
-      // Confirmed on destination — now safe to delete from source
+      const destination = await getObjectMetadata(key, to);
+      if (!destination.exists || destination.size !== src.size) {
+        throw new Error("destination readback did not match the source size");
+      }
+      if (src.contentType && destination.contentType && destination.contentType !== src.contentType) {
+        throw new Error("destination readback did not match the source content type");
+      }
+
+      // Do not remove the origin until the destination is readable and exact.
       await deleteObject(key, from);
+      if (await objectExists(key, from)) {
+        throw new Error("source object remains after the delete request");
+      }
       result.movedCount += 1;
       result.bytesMoved += src.size;
 

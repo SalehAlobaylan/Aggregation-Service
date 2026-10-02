@@ -17,6 +17,7 @@ import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/life
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 import { aiPriorityForContentType } from '../services/ai-queue-priority.js';
 import { knownDurationAdmissionFailure } from '../services/pods-admission.js';
+import { contentResetReplayContextSchema } from '../contracts/content-reset-replay.js';
 
 interface SourceFilters {
     include_keywords?: string[];
@@ -174,6 +175,14 @@ export const createNormalizeWorker = () => createWorker({
     processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
         const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings, sourceRunRequestId, tenantId: jobTenantId, operatorPlanId, operatorStepId, idempotencyKey } = job.data;
 		const durableEnvelope = job.data.sourceRun ? sourceRunExecutionEnvelopeSchema.parse(job.data.sourceRun) : undefined;
+		if (job.data.contentResetReplay) {
+			const replay = contentResetReplayContextSchema.parse(job.data.contentResetReplay);
+			if (!durableEnvelope || replay.spec.sourceType !== sourceType || job.data.sourceRunPageId !== 'initial' ||
+				!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > replay.spec.maxItems ||
+				rawItems.some((item) => !item.upstreamObservationId || !item.upstreamFingerprint || !/^[0-9a-f]{64}$/.test(item.upstreamFingerprint))) {
+				throw new Error('CMS replay normalize payload is outside its immutable contract');
+			}
+		}
 		const heartbeat = durableEnvelope ? startSourceRunLeaseHeartbeat(durableEnvelope, { requestId: job.id }) : undefined;
 		try {
 		if (durableEnvelope) {
@@ -199,10 +208,10 @@ export const createNormalizeWorker = () => createWorker({
 
         let processed = 0;
         let duplicates = 0;
-		// This is the exact count of CMS rows that received this fenced
-		// execution-unit attribution. It intentionally includes repaired
-		// duplicates, unlike `processed`, which counts only newly created rows.
-		let cmsUpserted = 0;
+		// Exact CMS materializations or immutable replay references established
+		// under this fenced unit. Includes repaired/unchanged instances;
+		// `processed` counts only newly created rows.
+		const cmsUpsertedIDs = new Set<string>();
         let filtered = 0;
         let failed = 0;
         let moderationApproved = 0;
@@ -271,7 +280,7 @@ export const createNormalizeWorker = () => createWorker({
 						source_url: normalized.originalUrl || undefined,
 					}]);
 					const verdict = precheck.candidates[0];
-					if (verdict?.verdict === 'exact_identity') {
+					if (verdict?.verdict === 'exact_identity' && !job.data.contentResetReplay) {
 						await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'exact_duplicate');
 						duplicates++;
 						continue;
@@ -298,19 +307,6 @@ export const createNormalizeWorker = () => createWorker({
                 } else {
                     moderationApproved++;
                 }
-				if (durableEnvelope) {
-					// Consumer-side attribution is persisted with the CMS upsert so a
-					// later verifier can observe this exact batch without trusting a
-					// worker counter or queue acknowledgement.
-					normalized.metadata = {
-						...normalized.metadata,
-						source_run_execution_unit_id: durableEnvelope.executionUnitId,
-						source_run_attempt_id: durableEnvelope.sourceRunAttemptId,
-						source_run_page_id: job.data.sourceRunPageId,
-						source_run_batch_id: job.data.sourceRunBatchId,
-					};
-				}
-
                 // The cache only avoids duplicate source work. Never let it
                 // suppress the deterministic downstream handoff: a prior
                 // attempt may have created the CMS row and crashed before
@@ -324,23 +320,69 @@ export const createNormalizeWorker = () => createWorker({
                 }
 
                 // Upsert to CMS
-				const { contentItemId, created, retired, status: cmsStatus, disposition, deliveryMode, nextRequiredStages, lifecycleReconciliationRequired } = await upsertContentItem(normalized, job.id, {
-					tenantId, contentSourceId: sourceId, sourceRunRequestId, operatorPlanId, operatorStepId, idempotencyKey,
+				let reconstructionGrant: string | undefined;
+				if (job.data.contentResetReplay) {
+					if (!durableEnvelope || !rawItem.upstreamObservationId || !rawItem.upstreamFingerprint || !job.data.sourceRunPageId || !job.data.sourceRunBatchId) {
+						throw new Error('Content Reset replay item is missing its CMS observation or normalization-unit identity');
+					}
+					const grant = await cmsClient.issueContentResetReconstructionGrant({
+						tenantId: durableEnvelope.tenantId,
+						requestId: durableEnvelope.sourceRunRequestId,
+						attemptId: durableEnvelope.sourceRunAttemptId,
+						unitId: durableEnvelope.executionUnitId,
+						unitJobId: durableEnvelope.unitJobId,
+						attemptFenceToken: durableEnvelope.attemptFenceToken,
+						executionLeaseToken: durableEnvelope.executionLeaseToken,
+						pageId: job.data.sourceRunPageId,
+						batchId: job.data.sourceRunBatchId,
+						campaignId: job.data.contentResetReplay.campaignId,
+						revisionId: job.data.contentResetReplay.revisionId,
+						observationId: rawItem.upstreamObservationId,
+					}, job.id);
+					if (grant.grantKind === 'existing_instance') {
+						if (!grant.existingContentItemId) throw new Error('CMS replay instance reference lacks its content identity');
+						await recordObservationDisposition(job, rawItem, 'materialized', grant.existingContentItemId);
+						cmsUpsertedIDs.add(grant.existingContentItemId);
+						duplicates++;
+						continue;
+					}
+					if (!grant.grant) throw new Error('CMS replay reconstruction lacks its one-use grant');
+					reconstructionGrant = grant.grant;
+				}
+				const { contentItemId, created, retired, sourceRunAttributed, status: cmsStatus, disposition, deliveryMode, nextRequiredStages, lifecycleReconciliationRequired } = await upsertContentItem(normalized, job.id, {
+					tenantId, contentSourceId: sourceId, sourceRunRequestId,
+					upstreamObservationId: rawItem.upstreamObservationId, upstreamItemId: item.externalId,
+					upstreamFingerprint: rawItem.upstreamFingerprint, reconstructionGrant,
+					operatorPlanId, operatorStepId, idempotencyKey,
+					sourceRunAttribution: durableEnvelope ? {
+						request_id: durableEnvelope.sourceRunRequestId,
+						attempt_id: durableEnvelope.sourceRunAttemptId,
+						execution_unit_id: durableEnvelope.executionUnitId,
+						unit_job_id: durableEnvelope.unitJobId,
+						attempt_fence_token: durableEnvelope.attemptFenceToken,
+						execution_lease_token: durableEnvelope.executionLeaseToken,
+						page_id: job.data.sourceRunPageId!,
+						batch_id: job.data.sourceRunBatchId!,
+					} : undefined,
 				});
 				// Older CMS deployments omit the additive compatibility fields. Treat
 				// that response as legacy-unknown and preserve the established handoff;
 				// never let an undefined optional field suppress required work.
 				const missingStages = Array.isArray(nextRequiredStages) ? nextRequiredStages : [];
 				const lifecycleNeedsReconciliation = lifecycleReconciliationRequired === true;
-				if (contentItemId) cmsUpserted++;
-				if (moderation.decision === 'auto_rejected') {
+				if (retired) {
+					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'retired_source_identity');
+				} else if (moderation.decision === 'auto_rejected') {
 					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'moderation_rejected');
-				} else if (contentItemId) {
+				} else if (contentItemId && (created || sourceRunAttributed)) {
 					await recordObservationDisposition(job, rawItem, 'materialized', contentItemId);
+				} else if (contentItemId && rawItem.upstreamObservationId) {
+					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'exact_duplicate');
 				}
+				if (contentItemId && sourceRunAttributed) cmsUpsertedIDs.add(contentItemId);
 				if (retired) {
 					duplicates++;
-					jobLogger.info('Skipping downstream work for retained News identity', { idempotencyKey: normalized.idempotencyKey });
+					jobLogger.info('Skipping downstream work for retired source identity', { idempotencyKey: normalized.idempotencyKey });
 					continue;
 				}
 				if (deliveryMode === 'durable_required') {
@@ -570,7 +612,8 @@ export const createNormalizeWorker = () => createWorker({
             }
         }
 
-        jobLogger.info('Normalize job completed', {
+		const cmsUpserted = cmsUpsertedIDs.size;
+		jobLogger.info('Normalize job completed', {
             sourceId,
             sourceType,
             processed,
@@ -615,9 +658,9 @@ export const createNormalizeWorker = () => createWorker({
 });
 
 async function recordObservationDisposition(
-	job: Job<NormalizeJob>, rawItem: { upstreamObservationId?: string }, disposition: 'materialized' | 'filtered',
+	job: Job<NormalizeJob>, rawItem: { externalId: string; upstreamObservationId?: string }, disposition: 'materialized' | 'filtered',
 	contentItemId?: string,
-	filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate' | 'duration_below_minimum',
+	filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate' | 'duration_below_minimum' | 'retired_source_identity',
 ): Promise<void> {
 	if (!rawItem.upstreamObservationId || !job.data.sourceRun) return;
 	const envelope = sourceRunExecutionEnvelopeSchema.parse(job.data.sourceRun);
@@ -626,6 +669,7 @@ async function recordObservationDisposition(
 		attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId,
 		unitJobId: envelope.unitJobId, attemptFenceToken: envelope.attemptFenceToken,
 		executionLeaseToken: envelope.executionLeaseToken, observationId: rawItem.upstreamObservationId,
+		upstreamItemId: rawItem.externalId,
 		disposition, contentItemId, filterClass,
 	}, job.id);
 }

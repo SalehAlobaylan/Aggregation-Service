@@ -13,6 +13,7 @@ import { sourceRunExecutionEnvelopeSchema, sourceRunManifestChildDigest, sourceR
 import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 import type { RawFetchedItem } from '../fetchers/types.js';
+import { contentResetReplayContextSchema, planContentResetReplayPage, ReplayPageIncomplete } from '../contracts/content-reset-replay.js';
 
 const SOURCE_RUN_NORMALIZE_BATCH_SIZE = 100;
 
@@ -45,6 +46,14 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
     const { sourceId, sourceType, config } = job.data;
     const pageId = job.data.sourceRunPageId;
     const settings = (config.settings as Record<string, unknown>) || {};
+    const replay = job.data.contentResetReplay ? contentResetReplayContextSchema.parse(job.data.contentResetReplay) : undefined;
+    if (replay && (pageId !== 'initial' || replay.spec.sourceType !== sourceType ||
+        (config.cursor ?? '') !== replay.inputCursor || settings.max_results !== replay.spec.maxItems ||
+        settings.max_bytes !== replay.spec.maxBytes || settings.max_provider_calls !== 1 ||
+        config.fetchedSoFar !== undefined || config.providerCallsSoFar !== undefined || config.observedBytesSoFar !== undefined ||
+        settings.deferred_observation_map !== undefined || settings.recovery !== undefined)) {
+      throw new Error('CMS replay page parameters differ from its immutable contract');
+    }
     const sourceConfig: SourceConfig = {
         id: sourceId, type: sourceType, name: (config.name as string) || sourceId,
         url: config.url as string, enabled: true, pollIntervalMs: (config.pollIntervalMs as number) || 300000,
@@ -69,6 +78,20 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
         throw error;
     }
 	const observedBytes = Buffer.byteLength(JSON.stringify(result.items), 'utf8');
+    let replayPlan: ReturnType<typeof planContentResetReplayPage> | undefined;
+    if (replay) {
+      try { replayPlan = planContentResetReplayPage(replay, result); }
+      catch (error) {
+        if (!(error instanceof ReplayPageIncomplete)) throw error;
+        heartbeat.assertCurrent();
+        await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: 0, declaredChildDigest: sourceRunManifestChildDigest([]) }, job.id);
+        await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome: 'partial', sequence: 3, pageId, finalPage: true, payload: {
+          failure_class: error.reasonCode, accepted: 0,
+          content_reset_replay: { branch_id: replay.branchId, page_id: replay.pageId, spec_hash: replay.specHash, complete: false, reason_code: error.reasonCode },
+        } });
+        return;
+      }
+    }
 	const providerCallsSoFar = (getNonNegativeInteger(config.providerCallsSoFar) ?? 0) + 1;
 	const observedBytesSoFar = (getNonNegativeInteger(config.observedBytesSoFar) ?? 0) + observedBytes;
 	const configuredProviderCallCap = getPositiveInteger(settings.max_provider_calls);
@@ -88,6 +111,7 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 				executionLeaseToken: envelope.executionLeaseToken,
 				providerCapability: capability, providerVersion: `${sourceType}:source-run-observation/v1`,
 				providerPageId: pageId, providerCursor: result.cursor,
+				disposition: 'deferred',
 				items: result.items.slice(0, SOURCE_RUN_NORMALIZE_BATCH_SIZE).map((item) => ({
 					upstreamItemId: item.externalId, upstreamFingerprint: upstreamItemFingerprint(item),
 				})),
@@ -95,12 +119,15 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 			created = recorded.created;
 		}
 		await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: 0, declaredChildDigest: sourceRunManifestChildDigest([]) }, job.id);
+		const observationsTruncated = Boolean(capability && result.items.length > SOURCE_RUN_NORMALIZE_BATCH_SIZE);
 		const outcome = result.items.length === 0
 			? 'no_change'
+			: observationsTruncated
+				? 'partial'
 			: capability
 				? 'upstream_change_deferred'
 				: 'observation_blocked_by_intake';
-		const payload = { fetched: result.metadata.totalFetched, accepted: 0, observed: created, observed_bytes: observedBytes, provider_capability: capability ?? 'none', intake_capacity: 0, cursor_advanced: false };
+		const payload = { fetched: result.metadata.totalFetched, accepted: 0, observed: created, observation_truncated: observationsTruncated, observed_bytes: observedBytes, provider_capability: capability ?? 'none', intake_capacity: 0, cursor_advanced: false };
 		await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: 2, pageId, payload });
 		await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: true, payload });
 		jobLogger.info('CMS source-run observation completed without intake', { sourceId, pageId, outcome, observed: created });
@@ -127,33 +154,69 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
         const cutoff = Date.now() - Math.min(72, Math.max(1, recovery.lookback_hours)) * 60 * 60 * 1000;
         items = items.filter((item) => item.publishedAt && new Date(item.publishedAt).getTime() >= cutoff);
     }
+    if (replayPlan) items = replayPlan.items;
 
-    const normalizeQueue = getQueue(QUEUE_NAMES.NORMALIZE);
-    const childKeys: string[] = [];
-    if (items.length > 0 && !normalizeQueue) throw new Error('normalize queue is unavailable for source-run fetch page');
-    for (let offset = 0, batchIndex = 0; offset < items.length; offset += SOURCE_RUN_NORMALIZE_BATCH_SIZE, batchIndex++) {
+	const replayObservationIDs = new Map<string, string>();
+	const replayFingerprints = new Map<string, string>();
+	const observationCapability = sourceObservationCapability(sourceType);
+	if (!deferredObservationMap && observationCapability && items.length > 0) {
+		for (let offset = 0; offset < items.length; offset += 100) {
+			heartbeat.assertCurrent();
+			const pageItems = items.slice(offset, offset + 100);
+			const recorded = await cmsClient.recordSourceRunUpstreamObservations({
+				tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId,
+				attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId,
+				unitJobId: envelope.unitJobId, attemptFenceToken: envelope.attemptFenceToken,
+				executionLeaseToken: envelope.executionLeaseToken, providerCapability: observationCapability,
+				providerVersion: `${sourceType}:source-run-observation/v1`, providerPageId: pageId,
+				providerCursor: result.cursor, disposition: 'observed',
+				items: pageItems.map((item) => ({ upstreamItemId: item.externalId, upstreamFingerprint: upstreamItemFingerprint(item) })),
+			}, job.id);
+			for (const item of pageItems) {
+				const observationID = recorded.observationIds[item.externalId];
+				if (!observationID) throw new Error('CMS did not return a replay observation for a fetched item');
+				replayObservationIDs.set(item.externalId, observationID);
+				replayFingerprints.set(item.externalId, upstreamItemFingerprint(item));
+			}
+		}
+	}
+	const normalizeQueue = getQueue(QUEUE_NAMES.NORMALIZE);
+	const childKeys: string[] = [];
+	const pendingBatches: Array<{ batch: RawFetchedItem[]; batchId: string; unitKey: string; child: { id: string; job_id: string; attempt_fence_token: string } }> = [];
+	if (items.length > 0 && !normalizeQueue) throw new Error('normalize queue is unavailable for source-run fetch page');
+	for (let offset = 0, batchIndex = 0; offset < items.length; offset += SOURCE_RUN_NORMALIZE_BATCH_SIZE, batchIndex++) {
 		heartbeat.assertCurrent();
-        const batch = items.slice(offset, offset + SOURCE_RUN_NORMALIZE_BATCH_SIZE);
-        const batchId = `batch-${batchIndex}`;
-        const unitKey = `normalize:${pageId}:${batchId}`;
-        const child = await cmsClient.authorizeSourceRunUnit({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, parentUnitId: envelope.executionUnitId, unitType: 'normalize_batch', unitKey, pageId, batchId }, job.id);
-        const lease = await cmsClient.acceptSourceRunUnit({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: child.id, unitJobId: child.job_id, attemptFenceToken: child.attempt_fence_token }, job.id);
-        const childEnvelope = durableEnvelope(envelope, child, lease);
-        await normalizeQueue!.add('source-run-normalize-batch', {
-            sourceId, sourceType,
-            rawItems: batch.map((item) => ({ externalId: item.externalId, rawData: item, fetchedAt: item.fetchedAt, upstreamObservationId: deferredObservationMap?.get(item.externalId) })),
-            fetchJobId: job.id || envelope.unitJobId, triggeredBy: 'schedule', sourceSettings: settings,
-            sourceRunRequestId: envelope.sourceRunRequestId, tenantId: envelope.tenantId,
-            sourceRun: childEnvelope, sourceRunPageId: pageId, sourceRunBatchId: batchId,
-        }, { jobId: sourceRunQueueJobId(childEnvelope.unitJobId), priority: 1 });
-        childKeys.push(unitKey);
-    }
+	        const batch = items.slice(offset, offset + SOURCE_RUN_NORMALIZE_BATCH_SIZE);
+	        const batchId = `batch-${batchIndex}`;
+	        const unitKey = `normalize:${pageId}:${batchId}`;
+	        const child = await cmsClient.authorizeSourceRunUnit({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, parentUnitId: envelope.executionUnitId, unitType: 'normalize_batch', unitKey, pageId, batchId }, job.id);
+		pendingBatches.push({ batch, batchId, unitKey, child });
+	        childKeys.push(unitKey);
+	    }
+	await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: childKeys.length, declaredChildDigest: sourceRunManifestChildDigest(childKeys) }, job.id);
+	for (const pending of pendingBatches) {
+		heartbeat.assertCurrent();
+		const lease = await cmsClient.acceptSourceRunUnit({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: pending.child.id, unitJobId: pending.child.job_id, attemptFenceToken: pending.child.attempt_fence_token }, job.id);
+		const childEnvelope = durableEnvelope(envelope, pending.child, lease);
+		await normalizeQueue!.add('source-run-normalize-batch', {
+			sourceId, sourceType,
+			rawItems: pending.batch.map((item) => ({
+				externalId: item.externalId, rawData: item, fetchedAt: item.fetchedAt,
+				upstreamObservationId: replayObservationIDs.get(item.externalId) ?? deferredObservationMap?.get(item.externalId),
+				upstreamFingerprint: replayFingerprints.get(item.externalId),
+			})),
+			fetchJobId: job.id || envelope.unitJobId, triggeredBy: 'schedule', sourceSettings: settings,
+			sourceRunRequestId: envelope.sourceRunRequestId, tenantId: envelope.tenantId,
+			sourceRun: childEnvelope, sourceRunPageId: pageId, sourceRunBatchId: pending.batchId,
+			contentResetReplay: job.data.contentResetReplay,
+		}, { jobId: sourceRunQueueJobId(childEnvelope.unitJobId), priority: 1 });
+	}
 
     const totalFetchedSoFar = fetchedSoFar + items.length;
     const reachedCap = configuredMaxResults !== undefined && totalFetchedSoFar >= configuredMaxResults;
 	const reachedProviderCallCap = configuredProviderCallCap !== undefined && providerCallsSoFar >= configuredProviderCallCap;
 	const reachedByteCap = configuredByteCap !== undefined && observedBytesSoFar >= configuredByteCap;
-	const canContinue = !reachedCap && !reachedProviderCallCap && !reachedByteCap;
+	const canContinue = !replay && !reachedCap && !reachedProviderCallCap && !reachedByteCap;
     if (result.hasMore && result.cursor && canContinue) {
 		heartbeat.assertCurrent();
         const nextPageId = durablePageID(result.cursor);
@@ -166,12 +229,11 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
     }
 
 		heartbeat.assertCurrent();
-    await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: childKeys.length, declaredChildDigest: sourceRunManifestChildDigest(childKeys) }, job.id);
-	const budgetTruncated = Boolean(result.hasMore && result.cursor && !canContinue);
+	const budgetTruncated = Boolean(!replay && result.hasMore && result.cursor && !canContinue);
 	const deferredTargetMissing = Boolean(deferredObservationMap && items.length === 0 && !(result.hasMore && result.cursor && canContinue));
     const outcome = deferredTargetMissing || budgetTruncated ? 'partial' : items.length > 0 ? 'new_items' : 'no_change';
     await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: 2, pageId, payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, has_more: Boolean(result.hasMore && result.cursor && canContinue), budget_truncated: budgetTruncated, child_batches: childKeys.length } });
-    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: !(result.hasMore && result.cursor && canContinue), payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, next_cursor_present: Boolean(result.cursor && canContinue), budget_truncated: budgetTruncated } });
+    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: !(result.hasMore && result.cursor && canContinue), payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, next_cursor_present: Boolean(result.cursor && canContinue), budget_truncated: budgetTruncated, ...(replayPlan ? { content_reset_replay: replayPlan.evidence } : {}) } });
     jobLogger.info('CMS source-run fetch page completed', { sourceId, pageId, items: items.length, batches: childKeys.length });
 	} finally {
 		heartbeat.stop();

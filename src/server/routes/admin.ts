@@ -824,6 +824,14 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 let deletedCount = 0;
                 let freedBytes = 0;
                 const errors: string[] = [];
+                const results: Array<{
+                    content_id: string;
+                    deleted_count: number;
+                    freed_bytes: number;
+                    objects_absent: boolean;
+                    requested_artifacts_absent: boolean;
+                    errors: string[];
+                }> = [];
 
                 if (keys && keys.length > 0) {
                     const out = await deleteObjectsByKeys(keys, tier);
@@ -833,14 +841,35 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
                 }
                 if (contentIds && contentIds.length > 0) {
                     for (const id of contentIds) {
-                        const out = await deleteContentObjects(id, artifacts, tier);
-                        deletedCount += out.deletedCount;
-                        freedBytes += out.freedBytes;
-                        errors.push(...out.errors);
+                        try {
+                            const out = await deleteContentObjects(id, artifacts, tier);
+                            deletedCount += out.deletedCount;
+                            freedBytes += out.freedBytes;
+                            errors.push(...out.errors.map((error) => `${id}: ${error}`));
+                            results.push({
+                                content_id: id,
+                                deleted_count: out.deletedCount,
+                                freed_bytes: out.freedBytes,
+                                objects_absent: out.objectsAbsent,
+                                requested_artifacts_absent: out.requestedArtifactsAbsent,
+                                errors: out.errors,
+                            });
+                        } catch (err) {
+                            const message = err instanceof Error ? err.message : String(err);
+                            errors.push(`${id}: ${message}`);
+                            results.push({
+                                content_id: id,
+                                deleted_count: 0,
+                                freed_bytes: 0,
+                                objects_absent: false,
+                                requested_artifacts_absent: false,
+                                errors: [message],
+                            });
+                        }
                     }
                 }
                 cachedStats = null;
-                return reply.send({ deleted_count: deletedCount, freed_bytes: freedBytes, errors });
+                return reply.send({ deleted_count: deletedCount, freed_bytes: freedBytes, errors, results });
             } catch (err) {
                 logger.error('storage.delete-objects: failed', err);
                 return reply.status(500).send({ error: err instanceof Error ? err.message : 'delete failed' });
