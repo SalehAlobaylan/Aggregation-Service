@@ -5,10 +5,12 @@
  */
 import {
   spawn,
+  execFileSync,
   type ChildProcessWithoutNullStreams,
   type SpawnOptions,
 } from "child_process";
 import { readFile } from "fs/promises";
+import { registerLocalProcess } from "./local-process-registry.js";
 import {
   managedChildren,
   managedProcessTerminations,
@@ -192,6 +194,8 @@ export async function runManagedProcess(
   ) as ChildProcessWithoutNullStreams;
   if (!child.pid)
     throw new Error(`${options.label} did not return a process id`);
+  let unregister: (()=>void)|undefined;
+  try { unregister = registerLocalProcess(child.pid, process.env.WAHB_MANAGED_ENV === "1" ? execFileSync("ps", ["-p", String(child.pid), "-o", "lstart="], {encoding:"utf8"}).trim() : ""); } catch (error) { terminateTree(child, options.label, true); throw error; }
   active.set(child.pid, { label: options.label, process: child });
   managedChildren.labels(options.label).inc();
 
@@ -328,6 +332,7 @@ export async function runManagedProcess(
     options.signal?.removeEventListener("abort", onAbort);
     if (child.pid) latestMetrics.delete(child.pid);
     active.delete(child.pid);
+    if (!processGroupAlive(child.pid)) unregister?.();
     managedChildren.labels(options.label).dec();
   }
 }

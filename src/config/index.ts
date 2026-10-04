@@ -2,7 +2,8 @@
  * Configuration module with Zod schema validation
  * Fail-fast with actionable error messages
  */
-import 'dotenv/config';
+import dotenv from 'dotenv';
+if (process.env.WAHB_MANAGED_ENV !== '1') dotenv.config();
 import { z } from 'zod';
 
 // Custom validators
@@ -50,7 +51,7 @@ const configSchema = z.object({
     // Optional - Cold tier (any S3-compatible bucket — R2, B2, Wasabi, AWS S3, etc.).
     // When configured, the storage worker can move purge candidates here instead
     // of deleting them outright.
-    coldStorageEnabled: z.coerce.boolean().default(false),
+    coldStorageEnabled: z.preprocess(value => value === 'true' || value === true, z.boolean()).default(false),
     coldStorageEndpoint: z.string().nullable().default(null),
     coldStorageBucket: z.string().nullable().default(null),
     coldStorageAccessKey: z.string().nullable().default(null),
