@@ -108,6 +108,7 @@ const CMS_CONTENT_STAGE_TRANSITION_TIMEOUT_MS = 60_000;
 // ten-second request timeout for a checkpoint turns a successful media effect
 // into an "unknown" attempt and unnecessarily requeues the episode.
 const CMS_LONG_FORM_CONTROL_TIMEOUT_MS = 60_000;
+const CMS_PODS_RESET_AUTHORIZATION_TIMEOUT_MS = 60_000;
 // Artifact registration/verification is part of the long-form media effect.
 // A CMAF package can issue hundreds of small, fenced manifest transactions
 // while Neon is contended by workflow snapshotters.  The old ten-second
@@ -951,6 +952,7 @@ export const cmsClient = {
       executionLeaseToken: string;
     },
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<void> {
     await makeProtectedRequest(
       "POST",
@@ -962,6 +964,7 @@ export const cmsClient = {
         execution_lease_token: input.executionLeaseToken,
       },
       requestId,
+      parentSignal,
     );
   },
 
@@ -1070,74 +1073,6 @@ export const cmsClient = {
       .parse(raw);
   },
 
-  async issueContentResetReconstructionGrant(
-	input: {
-		tenantId: string;
-		requestId: string;
-		attemptId: string;
-		unitId: string;
-		unitJobId: string;
-		attemptFenceToken: string;
-		executionLeaseToken: string;
-		pageId: string;
-		batchId: string;
-		campaignId: string;
-		revisionId: string;
-		observationId: string;
-	},
-	requestId?: string,
-  ): Promise<{ grantId?: string; referenceId?: string; grant?: string; grantKind: "replacement" | "new_identity" | "existing_instance"; existingContentItemId?: string; targetContentItemId?: string | null; sourceObservationId: string; replacementInstanceGeneration: number; expiresAt?: string }> {
-	const raw = await makeProtectedRequest<unknown>(
-		"POST",
-		`/source-runs/${encodeURIComponent(input.requestId)}/attempts/${encodeURIComponent(input.attemptId)}/units/${encodeURIComponent(input.unitId)}/content-reset-grants`,
-		{
-			tenant_id: input.tenantId,
-			campaign_id: input.campaignId,
-			revision_id: input.revisionId,
-			source_observation_id: input.observationId,
-			unit_job_id: input.unitJobId,
-			attempt_fence_token: input.attemptFenceToken,
-			execution_lease_token: input.executionLeaseToken,
-			page_id: input.pageId,
-			batch_id: input.batchId,
-		},
-		requestId,
-	);
-	const capability = z.object({
-		grant_id: z.string().uuid(),
-		grant: z.string().min(32),
-		grant_kind: z.enum(["replacement", "new_identity"]),
-		target_content_item_id: z.string().uuid().nullable(),
-		source_observation_id: z.string().uuid(),
-		replacement_instance_generation: z.number().int().positive(),
-		expires_at: z.string().datetime({ offset: true }),
-	}).strict().transform((value) => ({
-		grantId: value.grant_id,
-		grant: value.grant,
-		grantKind: value.grant_kind,
-		targetContentItemId: value.target_content_item_id,
-		sourceObservationId: value.source_observation_id,
-		replacementInstanceGeneration: value.replacement_instance_generation,
-		expiresAt: value.expires_at,
-	}));
-	const reference = z.object({
-		reference_id: z.string().uuid(),
-		grant_kind: z.literal("existing_instance"),
-		existing_content_item_id: z.string().uuid(),
-		source_observation_id: z.string().uuid(),
-		replacement_instance_generation: z.number().int().positive(),
-	}).strict().transform((value) => ({
-		referenceId: value.reference_id,
-		grantKind: value.grant_kind,
-		existingContentItemId: value.existing_content_item_id,
-		sourceObservationId: value.source_observation_id,
-		replacementInstanceGeneration: value.replacement_instance_generation,
-	}));
-	const result = z.union([capability, reference]).parse(raw);
-	if (result.sourceObservationId !== input.observationId) throw new Error("CMS replay resolution is bound to another observation");
-	return result;
-  },
-
   async recordSourceRunUpstreamObservationDisposition(
     input: {
       tenantId: string;
@@ -1162,6 +1097,7 @@ export const cmsClient = {
         | "retired_source_identity";
     },
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<{ created: boolean }> {
     const raw = await makeProtectedRequest<unknown>(
       "POST",
@@ -1177,6 +1113,7 @@ export const cmsClient = {
         filter_class: input.filterClass ?? "",
       },
       requestId,
+      parentSignal,
     );
     return z
       .object({ ok: z.literal(true), created: z.boolean() })
@@ -1282,6 +1219,7 @@ export const cmsClient = {
       source_url?: string;
     }>,
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<{
     candidates: Array<{
       verdict: "clear" | "exact_identity" | "likely_duplicate";
@@ -1295,6 +1233,7 @@ export const cmsClient = {
       "/redundancy/precheck",
       { candidates },
       requestId,
+      parentSignal,
     );
   },
   /**
@@ -1342,13 +1281,14 @@ export const cmsClient = {
   async createContentItem(
     data: CreateContentItemRequest,
     requestId?: string,
+    parentSignal?: AbortSignal,
   ): Promise<CreateContentItemResponse> {
     return makeProtectedRequest<CreateContentItemResponse>(
       "POST",
       "/content-items",
       data,
       requestId,
-      undefined,
+      parentSignal,
       CMS_CONTENT_INGEST_TIMEOUT_MS,
     );
   },
@@ -1961,12 +1901,20 @@ export const cmsClient = {
       size_bytes: number;
     }>;
   }, requestId?: string): Promise<{ authorized: boolean }> {
-    return makeProtectedRequest<{ authorized: boolean }>(
+    // This is the callback for an already approved, CMS-fenced reset. An
+    // unrelated ingestion failure must not prevent asking CMS for authority.
+    const response = await makeRequest<ApiResponse<{ authorized: boolean }>>(
       "POST",
       "/pods-reset/authorize-object-deletion",
       data,
       requestId,
+      undefined,
+      CMS_PODS_RESET_AUTHORIZATION_TIMEOUT_MS,
     );
+    if (response.data?.authorized !== true) {
+      throw new Error("CMS did not authorize the exact reset object set");
+    }
+    return response.data;
   },
 
   async getAtomizationInput(

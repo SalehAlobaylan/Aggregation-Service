@@ -21,7 +21,8 @@ const SOURCE_CACHE_TTL = 300; // 5 minutes
 export async function upsertContentItem(
 	item: NormalizedItem,
 	requestId?: string,
-	lineage?: { tenantId: string; contentSourceId: string; sourceRunRequestId?: string; upstreamObservationId?: string; upstreamItemId?: string; upstreamFingerprint?: string; reconstructionGrant?: string; sourceRunAttribution?: CreateContentItemRequest['source_run_attribution']; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string },
+	lineage?: { tenantId: string; contentSourceId: string; sourceRunRequestId?: string; upstreamObservationId?: string; upstreamItemId?: string; upstreamFingerprint?: string; sourceRunAttribution?: CreateContentItemRequest['source_run_attribution']; operatorPlanId?: string; operatorStepId?: string; idempotencyKey?: string },
+	parentSignal?: AbortSignal,
 ): Promise<{
 	contentItemId: string;
 	created: boolean;
@@ -59,7 +60,6 @@ export async function upsertContentItem(
 		source_upstream_item_id: lineage?.upstreamObservationId ? lineage.upstreamItemId : undefined,
 		source_upstream_fingerprint: lineage?.upstreamObservationId ? lineage.upstreamFingerprint : undefined,
 		source_observation_id: lineage?.upstreamObservationId,
-		content_reset_reconstruction_grant: lineage?.reconstructionGrant,
 		source_run_attribution: lineage?.sourceRunAttribution,
     media_url: item.mediaUrl,
     thumbnail_url: item.thumbnailUrl,
@@ -74,7 +74,7 @@ export async function upsertContentItem(
 
   try {
     // Create in CMS (should be idempotent)
-    const response = await cmsClient.createContentItem(request, requestId);
+    const response = await cmsClient.createContentItem(request, requestId, parentSignal);
 
     const contentItemId = response.id;
     const created = response.created !== false; // Assume created unless explicitly false

@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { FetchResult } from '../../src/fetchers/types.js';
 
 const mocks = vi.hoisted(() => ({
   fetch: vi.fn(), receipt: vi.fn(), begin: vi.fn(), freeze: vi.fn(), authorize: vi.fn(), accept: vi.fn(), observations: vi.fn(),
@@ -35,9 +34,6 @@ function job() {
     config: { url: 'https://example.test', settings: { max_results: 100, max_bytes: 8388608, max_provider_calls: 1 } },
   } };
 }
-function result(count: number, more = false): FetchResult {
-  return { items: Array.from({ length: count }, (_, i) => ({ externalId: String(i), sourceType: 'REDDIT', url: 'https://example.test/item', title: String(i), publishedAt: '2026-09-15T00:00:00Z', fetchedAt: '2026-09-29T00:00:00Z', metadata: {} })), hasMore: more, cursor: more ? 'opaque-next' : undefined, metadata: { totalFetched: count, skipped: 0, errors: 0 } };
-}
 async function processJob(input: unknown) {
   const { createFetchWorker } = await import('../../src/workers/fetch.worker.js');
   const worker = createFetchWorker() as unknown as { processor: (job: unknown, logger: unknown) => Promise<void> };
@@ -54,28 +50,11 @@ describe('Content Reset fetch admission and page effects', () => {
     mocks.normalizeAdd.mockResolvedValue(undefined); mocks.fetchAdd.mockResolvedValue(undefined);
   });
 
-  it('refuses changed bounds before beginning any CMS or provider effect', async () => {
-    const input = job(); input.data.config.settings.max_results = 101;
-    await expect(processJob(input)).rejects.toThrow('immutable contract');
+  it.each([page, {}, null, false])('rejects historical replay before any CMS or provider effect', async (payload) => {
+    const input = job(); input.data.contentResetReplay = payload;
+    await expect(processJob(input)).rejects.toThrow('discontinued');
     expect(mocks.begin).not.toHaveBeenCalled(); expect(mocks.fetch).not.toHaveBeenCalled();
-  });
-
-  it('records overflow as partial without observations, normalize work or cursor continuation', async () => {
-    mocks.fetch.mockResolvedValue(result(101, true));
-    await processJob(job());
-    expect(mocks.fetch).toHaveBeenCalledTimes(1);
-    expect(mocks.freeze).toHaveBeenCalledWith(expect.objectContaining({ declaredChildCount: 0 }), 'job');
-    expect(mocks.receipt).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: 'partial', finalPage: true, payload: expect.objectContaining({ failure_class: 'replay_page_budget_exceeded' }) }));
-    expect(mocks.observations).not.toHaveBeenCalled(); expect(mocks.normalizeAdd).not.toHaveBeenCalled(); expect(mocks.fetchAdd).not.toHaveBeenCalled();
-  });
-
-  it('admits a complete page and leaves its next opaque cursor for CMS scheduling', async () => {
-    mocks.fetch.mockResolvedValue(result(2, true));
-    await processJob(job());
-    expect(mocks.observations).toHaveBeenCalledTimes(1); expect(mocks.normalizeAdd).toHaveBeenCalledTimes(1);
+    expect(mocks.observations).not.toHaveBeenCalled(); expect(mocks.normalizeAdd).not.toHaveBeenCalled();
     expect(mocks.fetchAdd).not.toHaveBeenCalled();
-    expect(mocks.authorize).toHaveBeenCalledTimes(1);
-    expect(mocks.authorize).toHaveBeenCalledWith(expect.objectContaining({ unitType: 'normalize_batch' }), 'job');
-    expect(mocks.receipt).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: 'new_items', finalPage: true, payload: expect.objectContaining({ budget_truncated: false, content_reset_replay: expect.objectContaining({ complete: true, next_cursor: 'opaque-next', exhausted: false, admitted: 2 }) }) }));
   });
 });

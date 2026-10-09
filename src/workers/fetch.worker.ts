@@ -2,7 +2,7 @@
  * Fetch Worker - handles content fetching from sources
  * Phase 2: Full implementation with source routing
  */
-import { Job } from 'bullmq';
+import { Job, UnrecoverableError } from 'bullmq';
 import { createHash } from 'node:crypto';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type FetchJob } from '../queues/index.js';
@@ -13,7 +13,6 @@ import { sourceRunExecutionEnvelopeSchema, sourceRunManifestChildDigest, sourceR
 import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 import type { RawFetchedItem } from '../fetchers/types.js';
-import { contentResetReplayContextSchema, planContentResetReplayPage, ReplayPageIncomplete } from '../contracts/content-reset-replay.js';
 
 const SOURCE_RUN_NORMALIZE_BATCH_SIZE = 100;
 
@@ -46,14 +45,6 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
     const { sourceId, sourceType, config } = job.data;
     const pageId = job.data.sourceRunPageId;
     const settings = (config.settings as Record<string, unknown>) || {};
-    const replay = job.data.contentResetReplay ? contentResetReplayContextSchema.parse(job.data.contentResetReplay) : undefined;
-    if (replay && (pageId !== 'initial' || replay.spec.sourceType !== sourceType ||
-        (config.cursor ?? '') !== replay.inputCursor || settings.max_results !== replay.spec.maxItems ||
-        settings.max_bytes !== replay.spec.maxBytes || settings.max_provider_calls !== 1 ||
-        config.fetchedSoFar !== undefined || config.providerCallsSoFar !== undefined || config.observedBytesSoFar !== undefined ||
-        settings.deferred_observation_map !== undefined || settings.recovery !== undefined)) {
-      throw new Error('CMS replay page parameters differ from its immutable contract');
-    }
     const sourceConfig: SourceConfig = {
         id: sourceId, type: sourceType, name: (config.name as string) || sourceId,
         url: config.url as string, enabled: true, pollIntervalMs: (config.pollIntervalMs as number) || 300000,
@@ -78,20 +69,6 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
         throw error;
     }
 	const observedBytes = Buffer.byteLength(JSON.stringify(result.items), 'utf8');
-    let replayPlan: ReturnType<typeof planContentResetReplayPage> | undefined;
-    if (replay) {
-      try { replayPlan = planContentResetReplayPage(replay, result); }
-      catch (error) {
-        if (!(error instanceof ReplayPageIncomplete)) throw error;
-        heartbeat.assertCurrent();
-        await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: 0, declaredChildDigest: sourceRunManifestChildDigest([]) }, job.id);
-        await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome: 'partial', sequence: 3, pageId, finalPage: true, payload: {
-          failure_class: error.reasonCode, accepted: 0,
-          content_reset_replay: { branch_id: replay.branchId, page_id: replay.pageId, spec_hash: replay.specHash, complete: false, reason_code: error.reasonCode },
-        } });
-        return;
-      }
-    }
 	const providerCallsSoFar = (getNonNegativeInteger(config.providerCallsSoFar) ?? 0) + 1;
 	const observedBytesSoFar = (getNonNegativeInteger(config.observedBytesSoFar) ?? 0) + observedBytes;
 	const configuredProviderCallCap = getPositiveInteger(settings.max_provider_calls);
@@ -154,7 +131,6 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
         const cutoff = Date.now() - Math.min(72, Math.max(1, recovery.lookback_hours)) * 60 * 60 * 1000;
         items = items.filter((item) => item.publishedAt && new Date(item.publishedAt).getTime() >= cutoff);
     }
-    if (replayPlan) items = replayPlan.items;
 
 	const replayObservationIDs = new Map<string, string>();
 	const replayFingerprints = new Map<string, string>();
@@ -208,7 +184,6 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 			fetchJobId: job.id || envelope.unitJobId, triggeredBy: 'schedule', sourceSettings: settings,
 			sourceRunRequestId: envelope.sourceRunRequestId, tenantId: envelope.tenantId,
 			sourceRun: childEnvelope, sourceRunPageId: pageId, sourceRunBatchId: pending.batchId,
-			contentResetReplay: job.data.contentResetReplay,
 		}, { jobId: sourceRunQueueJobId(childEnvelope.unitJobId), priority: 1 });
 	}
 
@@ -216,7 +191,7 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
     const reachedCap = configuredMaxResults !== undefined && totalFetchedSoFar >= configuredMaxResults;
 	const reachedProviderCallCap = configuredProviderCallCap !== undefined && providerCallsSoFar >= configuredProviderCallCap;
 	const reachedByteCap = configuredByteCap !== undefined && observedBytesSoFar >= configuredByteCap;
-	const canContinue = !replay && !reachedCap && !reachedProviderCallCap && !reachedByteCap;
+	const canContinue = !reachedCap && !reachedProviderCallCap && !reachedByteCap;
     if (result.hasMore && result.cursor && canContinue) {
 		heartbeat.assertCurrent();
         const nextPageId = durablePageID(result.cursor);
@@ -229,11 +204,11 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
     }
 
 		heartbeat.assertCurrent();
-	const budgetTruncated = Boolean(!replay && result.hasMore && result.cursor && !canContinue);
+	const budgetTruncated = Boolean(result.hasMore && result.cursor && !canContinue);
 	const deferredTargetMissing = Boolean(deferredObservationMap && items.length === 0 && !(result.hasMore && result.cursor && canContinue));
     const outcome = deferredTargetMissing || budgetTruncated ? 'partial' : items.length > 0 ? 'new_items' : 'no_change';
     await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: 2, pageId, payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, has_more: Boolean(result.hasMore && result.cursor && canContinue), budget_truncated: budgetTruncated, child_batches: childKeys.length } });
-    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: !(result.hasMore && result.cursor && canContinue), payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, next_cursor_present: Boolean(result.cursor && canContinue), budget_truncated: budgetTruncated, ...(replayPlan ? { content_reset_replay: replayPlan.evidence } : {}) } });
+    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: !(result.hasMore && result.cursor && canContinue), payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, next_cursor_present: Boolean(result.cursor && canContinue), budget_truncated: budgetTruncated } });
     jobLogger.info('CMS source-run fetch page completed', { sourceId, pageId, items: items.length, batches: childKeys.length });
 	} finally {
 		heartbeat.stop();
@@ -252,6 +227,7 @@ function parseDeferredObservationMap(value: unknown): Map<string, string> | unde
 export const createFetchWorker = () => createWorker({
     queueName: QUEUE_NAMES.FETCH,
     processor: async (job: Job<FetchJob>, jobLogger, signal): Promise<void> => {
+        if (job.data.contentResetReplay !== undefined) throw new UnrecoverableError('Content Reset replay is discontinued');
 		if (job.data.sourceRun) {
 			return processDurableFetch(job, jobLogger, signal);
 		}

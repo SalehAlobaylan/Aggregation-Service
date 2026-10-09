@@ -10,11 +10,10 @@ import { Job, Queue } from 'bullmq';
 import { cmsClient } from '../cms/client.js';
 import { sourceRunQueueJobId, type SourceRunDispatchClaim, type SourceRunExecutionEnvelope } from '../contracts/source-runs.js';
 import { enqueueSourceRunReceipt, buildSourceRunReceipt } from '../services/lifecycle-receipts.js';
-import { getQueue, QUEUE_NAMES, type ContentResetReplayContext, type FetchJob, type SourceRunDispatchJob, type SourceType } from '../queues/index.js';
+import { getQueue, QUEUE_NAMES, type FetchJob, type SourceRunDispatchJob, type SourceType } from '../queues/index.js';
 import { createWorker } from './base-worker.js';
 import { logger } from '../observability/logger.js';
 import { isDependencyDeferral } from '../observability/job-projection.js';
-import { contentResetReplayFromMetadata } from '../contracts/content-reset-replay.js';
 
 const REPEATABLE_NAME = 'source-run-dispatch-repeatable';
 const DISPATCH_INTERVAL_MS = 5_000;
@@ -55,13 +54,6 @@ function sourceRunSettings(sourceSettings: Record<string, unknown>, request: Sou
     if (entries.length > 0 && entries.length <= 20) settings.deferred_observation_map = Object.fromEntries(entries);
   }
   return settings;
-}
-
-function contentResetReplayContext(request: SourceRunDispatchClaim['request']): ContentResetReplayContext | undefined {
-  if (request.purpose !== 'content_reset_replay') return undefined;
-  const page = contentResetReplayFromMetadata(request.metadata);
-  if (page.spec.maxItems !== request.item_cap || page.spec.maxBytes !== request.byte_cap || request.provider_call_cap !== 1) throw new Error('CMS replay page budget mismatch');
-  return page;
 }
 
 function executionEnvelope(
@@ -107,6 +99,8 @@ async function processOneApprovedUnitAdoption(requestId?: string): Promise<boole
 }
 
 async function runClaimedCoordinator(claim: SourceRunDispatchClaim, requestId?: string): Promise<void> {
+  if (claim.request.purpose === 'content_reset_replay') throw new Error('Content Reset replay is discontinued');
+
   // Reacquire if a queue delay outlived the initial dispatch lease. The CMS
   // endpoint will never reissue the attempt fence or accept a started effect.
   const rootLease = await cmsClient.acceptSourceRunUnit({
@@ -119,8 +113,6 @@ async function runClaimedCoordinator(claim: SourceRunDispatchClaim, requestId?: 
   }, requestId);
   const root = executionEnvelope(claim, { ...claim.unit, attempt_fence_token: claim.attempt.fence_token }, rootLease);
 
-  const replay = contentResetReplayContext(claim.request);
-  if (replay && (replay.spec.sourceType !== claim.source.type || replay.spec.configVersion !== claim.source.source_config_version)) throw new Error('CMS replay source contract mismatch');
   const pageId = 'initial';
   const page = await cmsClient.authorizeSourceRunUnit({
     tenantId: claim.request.tenant_id,
@@ -151,14 +143,12 @@ async function runClaimedCoordinator(claim: SourceRunDispatchClaim, requestId?: 
       url: claim.source.url,
 	  settings: sourceRunSettings(claim.source.settings, claim.request),
       pollIntervalMs: claim.source.fetch_interval_minutes * 60_000,
-      ...(replay ? { cursor: replay.inputCursor || undefined } : {}),
     },
     triggeredBy: 'schedule',
     triggeredAt: new Date().toISOString(),
     sourceRunRequestId: claim.request.id,
     tenantId: claim.request.tenant_id,
     sourceRun: pageEnvelope,
-    contentResetReplay: replay,
     sourceRunCoordinatorUnitId: claim.unit.id,
     sourceRunPageId: pageId,
   };

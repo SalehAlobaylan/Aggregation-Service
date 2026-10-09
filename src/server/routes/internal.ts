@@ -363,21 +363,33 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 			expected.push({ storage_tier, bucket, object_key, etag, size_bytes: Number(size_bytes) });
 		}
 
+		let phase: 'cms_authorization' | 'cms_retirement_read' | 'storage_deletion' = 'cms_authorization';
 		try {
 			await cmsClient.authorizePodsResetObjectDeletion({
 				run_id: String(body.run_id), tenant_id: body.tenant_id, content_item_id: id,
 				manifest_hash: String(body.manifest_hash), fencing_token: String(body.fencing_token),
 				execution_token: String(body.execution_token), storage_bindings: storageBindings, objects: expected,
 			});
+			phase = 'cms_retirement_read';
 			const item = await cmsClient.getContentItem(id);
 			if (item.tenant_id !== body.tenant_id || item.status !== 'ARCHIVED' || item.feed_visibility !== 'hidden') {
 				return reply.status(409).send({ message: 'CMS retirement state is not established for this item' });
 			}
+			phase = 'storage_deletion';
 			const result = await deletePodsResetObjectsExact(id, expected, storageBindings);
 			return reply.send(podsResetDeleteResponse(id, String(body.fencing_token), result));
 		} catch (error) {
 			logger.warn('Pods reset exact object deletion failed closed', { contentItemId: id, error: error instanceof Error ? error.message : 'unknown' });
-			return reply.status(409).send({ message: 'Pods reset object deletion was not proven safe or complete' });
+			const cmsStatus = phase !== 'storage_deletion' && error instanceof Error &&
+				'status' in error && typeof error.status === 'number' && Number.isInteger(error.status) &&
+				error.status >= 400 && error.status <= 599 ? error.status : undefined;
+			return reply.status(409).send({
+				code: `pods_reset_${phase}_failed`,
+				message: phase === 'storage_deletion' ? 'Pods reset storage deletion or absence verification failed' :
+					phase === 'cms_authorization' ? 'CMS reset authorization could not be completed; file deletion was not started' :
+					'CMS retired content could not be read; file deletion was not started',
+				...(cmsStatus !== undefined && { cms_status: cmsStatus }),
+			});
 		}
 	});
 

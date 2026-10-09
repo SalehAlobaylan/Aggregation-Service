@@ -114,7 +114,6 @@ export interface CreateContentItemRequest {
   source_upstream_item_id?: string;
   source_upstream_fingerprint?: string;
   source_observation_id?: string;
-  content_reset_reconstruction_grant?: string;
   source_run_attribution?: {
     request_id: string;
     attempt_id: string;

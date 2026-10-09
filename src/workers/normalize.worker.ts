@@ -2,7 +2,7 @@
  * Normalize Worker - handles content normalization to canonical format
  * Phase 2: Full implementation with CMS upsert
  */
-import { Job } from 'bullmq';
+import { Job, UnrecoverableError } from 'bullmq';
 import { createWorker } from './base-worker.js';
 import { QUEUE_NAMES, type NormalizeJob } from '../queues/index.js';
 import { normalizeItem } from '../normalizers/index.js';
@@ -17,7 +17,6 @@ import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/life
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
 import { aiPriorityForContentType } from '../services/ai-queue-priority.js';
 import { knownDurationAdmissionFailure } from '../services/pods-admission.js';
-import { contentResetReplayContextSchema } from '../contracts/content-reset-replay.js';
 
 interface SourceFilters {
     include_keywords?: string[];
@@ -172,17 +171,11 @@ function evaluateModerationDecision(
 
 export const createNormalizeWorker = () => createWorker({
     queueName: QUEUE_NAMES.NORMALIZE,
-    processor: async (job: Job<NormalizeJob>, jobLogger): Promise<void> => {
+    processor: async (job: Job<NormalizeJob>, jobLogger, signal): Promise<void> => {
+        signal?.throwIfAborted();
+        if (job.data.contentResetReplay !== undefined) throw new UnrecoverableError('Content Reset replay is discontinued');
         const { sourceId, sourceType, rawItems, fetchJobId, triggeredBy = 'schedule', sourceSettings, sourceRunRequestId, tenantId: jobTenantId, operatorPlanId, operatorStepId, idempotencyKey } = job.data;
 		const durableEnvelope = job.data.sourceRun ? sourceRunExecutionEnvelopeSchema.parse(job.data.sourceRun) : undefined;
-		if (job.data.contentResetReplay) {
-			const replay = contentResetReplayContextSchema.parse(job.data.contentResetReplay);
-			if (!durableEnvelope || replay.spec.sourceType !== sourceType || job.data.sourceRunPageId !== 'initial' ||
-				!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > replay.spec.maxItems ||
-				rawItems.some((item) => !item.upstreamObservationId || !item.upstreamFingerprint || !/^[0-9a-f]{64}$/.test(item.upstreamFingerprint))) {
-				throw new Error('CMS replay normalize payload is outside its immutable contract');
-			}
-		}
 		const heartbeat = durableEnvelope ? startSourceRunLeaseHeartbeat(durableEnvelope, { requestId: job.id }) : undefined;
 		try {
 		if (durableEnvelope) {
@@ -192,7 +185,7 @@ export const createNormalizeWorker = () => createWorker({
 			// The fenced begin CAS occurs before the first CMS upsert or downstream
 			// handoff. A crash after this point is verification work, never a
 			// blind replay of a batch with an uncertain consumer-visible effect.
-			await cmsClient.beginSourceRunUnit({ tenantId: durableEnvelope.tenantId, requestId: durableEnvelope.sourceRunRequestId, attemptId: durableEnvelope.sourceRunAttemptId, unitId: durableEnvelope.executionUnitId, unitJobId: durableEnvelope.unitJobId, attemptFenceToken: durableEnvelope.attemptFenceToken, executionLeaseToken: durableEnvelope.executionLeaseToken }, job.id);
+			await cmsClient.beginSourceRunUnit({ tenantId: durableEnvelope.tenantId, requestId: durableEnvelope.sourceRunRequestId, attemptId: durableEnvelope.sourceRunAttemptId, unitId: durableEnvelope.executionUnitId, unitJobId: durableEnvelope.unitJobId, attemptFenceToken: durableEnvelope.attemptFenceToken, executionLeaseToken: durableEnvelope.executionLeaseToken }, job.id, signal);
 			await enqueueSourceRunReceipt(buildSourceRunReceipt({ envelope: durableEnvelope, stage: 'normalize', eventType: 'normalize_scheduled', outcome: 'no_change', sequence: 0, pageId: job.data.sourceRunPageId, batchId: job.data.sourceRunBatchId, payload: { item_count: rawItems?.length || 0 } }));
 		}
         const tenantId = jobTenantId || tenantFromSourceSettings(sourceSettings);
@@ -222,6 +215,7 @@ export const createNormalizeWorker = () => createWorker({
 		let legalDurationCandidates = 0;
 
         for (const rawItem of rawItems || []) {
+            signal?.throwIfAborted();
             try {
 				heartbeat?.assertCurrent();
                 // Cast raw data back to RawFetchedItem
@@ -230,7 +224,7 @@ export const createNormalizeWorker = () => createWorker({
                 // Normalize the item
                 const normalized = normalizeItem(item);
                 if (!normalized) {
-					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'normalization_unsupported');
+					await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'normalization_unsupported');
                     failed++;
                     continue;
                 }
@@ -244,7 +238,7 @@ export const createNormalizeWorker = () => createWorker({
                 // authoritative FFprobe gate in the Media worker.
                 const durationFailure = knownDurationAdmissionFailure(normalized.type, normalized.durationSec);
                 if (durationFailure) {
-                    await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'duration_below_minimum');
+                    await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'duration_below_minimum');
                     filtered++;
                     jobLogger.info('Skipping media outside Pods admission contract', {
                         sourceId, sourceType, durationSec: normalized.durationSec, reason: durationFailure,
@@ -257,7 +251,7 @@ export const createNormalizeWorker = () => createWorker({
 
                 const filterDecision = shouldSkipByFilters(normalized, item, sourceFilters);
                 if (filterDecision.skip) {
-					await recordObservationDisposition(job, rawItem, 'filtered', undefined, filterDecision.reason as 'include_keywords' | 'exclude_keywords' | 'min_engagement');
+					await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, filterDecision.reason as 'include_keywords' | 'exclude_keywords' | 'min_engagement');
                     filtered++;
                     jobLogger.debug('Skipping item due to source filters', {
                         sourceId,
@@ -278,10 +272,10 @@ export const createNormalizeWorker = () => createWorker({
 						title: normalized.title,
 						duration_sec: typeof normalized.durationSec === 'number' ? normalized.durationSec : undefined,
 						source_url: normalized.originalUrl || undefined,
-					}]);
+					}], job.id, signal);
 					const verdict = precheck.candidates[0];
-					if (verdict?.verdict === 'exact_identity' && !job.data.contentResetReplay) {
-						await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'exact_duplicate');
+					if (verdict?.verdict === 'exact_identity') {
+						await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'exact_duplicate');
 						duplicates++;
 						continue;
 					}
@@ -320,39 +314,10 @@ export const createNormalizeWorker = () => createWorker({
                 }
 
                 // Upsert to CMS
-				let reconstructionGrant: string | undefined;
-				if (job.data.contentResetReplay) {
-					if (!durableEnvelope || !rawItem.upstreamObservationId || !rawItem.upstreamFingerprint || !job.data.sourceRunPageId || !job.data.sourceRunBatchId) {
-						throw new Error('Content Reset replay item is missing its CMS observation or normalization-unit identity');
-					}
-					const grant = await cmsClient.issueContentResetReconstructionGrant({
-						tenantId: durableEnvelope.tenantId,
-						requestId: durableEnvelope.sourceRunRequestId,
-						attemptId: durableEnvelope.sourceRunAttemptId,
-						unitId: durableEnvelope.executionUnitId,
-						unitJobId: durableEnvelope.unitJobId,
-						attemptFenceToken: durableEnvelope.attemptFenceToken,
-						executionLeaseToken: durableEnvelope.executionLeaseToken,
-						pageId: job.data.sourceRunPageId,
-						batchId: job.data.sourceRunBatchId,
-						campaignId: job.data.contentResetReplay.campaignId,
-						revisionId: job.data.contentResetReplay.revisionId,
-						observationId: rawItem.upstreamObservationId,
-					}, job.id);
-					if (grant.grantKind === 'existing_instance') {
-						if (!grant.existingContentItemId) throw new Error('CMS replay instance reference lacks its content identity');
-						await recordObservationDisposition(job, rawItem, 'materialized', grant.existingContentItemId);
-						cmsUpsertedIDs.add(grant.existingContentItemId);
-						duplicates++;
-						continue;
-					}
-					if (!grant.grant) throw new Error('CMS replay reconstruction lacks its one-use grant');
-					reconstructionGrant = grant.grant;
-				}
 				const { contentItemId, created, retired, sourceRunAttributed, status: cmsStatus, disposition, deliveryMode, nextRequiredStages, lifecycleReconciliationRequired } = await upsertContentItem(normalized, job.id, {
 					tenantId, contentSourceId: sourceId, sourceRunRequestId,
 					upstreamObservationId: rawItem.upstreamObservationId, upstreamItemId: item.externalId,
-					upstreamFingerprint: rawItem.upstreamFingerprint, reconstructionGrant,
+					upstreamFingerprint: rawItem.upstreamFingerprint,
 					operatorPlanId, operatorStepId, idempotencyKey,
 					sourceRunAttribution: durableEnvelope ? {
 						request_id: durableEnvelope.sourceRunRequestId,
@@ -364,20 +329,21 @@ export const createNormalizeWorker = () => createWorker({
 						page_id: job.data.sourceRunPageId!,
 						batch_id: job.data.sourceRunBatchId!,
 					} : undefined,
-				});
+				}, signal);
+                signal?.throwIfAborted();
 				// Older CMS deployments omit the additive compatibility fields. Treat
 				// that response as legacy-unknown and preserve the established handoff;
 				// never let an undefined optional field suppress required work.
 				const missingStages = Array.isArray(nextRequiredStages) ? nextRequiredStages : [];
 				const lifecycleNeedsReconciliation = lifecycleReconciliationRequired === true;
 				if (retired) {
-					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'retired_source_identity');
+					await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'retired_source_identity');
 				} else if (moderation.decision === 'auto_rejected') {
-					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'moderation_rejected');
+					await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'moderation_rejected');
 				} else if (contentItemId && (created || sourceRunAttributed)) {
-					await recordObservationDisposition(job, rawItem, 'materialized', contentItemId);
+					await recordObservationDisposition(job, signal, rawItem, 'materialized', contentItemId);
 				} else if (contentItemId && rawItem.upstreamObservationId) {
-					await recordObservationDisposition(job, rawItem, 'filtered', undefined, 'exact_duplicate');
+					await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'exact_duplicate');
 				}
 				if (contentItemId && sourceRunAttributed) cmsUpsertedIDs.add(contentItemId);
 				if (retired) {
@@ -605,6 +571,7 @@ export const createNormalizeWorker = () => createWorker({
                         });
                     }
             } catch (error) {
+                signal?.throwIfAborted();
                 failed++;
                 jobLogger.error('Failed to process item', error, {
                     externalId: rawItem.externalId,
@@ -650,7 +617,7 @@ export const createNormalizeWorker = () => createWorker({
             aiEnqueued,
 			legalDurationCandidates,
 			materializedItems: cmsUpserted,
-        });
+        }, signal);
 		} finally {
 			heartbeat?.stop();
 		}
@@ -658,7 +625,7 @@ export const createNormalizeWorker = () => createWorker({
 });
 
 async function recordObservationDisposition(
-	job: Job<NormalizeJob>, rawItem: { externalId: string; upstreamObservationId?: string }, disposition: 'materialized' | 'filtered',
+	job: Job<NormalizeJob>, signal: AbortSignal | undefined, rawItem: { externalId: string; upstreamObservationId?: string }, disposition: 'materialized' | 'filtered',
 	contentItemId?: string,
 	filterClass?: 'include_keywords' | 'exclude_keywords' | 'min_engagement' | 'moderation_rejected' | 'normalization_unsupported' | 'exact_duplicate' | 'duration_below_minimum' | 'retired_source_identity',
 ): Promise<void> {
@@ -671,7 +638,7 @@ async function recordObservationDisposition(
 		executionLeaseToken: envelope.executionLeaseToken, observationId: rawItem.upstreamObservationId,
 		upstreamItemId: rawItem.externalId,
 		disposition, contentItemId, filterClass,
-	}, job.id);
+	}, job.id, signal);
 }
 
 function tenantFromSourceSettings(settings?: Record<string, unknown>): string {
@@ -695,7 +662,8 @@ async function reportNormalizeRun(
     duplicates: number,
     filtered: number,
     failed: number,
-    metadata: Record<string, unknown>
+    metadata: Record<string, unknown>,
+    parentSignal?: AbortSignal,
 ): Promise<void> {
     if (!fetchJobId || !isUuid(sourceId)) return;
     try {
@@ -713,7 +681,7 @@ async function reportNormalizeRun(
 			materialized_items: typeof metadata.materializedItems === 'number' ? metadata.materializedItems : undefined,
 			finished_at: new Date().toISOString(),
 			metadata: { ...metadata, stage: 'normalize' },
-        }, fetchJobId);
+        }, fetchJobId, parentSignal);
     } catch {
         // Telemetry should never fail normalization.
     }

@@ -39,20 +39,30 @@ describe('reset normalize admission', () => {
     expect(mocks.upsert).not.toHaveBeenCalled();
   });
 
-  it('uses the durable reference for an already staged instance without another upsert', async () => {
-    const stop = vi.fn();
-    mocks.heartbeat.mockReturnValue({ assertCurrent: vi.fn(), stop });
-    mocks.normalize.mockReturnValue({ type: 'NEWS', title: 'A complete news title', bodyText: 'A complete article body. '.repeat(10), metadata: {}, idempotencyKey: 'key' });
+  it('cancels an in-flight CMS upsert and stops the batch instead of ignoring the job deadline', async () => {
+    const controller = new AbortController();
+    let started!: () => void;
+    const upsertStarted = new Promise<void>((resolve) => { started = resolve; });
+    mocks.normalize.mockReturnValue({ type: 'NEWS', title: 'A normal test article', bodyText: 'body '.repeat(30), status: 'PENDING', idempotencyKey: 'test-key' });
     mocks.dedup.mockResolvedValue({ isDuplicate: false });
-    mocks.grant.mockResolvedValue({ grantKind: 'existing_instance', referenceId: page.pageId, existingContentItemId: page.branchId, sourceObservationId: page.pageId });
+    mocks.upsert.mockImplementation((_item, _requestId, _lineage, signal: AbortSignal) => new Promise((_resolve, reject) => {
+      expect(signal).toBe(controller.signal);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      started();
+    }));
     const { createNormalizeWorker } = await import('../../src/workers/normalize.worker.js');
-    const worker = createNormalizeWorker() as unknown as { processor: (job: unknown, logger: unknown) => Promise<void> };
-    await worker.processor({ id: 'job', data: data() }, { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() });
-    expect(mocks.begin).toHaveBeenCalledOnce();
-    expect(mocks.grant).toHaveBeenCalledOnce();
-    expect(mocks.upsert).not.toHaveBeenCalled();
-    expect(mocks.disposition).toHaveBeenCalledWith(expect.objectContaining({ disposition: 'materialized', contentItemId: page.branchId, observationId: page.pageId, unitId: page.pageId }), 'job');
-    expect(mocks.receipt).toHaveBeenLastCalledWith(expect.objectContaining({ eventType: 'normalize_terminal', outcome: 'no_change', payload: expect.objectContaining({ processed: 0, duplicates: 1, cms_upserted: 1, failed: 0 }) }));
-    expect(stop).toHaveBeenCalledOnce();
+    const worker = createNormalizeWorker() as unknown as { processor: (job: unknown, logger: unknown, signal: AbortSignal) => Promise<void> };
+    const pending = worker.processor({ id: 'cancelled-job', data: {
+      tenantId: 'tenant', sourceId: page.branchId, sourceType: 'REDDIT', fetchJobId: 'fetch',
+      rawItems: [{ externalId: 'one', rawData: {} }, { externalId: 'two', rawData: {} }],
+    } }, { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }, controller.signal);
+    const rejected = expect(pending).rejects.toThrow('cancelled for test');
+    await upsertStarted;
+    controller.abort(new Error('cancelled for test'));
+    await rejected;
+    expect(mocks.upsert).toHaveBeenCalledTimes(1);
+    expect(mocks.normalize).toHaveBeenCalledTimes(1);
+    expect(mocks.receipt).not.toHaveBeenCalled();
   });
+
 });
