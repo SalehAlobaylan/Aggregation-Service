@@ -30,6 +30,14 @@ Background subsystems run alongside the main pipeline: **Media Atomization** (lo
 
 **BullMQ queues** (Redis db=0): `fetch`, `normalize`, `media`, `ai`, `atomization`, `atomization-sweep`, `storage-sweep`, `reconcile`, `quality-reencode`, `discovery`, `discovery-sweep`, `source-graph`, plus `aggregation-dlq`. Defaults: 3 attempts, exponential backoff; completed kept 1h, failed 24h.
 
+## Recovery backup storage
+
+Aggregation stores and verifies CMS-requested Retention recovery payloads through
+`/internal/recovery-artifacts`. `BACKUP_STORAGE_BUCKET` must select a separate
+private bucket on the existing storage endpoint; missing or shared media-bucket
+configuration blocks backups. CMS owns cleanup eligibility, approval and deletion.
+See [private backups](../docs/index.md#private-backups) and the [Retention guide](../plans/implemented-systems/retention-and-fresh-start-systems.md/retention-autopilot.md).
+
 ## Media Atomization
 
 Aggregation executes atomization; CMS owns policy and feed visibility.
@@ -71,6 +79,7 @@ Env is for boot-time infrastructure and credentials only. Algorithm/cadence knob
 | `INTERNAL_SERVICE_TOKEN` | Auth for the inbound `/internal` route |
 | `JWT_SECRET` / `ADMIN_JWT_ISSUER` / `ADMIN_JWT_AUDIENCE` / `ADMIN_ALLOWED_ROLES` | Admin route auth |
 | `STORAGE_ENDPOINT` / `STORAGE_BUCKET` / `STORAGE_REGION` / `STORAGE_ACCESS_KEY` / `STORAGE_SECRET_KEY` / `STORAGE_PUBLIC_URL` | Hot object storage (S3 / R2 / MinIO) |
+| `BACKUP_STORAGE_BUCKET` | Required for recovery/migration backups; separate private bucket using the existing storage endpoint and credentials |
 
 ### Common (optional)
 

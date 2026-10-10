@@ -25,7 +25,6 @@ import { logger } from '../../observability/logger.js';
 import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { cmsClient } from '../../cms/client.js';
 import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
-import { runSweepForTenant } from '../../services/storage.service.js';
 import { databaseMigrationQuiescence, quiesceForDatabaseMigration, resumeAfterDatabaseMigration } from '../../services/database-migration-quiescence.js';
 import { aggregateTopologyReadiness } from '../../runtime/role-readiness.js';
 
@@ -176,7 +175,7 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
     });
 
 	// Recovery artifacts are a deliberately narrow object-store capability for
-	// CMS Retention. The request supplies neither a bucket nor arbitrary key;
+	// CMS recovery backups. The request supplies neither a bucket nor arbitrary key;
 	// only reserved, content-addressed system/recovery objects are accepted.
 	fastify.post<{ Body: { key?: string; sha256?: string; payload_base64?: string } }>(
 		'/internal/recovery-artifacts',
@@ -193,20 +192,25 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 			if (body.length === 0 || body.length > RECOVERY_ARTIFACT_MAX_BYTES || createHash('sha256').update(body).digest('hex') !== checksum) {
 				return reply.status(400).send({ message: 'recovery artifact checksum or size rejected' });
 			}
+			let created = false; let verified = false;
 			try {
-				if (await objectExists(key)) {
-					const existing = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
+				if (await objectExists(key, "backup")) {
+					const existing = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES, "backup");
 					if (createHash('sha256').update(existing).digest('hex') !== checksum) return reply.status(409).send({ message: 'recovery key already has different content' });
 				} else {
 					await uploadEncryptedRecoveryArtifact(key, body);
+					created = true;
 				}
 				if (!await recoveryArtifactEncryptionVerified(key)) return reply.status(409).send({ message: 'recovery artifact encryption could not be verified' });
-				const readback = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
+				const readback = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES, "backup");
 				if (createHash('sha256').update(readback).digest('hex') !== checksum) return reply.status(502).send({ message: 'recovery artifact readback mismatch' });
-				return reply.send({ data: { key, sha256: checksum, bytes: body.length, verified: true } });
+				verified = true;
+				return reply.send({ data: { key, sha256: checksum, bytes: body.length, verified } });
 			} catch (error) {
 				logger.warn('Recovery artifact operation failed', { key, error: error instanceof Error ? error.message : 'unknown' });
 				return reply.status(502).send({ message: 'recovery artifact storage unavailable' });
+			} finally {
+				if (created && !verified) await deleteObject(key, "backup").catch(() => logger.warn('Failed backup artifact cleanup', { key }));
 			}
 		},
 	);
@@ -215,7 +219,7 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		const key = String(request.body?.key ?? ''); const checksum = String(request.body?.sha256 ?? '').toLowerCase();
 		if (!validRecoveryArtifactRef(key, checksum)) return reply.status(400).send({ message: 'invalid recovery artifact reference' });
 		try {
-			const body = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES);
+			const body = await readObjectBuffer(key, RECOVERY_ARTIFACT_MAX_BYTES, "backup");
 			const verified = createHash('sha256').update(body).digest('hex') === checksum && await recoveryArtifactEncryptionVerified(key);
 			return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.length, verified } });
 		} catch { return reply.status(502).send({ message: 'recovery artifact unavailable' }); }
@@ -246,9 +250,10 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 			const key = databaseMigrationArtifactKey(programId, unitId, checksum, kind);
 			const byteCount = Number(request.headers['content-length'] ?? 0);
 			if (!key || !Number.isSafeInteger(byteCount) || byteCount < 1 || byteCount > DATABASE_MIGRATION_ARTIFACT_MAX_BYTES || typeof request.body?.pipe !== 'function') return reply.status(400).send({ message: 'invalid database migration artifact request' });
+			let created = false; let verified = false;
 			try {
-				if (await objectExists(key)) {
-					const existing = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES);
+				if (await objectExists(key, "backup")) {
+					const existing = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES, "backup");
 					const verified = existing.sha256 === checksum && await recoveryArtifactEncryptionVerified(key);
 					return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: existing.bytes, verified, idempotent: true } });
 				}
@@ -257,30 +262,34 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 				const counter = new Transform({ transform(chunk: Buffer, _encoding, callback) { streamed += chunk.length; if (streamed > DATABASE_MIGRATION_ARTIFACT_MAX_BYTES) return callback(new Error('artifact exceeds byte limit')); hash.update(chunk); callback(null, chunk); } });
 				request.body.pipe(counter);
 				await uploadEncryptedMigrationArtifact(key, counter, byteCount, kind === 'manifest' ? 'application/json' : 'application/octet-stream');
-				if (streamed !== byteCount || hash.digest('hex') !== checksum) { await deleteObject(key).catch(() => undefined); return reply.status(400).send({ message: 'database migration artifact checksum or size rejected' }); }
-				const readback = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES);
-				const verified = readback.sha256 === checksum && await recoveryArtifactEncryptionVerified(key);
+				created = true;
+				if (streamed !== byteCount || hash.digest('hex') !== checksum) { return reply.status(400).send({ message: 'database migration artifact checksum or size rejected' }); }
+				const readback = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES, "backup");
+				verified = readback.sha256 === checksum && await recoveryArtifactEncryptionVerified(key);
 				return reply.status(verified ? 200 : 502).send({ data: { key, sha256: checksum, bytes: streamed, verified, encrypted: verified } });
-			} catch (error) { logger.warn('Database migration artifact operation failed', { key, error: error instanceof Error ? error.message : 'unknown' }); return reply.status(502).send({ message: 'database migration artifact storage unavailable' }); }
+			} catch (error) { logger.warn('Database migration artifact operation failed', { key, error: error instanceof Error ? error.message : 'unknown' }); return reply.status(502).send({ message: 'database migration artifact storage unavailable' }); } finally {
+				if (created && !verified) await deleteObject(key, "backup").catch(() => logger.warn('Failed backup artifact cleanup', { key }));
+			}
 		},
 	);
 	fastify.post<{ Body: { key?: string; sha256?: string } }>('/internal/database-migration-artifacts/verify', async (request, reply) => {
 		const key = String(request.body?.key ?? ''); const checksum = String(request.body?.sha256 ?? '').toLowerCase();
 		if (!validDatabaseMigrationArtifactRef(key, checksum)) return reply.status(400).send({ message: 'invalid database migration artifact reference' });
-		try { const body = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES); const verified = body.sha256 === checksum && await recoveryArtifactEncryptionVerified(key); return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.bytes, verified, encrypted: verified } }); } catch { return reply.status(502).send({ message: 'database migration artifact unavailable' }); }
+		try { const body = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES, "backup"); const verified = body.sha256 === checksum && await recoveryArtifactEncryptionVerified(key); return reply.status(verified ? 200 : 409).send({ data: { key, sha256: checksum, bytes: body.bytes, verified, encrypted: verified } }); } catch { return reply.status(502).send({ message: 'database migration artifact unavailable' }); }
 	});
 	fastify.delete<{ Body: { key?: string; sha256?: string; approval_id?: string; retention_expired?: boolean } }>('/internal/database-migration-artifacts', async (request, reply) => {
 		const key = String(request.body?.key ?? ''); const checksum = String(request.body?.sha256 ?? '').toLowerCase(); const approval = String(request.body?.approval_id ?? '');
 		if (!validDatabaseMigrationArtifactRef(key, checksum) || !CANONICAL_UUID.test(approval) || request.body?.retention_expired !== true) return reply.status(400).send({ message: 'exact artifact, approval, and retention proof are required' });
-		try { const existing = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES); if (existing.sha256 !== checksum) return reply.status(409).send({ message: 'artifact checksum changed' }); await deleteObject(key); const absent = !await objectExists(key); return reply.status(absent ? 200 : 502).send({ data: { key, sha256: checksum, deleted: absent, approval_id: approval } }); } catch { return reply.status(502).send({ message: 'database migration artifact deletion unavailable' }); }
+		try { const existing = await readObjectDigest(key, DATABASE_MIGRATION_ARTIFACT_MAX_BYTES, "backup"); if (existing.sha256 !== checksum) return reply.status(409).send({ message: 'artifact checksum changed' }); await deleteObject(key, "backup"); const absent = !await objectExists(key, "backup"); return reply.status(absent ? 200 : 502).send({ data: { key, sha256: checksum, deleted: absent, approval_id: approval } }); } catch { return reply.status(502).send({ message: 'database migration artifact deletion unavailable' }); }
 	});
 
 	fastify.delete<{ Body: { key?: string } }>('/internal/recovery-artifacts', async (request, reply) => {
 		const key = String(request.body?.key ?? '');
 		if (!RECOVERY_ARTIFACT_PREFIX.test(key)) return reply.status(400).send({ message: 'invalid recovery artifact reference' });
 		try {
-			await deleteObject(key);
-			return reply.send({ data: { key, deleted: true } });
+			await deleteObject(key, "backup");
+			const absent = !await objectExists(key, "backup");
+			return reply.status(absent ? 200 : 502).send({ data: { key, deleted: absent } });
 		} catch { return reply.status(502).send({ message: 'recovery artifact deletion unavailable' }); }
 	});
 
@@ -436,48 +445,9 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		return reply.send({ data: { deleted_count: deletedCount, freed_bytes: freedBytes, errors: [], results, result_root: resultRoot, fencing_token: body.fencing_token } });
 	});
 
-	// Retention can request one bounded Storage-owner run. This endpoint does
-	// not accept candidate IDs: Storage reloads its policy and selects/rechecks
-	// its own candidates through CMS, preserving its single ownership boundary.
-	fastify.post<{ Body: { tenant_id?: string; owner?: string; action_class?: string; allowed_action_classes?: string[]; max_bytes?: number; max_items?: number; max_actions?: number; expires_at?: string; idempotency_key?: string; manifest_hash?: string; correlation_id?: string; owner_request_id?: string } }>('/internal/retention/storage/sweep', async (request, reply) => {
-		const tenantId = String(request.body?.tenant_id ?? '').trim();
-		const owner = String(request.body?.owner ?? '');
-		const actionClass = String(request.body?.action_class ?? '');
-		const allowedClasses = Array.isArray(request.body?.allowed_action_classes) ? request.body?.allowed_action_classes.map(String) : [];
-		const expiresAt = Date.parse(String(request.body?.expires_at ?? ''));
-		if (!tenantId || owner !== 'storage' || actionClass !== 'storage.request_bounded_run' || !allowedClasses.includes(actionClass) || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || !String(request.body?.idempotency_key ?? '').trim() || !String(request.body?.manifest_hash ?? '').trim()) return reply.status(400).send({ message: 'complete non-expired owner envelope is required' });
-		try {
-			const policies = await cmsClient.listStoragePolicies();
-			const policy = policies.all.find(row => row.tenant_id === tenantId) ?? policies.global;
-			if (!policy) return reply.status(404).send({ message: 'storage policy not found' });
-			const result = await runSweepForTenant({ ...policy, tenant_id: tenantId }, 'retention', {
-				maxBytes: Math.max(0, Number(request.body?.max_bytes ?? 0)) || undefined,
-				archiveAction: policy.archive_action === 'move_to_cold' ? 'move_to_cold' : 're_encode',
-				idempotencyKey: String(request.body?.idempotency_key),
-				manifestHash: String(request.body?.manifest_hash ?? '') || undefined,
-				correlationId: String(request.body?.correlation_id ?? '') || undefined,
-				ownerRequestId: String(request.body?.owner_request_id ?? '') || undefined,
-			});
-			const requestedMaxBytes = Number(request.body?.max_bytes ?? 0);
-			const actionCount = Number(result.deletedCount ?? 0) + Number(result.movedToColdCount ?? 0) + Number(result.reEncodedCount ?? 0);
-			const requestedMaxActions = Number(request.body?.max_actions ?? 0);
-			if (requestedMaxBytes > 0 && result.freedBytes > requestedMaxBytes) {
-				return reply.status(409).send({ message: 'storage owner exceeded the approved byte bound', freed_bytes: result.freedBytes, max_bytes: requestedMaxBytes });
-			}
-			if (requestedMaxActions > 0 && actionCount > requestedMaxActions) {
-				return reply.status(409).send({ message: 'storage owner exceeded the approved action bound', action_count: actionCount, max_actions: requestedMaxActions });
-			}
-			const requestedMaxItems = Number(request.body?.max_items ?? 0);
-			if (requestedMaxItems > 0 && actionCount > requestedMaxItems) {
-				return reply.status(409).send({ message: 'storage owner exceeded the approved item bound', action_count: actionCount, max_items: requestedMaxItems });
-			}
-			const resultHash = createHash('sha256').update(`${request.body?.manifest_hash}|${tenantId}|${result.deletedCount}|${result.freedBytes}|${actionCount}|${request.body?.owner_request_id ?? ''}`).digest('hex');
-			return reply.send({ data: { ...result, owner, action_class: actionClass, action_count: actionCount, request_hash: request.body?.manifest_hash, owner_request_id: request.body?.owner_request_id, result_hash: resultHash } });
-		} catch (error) {
-			logger.warn('Retention Storage owner request failed', { error: error instanceof Error ? error.message : 'unknown' });
-			return reply.status(502).send({ message: 'storage owner unavailable' });
-		}
-	});
+	// Retired compatibility route; internal service authentication still applies.
+	fastify.post('/internal/retention/storage/sweep', async (_request, reply) =>
+		reply.status(410).send({ code: 'retention_capability_retired', message: 'Use native Storage maintenance' }));
 
     fastify.post<{ Body: InternalRetryBody; Reply: InternalRetryResponse }>(
         '/internal/retry-pending',

@@ -43,6 +43,7 @@ const configSchema = z.object({
     // Required - Storage (S3-compatible) — primary/hot tier
     storageEndpoint: urlSchema.describe('S3-compatible storage endpoint'),
     storageBucket: z.string().min(1, 'Storage bucket name is required'),
+    backupStorageBucket: z.string().trim().min(1).optional(),
     storageAccessKey: z.string().default('minioadmin'),
     storageSecretKey: z.string().default('minioadmin'),
     storagePublicUrl: urlSchema.default('http://localhost:9000'),
@@ -177,6 +178,7 @@ function mapEnvToConfig(): Record<string, unknown> {
 
         storageEndpoint: process.env.STORAGE_ENDPOINT,
         storageBucket: process.env.STORAGE_BUCKET,
+        backupStorageBucket: process.env.BACKUP_STORAGE_BUCKET || undefined,
         storageAccessKey: process.env.STORAGE_ACCESS_KEY,
         storageSecretKey: process.env.STORAGE_SECRET_KEY,
         storagePublicUrl: process.env.STORAGE_PUBLIC_URL,

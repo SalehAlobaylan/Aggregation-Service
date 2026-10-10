@@ -10,6 +10,7 @@ import {
   DeleteObjectsCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  GetBucketEncryptionCommand,
   type PutObjectCommandInput,
   type _Object as S3Object,
   type ObjectIdentifier,
@@ -44,6 +45,7 @@ import {
 // -----------------------------------------------------------------------------
 
 export type StorageTier = "primary" | "cold";
+type ObjectStorageTier = StorageTier | "backup";
 
 const primaryClient = new S3Client({
   endpoint: config.storageEndpoint,
@@ -129,7 +131,14 @@ interface TierBinding {
   publicUrl: string;
 }
 
-function bindingFor(tier: StorageTier): TierBinding {
+function bindingFor(tier: ObjectStorageTier): TierBinding {
+  if (tier === "backup") {
+    const bucket = config.backupStorageBucket;
+    if (!bucket || bucket === config.storageBucket || bucket === config.coldStorageBucket) {
+      throw new Error("A separate private backup bucket is required");
+    }
+    return { client: primaryClient, bucket, publicUrl: "" };
+  }
   if (tier === "cold") {
     if (
       !coldClient ||
@@ -187,6 +196,7 @@ export function getPublicUrl(
   tier: StorageTier = "primary",
 ): string {
   const { publicUrl } = bindingFor(tier);
+  if (!publicUrl) throw new Error("Backup objects have no public URL");
   return `${publicUrl.replace(/\/$/, "")}/${key}`;
 }
 
@@ -210,7 +220,7 @@ function isMissingObjectError(error: unknown): boolean {
  */
 export async function objectExists(
   key: string,
-  tier: StorageTier = "primary",
+  tier: ObjectStorageTier = "primary",
   signal?: AbortSignal,
 ): Promise<boolean> {
   const { client, bucket } = bindingFor(tier);
@@ -465,14 +475,13 @@ export async function uploadBuffer(
   throw lastError || new Error("Upload failed after retries");
 }
 
-// Recovery artifacts are operator-only payloads. They use provider-managed
-// server-side encryption and callers verify the provider's HEAD response
-// before the CMS is allowed to ledger the artifact as recoverable.
+// All backup artifacts use the separate private bucket. Conditional creation
+// prevents a failed concurrent attempt from deleting an existing backup.
 export async function uploadEncryptedRecoveryArtifact(
   key: string,
   buffer: Buffer,
 ): Promise<void> {
-  const { client, bucket } = bindingFor("primary");
+  const { client, bucket } = bindingFor("backup");
   await client.send(
     new PutObjectCommand({
       Bucket: bucket,
@@ -481,6 +490,7 @@ export async function uploadEncryptedRecoveryArtifact(
       ContentType: "application/gzip",
       ContentLength: buffer.length,
       ServerSideEncryption: "AES256",
+      IfNoneMatch: "*",
     }),
   );
 }
@@ -491,7 +501,7 @@ export async function uploadEncryptedMigrationArtifact(
   size: number,
   contentType: string,
 ): Promise<void> {
-  const { client, bucket } = bindingFor("primary");
+  const { client, bucket } = bindingFor("backup");
   await client.send(
     new PutObjectCommand({
       Bucket: bucket,
@@ -500,6 +510,7 @@ export async function uploadEncryptedMigrationArtifact(
       ContentType: contentType,
       ContentLength: size,
       ServerSideEncryption: "AES256",
+      IfNoneMatch: "*",
     }),
   );
 }
@@ -507,14 +518,19 @@ export async function uploadEncryptedMigrationArtifact(
 export async function recoveryArtifactEncryptionVerified(
   key: string,
 ): Promise<boolean> {
-  const { client, bucket } = bindingFor("primary");
+  const { client, bucket } = bindingFor("backup");
   const head = await client.send(
     new HeadObjectCommand({ Bucket: bucket, Key: key }),
   );
-  return (
-    head.ServerSideEncryption === "AES256" ||
-    head.ServerSideEncryption === "aws:kms"
-  );
+  if (head.ServerSideEncryption === "AES256" || head.ServerSideEncryption === "aws:kms") return true;
+  // R2 encrypts automatically but omits the S3 object encryption header.
+  // Require the provider's positive bucket encryption proof on its HTTPS API.
+  const endpoint = new URL(config.storageEndpoint);
+  if (endpoint.protocol !== "https:" || !/^[a-f0-9]{32}\.r2\.cloudflarestorage\.com$/.test(endpoint.hostname)) return false;
+  const encryption = await client.send(new GetBucketEncryptionCommand({ Bucket: bucket }));
+  return encryption.ServerSideEncryptionConfiguration?.Rules?.some(
+    rule => rule.ApplyServerSideEncryptionByDefault?.SSEAlgorithm === "AES256",
+  ) === true;
 }
 
 // Recovery artifacts are private system objects. Callers never receive a
@@ -522,7 +538,7 @@ export async function recoveryArtifactEncryptionVerified(
 export async function readObjectBuffer(
   key: string,
   maxBytes: number,
-  tier: StorageTier = "primary",
+  tier: ObjectStorageTier = "primary",
 ): Promise<Buffer> {
   const { client, bucket } = bindingFor(tier);
   const response = await client.send(
@@ -543,7 +559,7 @@ export async function readObjectBuffer(
 export async function readObjectDigest(
   key: string,
   maxBytes: number,
-  tier: StorageTier = "primary",
+  tier: ObjectStorageTier = "primary",
   signal?: AbortSignal,
 ): Promise<{ bytes: number; sha256: string }> {
   const { createHash } = await import("node:crypto");
@@ -906,7 +922,7 @@ export async function deletePodsResetObjectsExact(
  */
 export async function deleteObject(
   key: string,
-  tier: StorageTier = "primary",
+  tier: ObjectStorageTier = "primary",
 ): Promise<number> {
   const { client, bucket } = bindingFor(tier);
   let size = 0;
