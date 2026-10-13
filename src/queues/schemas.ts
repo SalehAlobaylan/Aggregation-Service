@@ -185,6 +185,7 @@ export interface MediaJob {
  * AI Job - handles transcript, embedding, and image-embedding generation
  */
 export interface AIJob {
+  tenantId?: string;
   contentItemId: string;
   contentType: ContentType;
   operations: ("transcript" | "embedding")[];

@@ -196,6 +196,7 @@ export const createReconcileWorker = () => createWorker({
         let enqueued = 0;
         for (const item of items) {
             const aiJob: AIJob = {
+                tenantId:item.tenant_id,
                 contentItemId: item.id,
                 contentType: item.type as AIJob['contentType'],
                 operations: ['embedding'], // embedding-only — no re-transcribe

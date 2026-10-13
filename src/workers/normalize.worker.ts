@@ -552,6 +552,7 @@ export const createNormalizeWorker = () => createWorker({
                                 `ai-text-article-${contentItemId}`,
                                 {
                                     contentItemId,
+                                    tenantId,
                                     contentType: normalized.type,
                                     operations: ['embedding'],
                                     textContent: {

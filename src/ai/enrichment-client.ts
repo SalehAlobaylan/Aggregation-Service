@@ -40,6 +40,13 @@ function tracingHeaders(requestId?: string): Record<string, string> {
     return requestId ? { 'X-Request-ID': requestId } : {};
 }
 
+export interface AISpendContext {
+    tenant_id: string;
+    trigger_source: string;
+    system_run_id?: string;
+    override_id?: string;
+}
+
 export interface EmbedResult {
     /** Qwen3 dense text embedding vector (1024 dimensions in the current Wahb stack). */
     embedding: number[];
@@ -105,6 +112,7 @@ export interface GeneratedChapterPlan {
 export async function generateChaptersViaEnrichment(
     windows: ChapterWindowPayload[],
     opts: {
+        spendContext?: AISpendContext;
         requestId?: string;
         language?: string | null;
         maxChapters?: number;
@@ -118,6 +126,7 @@ export async function generateChaptersViaEnrichment(
         method: 'POST',
         body: JSON.stringify({
             windows,
+            spend_context: opts.spendContext,
             mode: opts.maxChapters ? 'count' : 'auto',
             target_count: opts.maxChapters,
             min_sec: opts.minSec,
@@ -136,8 +145,12 @@ export async function generateChaptersViaEnrichment(
 
     if (!response.ok) {
         const errorText = await response.text().catch(() => '');
-        throw new Error(
-            `Enrichment /v1/chapters/generate failed: ${response.status} ${response.statusText} - ${errorText}`,
+        let payload: EnrichmentErrorPayload = {};
+        try { payload = JSON.parse(errorText) as EnrichmentErrorPayload; } catch { /* bounded error */ }
+        throw new EnrichmentRequestError(
+            `Chapter planning declined: ${payload.error ?? response.statusText}`,
+            response.status, payload.retryable ?? response.status >= 500,
+            payload.retry_after_seconds, payload.error_code,
         );
     }
 
@@ -160,6 +173,7 @@ export async function generateEmbeddingViaEnrichment(
     text: string,
     contentItemId?: string,
     opts: {
+        spendContext?: AISpendContext;
         requestId?: string;
         extractTags?: boolean;
         signal?: AbortSignal;
@@ -177,12 +191,14 @@ export async function generateEmbeddingViaEnrichment(
 ): Promise<EmbedResult> {
     const body: {
         texts: string[];
+        spend_context?: AISpendContext;
         content_ids?: string[];
         extract_tags?: boolean;
         pipeline_repair?: NonNullable<typeof opts.pipelineRepair>;
 		lane?: 'news' | 'pods';
 		content_stage?: ContentStageCorrelation;
     } = { texts: [text] };
+    body.spend_context = opts.spendContext;
     if (contentItemId) body.content_ids = [contentItemId];
     if (opts.extractTags) body.extract_tags = true;
     if (opts.pipelineRepair) body.pipeline_repair = opts.pipelineRepair;
@@ -271,11 +287,11 @@ export async function generateEmbeddingViaEnrichment(
 export async function generateMetadataViaEnrichment(
 	text: string,
 	contentItemId: string,
-	opts: { requestId?: string; contentStage: ContentStageCorrelation; signal?: AbortSignal },
+	opts: { spendContext?: AISpendContext; requestId?: string; contentStage: ContentStageCorrelation; signal?: AbortSignal },
 ): Promise<{ writeBackStatus: string; writeBackError?: string }> {
 	const response = await fetch(`${baseUrl()}/v1/summarize`, {
 		method: 'POST',
-		body: JSON.stringify({ text: text.slice(0, 12_000), max_length: 200, style: 'brief', content_id: contentItemId, content_stage: opts.contentStage }),
+		body: JSON.stringify({ spend_context: opts.spendContext, text: text.slice(0, 12_000), max_length: 200, style: 'brief', content_id: contentItemId, content_stage: opts.contentStage }),
 		headers: { 'Content-Type': 'application/json', ...authHeaders(), ...tracingHeaders(opts.requestId) },
 		signal: requestSignal(opts.signal, EMBED_TIMEOUT_MS),
 	});

@@ -1770,6 +1770,7 @@ async function enqueueAIJob(
       contentItemId,
       contentType,
       operations,
+      tenantId: job.data.tenantId,
       textContent: job.data.textContent ?? { title: "" },
       mediaUrl,
       transcriptionUrl: options.transcriptionUrl ?? mediaUrl,

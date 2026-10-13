@@ -22,7 +22,7 @@ describe('generateEmbeddingViaEnrichment', () => {
         const result = await generateEmbeddingViaEnrichment(
             'hello',
             'content-id',
-            { requestId: 'job-1', extractTags: true },
+            { requestId: 'job-1', extractTags: true, spendContext: {tenant_id:'tenant-a',trigger_source:'embedding_campaign',system_run_id:'campaign-7'} },
         );
 
         expect(result.writeBackStatus).toBe('ok');
@@ -32,6 +32,7 @@ describe('generateEmbeddingViaEnrichment', () => {
             texts: ['hello'],
             content_ids: ['content-id'],
             extract_tags: true,
+            spend_context: {tenant_id:'tenant-a',trigger_source:'embedding_campaign',system_run_id:'campaign-7'},
         });
         expect(body).not.toHaveProperty('extract_sparse');
     });

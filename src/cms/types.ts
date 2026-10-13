@@ -1027,6 +1027,7 @@ export interface ApiResponse<T> {
 
 /** One READY item still missing a dense embedding (reconciliation sweep). */
 export interface MissingEmbeddingItem {
+ tenant_id?: string;
   id: string;
   type: string;
   title: string | null;

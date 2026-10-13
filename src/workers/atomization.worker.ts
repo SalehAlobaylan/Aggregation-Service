@@ -28,7 +28,7 @@ import {
   type StorageTier,
 } from "../storage/client.js";
 import { uploadFileWithManifest } from "../storage/manifest.js";
-import { generateChaptersViaEnrichment } from "../ai/enrichment-client.js";
+import { generateChaptersViaEnrichment, EnrichmentRequestError } from "../ai/enrichment-client.js";
 import type {
   AtomizationChapter,
   AtomizationInputResponse,
@@ -226,6 +226,7 @@ export const createAtomizationWorker = () => createWorker({
         } else {
           const windows = buildWindows(input.segments);
           const generated = await generateChaptersViaEnrichment(windows, {
+            spendContext: { tenant_id: input.item.tenant_id, trigger_source: "media_atomization", system_run_id: stageClaim?.request_id ?? governed!.id },
             requestId: job.id,
             language: input.transcript.language,
             // Context determines count. A density preference must not force
@@ -238,6 +239,7 @@ export const createAtomizationWorker = () => createWorker({
             // This call precedes generation persistence, download and cuts.
             // A failed planner response is not an uncertain media upload.
             if (signal?.aborted) throw cause;
+            if (cause instanceof EnrichmentRequestError && cause.errorCode === "AI_BUDGET_CAPPED") throw cause;
             const detail = cause instanceof Error ? cause.message : "Planner unavailable";
             throw new ChapterPlanningError(`Chapter planning failed: ${detail.slice(0, 1500)}`);
           });
@@ -867,6 +869,11 @@ attemptId: stageClaim?.attempt_id ?? governed?.attemptId,
         jobLogger.info("Discarded stale or non-claimable atomization-stage delivery", {
           requestId: stageClaim.request_id,
         });
+        return;
+      }
+      if (error instanceof EnrichmentRequestError && error.errorCode === "AI_BUDGET_CAPPED") {
+        if (stageClaim) await cmsClient.deferContentStage(stageClaim, 300, "budget_capped: contextual planning paused", job.id);
+        else if (governed) await cmsClient.deferAtomizationWork({ id: governed.id, claimToken: governed.claimToken, fenceToken: governed.fenceToken, retryAfterSec: 300, summary: "budget_capped: contextual planning paused" }, job.id, signal);
         return;
       }
       if (error instanceof ResourceDeferredError && governed) {

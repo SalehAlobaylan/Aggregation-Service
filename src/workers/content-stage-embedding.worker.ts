@@ -14,6 +14,7 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 		return;
 	}
 	const correlation = contentStageCorrelation(claim);
+ const spendContext = { tenant_id: claim.tenant_id, trigger_source: "content_pipeline", system_run_id: claim.request_id };
 	let heartbeat: NodeJS.Timeout | undefined;
 	let stageBegun = false;
 	try {
@@ -30,9 +31,10 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 		}
 		const metadataStage = claim.stage === 'news_llm_metadata' || claim.stage === 'pods_llm_metadata';
 		const result = metadataStage
-			? await generateMetadataViaEnrichment(text, claim.content_item_id, { requestId: job.id, contentStage: correlation, signal })
+			? await generateMetadataViaEnrichment(text, claim.content_item_id, { spendContext, requestId: job.id, contentStage: correlation, signal })
 			: await generateEmbeddingViaEnrichment(text, claim.content_item_id, {
-				requestId: job.id,
+				spendContext,
+                requestId: job.id,
 				extractTags: false,
 				lane: claim.lane,
 				contentStage: correlation,
@@ -48,6 +50,10 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 			jobLogger.info('Discarded stale or non-claimable content-stage delivery', { requestId: claim.request_id });
 			return;
 		}
+        if (error instanceof EnrichmentRequestError && error.errorCode === 'AI_BUDGET_CAPPED') {
+            await cmsClient.deferContentStage(claim, 300, 'budget_capped: new paid metadata admission paused', job.id);
+            return;
+        }
 		if (error instanceof EnrichmentRequestError && error.status === 429) {
 			await cmsClient.deferContentStage(claim, error.retryAfterSeconds ?? 1, 'Enrichment lane capacity deferred', job.id);
 			return;

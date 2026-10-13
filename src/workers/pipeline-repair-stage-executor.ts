@@ -254,6 +254,7 @@ async function textEmbedding(
   if (!text.trim())
     throw new Error("CMS repair command has no text for text_embedding");
   const result = await generateEmbeddingViaEnrichment(text, job.contentItemId, {
+    spendContext: { tenant_id: job.tenantId, trigger_source: "pipeline_repair", system_run_id: job.repairId },
     requestId: job.deterministicJobId,
     extractTags: job.content.type === "VIDEO" || job.content.type === "PODCAST",
     signal,

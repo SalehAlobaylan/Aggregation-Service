@@ -1,3 +1,4 @@
+import type { AISpendContext } from "./enrichment-client.js";
 /**
  * Media-Service HTTP client.
  *
@@ -312,10 +313,11 @@ export interface ImageEmbedResult {
 export async function embedImageViaMedia(
     imageUrl: string,
     contentItemId?: string,
-    opts: { requestId?: string; signal?: AbortSignal } = {},
+    opts: { requestId?: string; signal?: AbortSignal; spendContext?: AISpendContext } = {},
 ): Promise<ImageEmbedResult> {
     const form = new FormData();
     form.append('url', imageUrl);
+    if (opts.spendContext) form.append('spend_context_json', JSON.stringify(opts.spendContext));
     if (contentItemId) form.append('content_id', contentItemId);
 
     const response = await fetch(`${baseUrl()}/v1/embed/image`, {
