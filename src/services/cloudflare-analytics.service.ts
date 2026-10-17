@@ -12,10 +12,9 @@
  * CLOUDFLARE_API_TOKEN, or CLOUDFLARE_R2_BUCKET_NAME is unset, `start...`
  * silently no-ops and the Operations panel just shows internal counts only.
  *
- * CF data lags real time by ~30 minutes. We pull yesterday + today on each
- * tick so late-arriving data backfills correctly. CMS UPSERT is additive,
- * so we MUST NOT re-pull the same window twice in a row — we track the last
- * pulled hour to avoid double-counting.
+ * CF data lags real time. We repair up to four missing hours within a 48-hour
+ * horizon plus two recent correction windows on each tick. CMS persists revision-aware replacement;
+ * retries and restarts cannot add the same window twice.
  */
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
@@ -27,13 +26,7 @@ const CF_GRAPHQL_URL = 'https://api.cloudflare.com/client/v4/graphql';
 
 let timer: NodeJS.Timeout | null = null;
 let bootstrapTimer: NodeJS.Timeout | null = null;
-// Track per-date hourly windows we've already pulled, so a re-tick within the
-// same hour doesn't double-count. Key: `${date}|${hour}`. In-memory only —
-// on restart we re-pull the current day's data, which CMS UPSERT will simply
-// add to existing counts (over-count), so we offset by a known window: only
-// pull complete hours that ended >= 1h ago. See pullOnce().
-const pulledHours = new Set<string>();
-
+// CMS persists exact-hour replacement windows; retries and restarts are safe.
 export function startCloudflareAnalyticsPuller(): void {
     if (!isConfigured()) {
         logger.info('Cloudflare Analytics puller: not configured (CLOUDFLARE_* env vars missing); skipping');
@@ -81,41 +74,30 @@ export async function pullOnce(): Promise<void> {
 
     // Pull the hour that ended at least 1 hour ago (CF data lag).
     const now = new Date();
-    const targetEnd = new Date(now.getTime() - 60 * 60 * 1000);
-    const targetStart = new Date(targetEnd.getTime() - 60 * 60 * 1000);
-    const dateKey = targetStart.toISOString().slice(0, 10);
-    const hourKey = targetStart.toISOString().slice(0, 13);
-
-    if (pulledHours.has(hourKey)) {
-        logger.debug('Cloudflare Analytics puller: hour already pulled, skipping', { hourKey });
-        return;
-    }
-
+    const targetEnd = new Date(Math.floor(now.getTime()/3_600_000)*3_600_000 - 3_600_000);
+    const scope = `${config.cloudflareAccountId}/${config.cloudflareR2BucketName}`;
     try {
-        const items = await fetchHourlyOps(targetStart, targetEnd);
-        if (items.length === 0) {
-            logger.debug('Cloudflare Analytics puller: no ops for window', { hourKey });
-            pulledHours.add(hourKey);
-            return;
+        const receiver = await cmsClient.getEconomicsCollection(scope);
+        if (receiver.storage_window_version !== 1 || receiver.environment !== (process.env.WAHB_ENVIRONMENT_ID?.trim() || 'unmapped')) {
+            logger.warn('Cloudflare analytics waiting for durable CMS window receiver'); return;
         }
-        await cmsClient.writeOpMetrics({
-            source: 'cloudflare',
-            date: dateKey,
-            items,
-        });
-        pulledHours.add(hourKey);
-        logger.info('Cloudflare Analytics puller: flushed hour', {
-            hourKey,
-            rows: items.length,
-        });
+        // At most four missing hours plus recent overlap for provider corrections.
+        // Older-than-48-hour outages remain a disclosed gap, never guessed zeros.
+        const recent = [1, 2].map(n => new Date(targetEnd.getTime()-n*3_600_000).toISOString());
+        const starts = [...new Set([...(receiver.storage_missing_hours ?? []).slice(0, 4), ...recent])];
+        for (const raw of starts) {
+            const start = new Date(raw);
+            if (!Number.isFinite(start.getTime()) || start.getTime()%3_600_000 !== 0 || start.getTime()>targetEnd.getTime()-3_600_000 || start.getTime()<now.getTime()-49*3_600_000) throw new Error('Invalid durable storage window');
+            const end = new Date(start.getTime()+3_600_000);
+            const items = await fetchHourlyOps(start, end);
+            await cmsClient.writeOpMetrics({ source: 'cloudflare', tenant_id: receiver.tenant_id,
+                window_start: start.toISOString(), window_end: end.toISOString(), window_key: scope,
+                date: start.toISOString().slice(0,10), items });
+        }
+        logger.info('Cloudflare Analytics puller: committed bounded windows', { windows: starts.length });
     } catch (err) {
-        // Telemetry — non-fatal. We do NOT mark the hour as pulled, so the next
-        // tick will retry. Worst case is the same hour gets double-counted if
-        // the failure was actually a successful CMS write that we missed the
-        // response from; we accept this for now.
-        logger.warn('Cloudflare Analytics puller: pull failed (will retry next tick)', {
+        logger.warn('Cloudflare Analytics puller: pull unavailable; durable missing windows retry next tick', {
             err: err instanceof Error ? err.message : String(err),
-            hourKey,
         });
     }
 }
@@ -156,9 +138,10 @@ async function fetchHourlyOps(start: Date, end: Date): Promise<OpMetricItem[]> {
             'Authorization': `Bearer ${config.cloudflareApiToken!}`,
         },
         body: JSON.stringify({ query, variables }),
+        signal: AbortSignal.timeout(10_000),
     });
     if (!resp.ok) {
-        throw new Error(`Cloudflare GraphQL ${resp.status}: ${await resp.text()}`);
+        throw new Error(`Cloudflare GraphQL unavailable (HTTP ${resp.status})`);
     }
     type CfResp = {
         data?: {
@@ -173,17 +156,30 @@ async function fetchHourlyOps(start: Date, end: Date): Promise<OpMetricItem[]> {
         };
         errors?: Array<{ message: string }>;
     };
-    const body = (await resp.json()) as CfResp;
+    if (!resp.body) throw new Error('Cloudflare response body unavailable');
+    const reader=resp.body.getReader();const chunks:Uint8Array[]=[];let bytes=0;
+    try {
+        for (;;) { const next=await reader.read(); if (next.done) break;
+            bytes+=next.value.byteLength;
+            if (bytes>2*1024*1024) { await reader.cancel(); throw new Error('Cloudflare response exceeds bounded window'); }
+            chunks.push(next.value);
+        }
+    } finally { reader.releaseLock(); }
+    const buffer=new Uint8Array(bytes);let offset=0;for (const chunk of chunks) {buffer.set(chunk,offset);offset+=chunk.byteLength;}
+    const body = JSON.parse(new TextDecoder().decode(buffer)) as CfResp;
     if (body.errors && body.errors.length > 0) {
         throw new Error(`Cloudflare GraphQL errors: ${body.errors.map(e => e.message).join('; ')}`);
     }
-    const groups = body.data?.viewer?.accounts?.[0]?.r2OperationsAdaptiveGroups ?? [];
+    const accounts = body.data?.viewer?.accounts;
+    const groups = accounts?.[0]?.r2OperationsAdaptiveGroups;
+    if (!accounts || accounts.length !== 1 || !Array.isArray(groups) || groups.length >= 100) throw new Error('Cloudflare window scope or coverage unavailable');
 
     const items: OpMetricItem[] = [];
     for (const g of groups) {
         const action = g.dimensions?.actionType ?? 'OTHER';
-        const count = g.sum?.requests ?? 0;
-        if (count <= 0) continue;
+        const count = g.sum?.requests;
+        if (count == null || !Number.isSafeInteger(count) || count < 0 || count > 1e15) throw new Error('Invalid Cloudflare operation count');
+        if (count === 0) continue;
         const mapped = mapCfActionType(action);
         items.push({ tier: 'primary', op_class: mapped.opClass, op_type: mapped.opType, count });
     }
@@ -195,7 +191,7 @@ async function fetchHourlyOps(start: Date, end: Date): Promise<OpMetricItem[]> {
  * documented at https://developers.cloudflare.com/r2/platform/metrics-analytics/
  * — values include: ListBuckets, ListObjects, WriteObject, ReadObject, etc.
  */
-function mapCfActionType(action: string): { opClass: 'A' | 'B'; opType: OpMetricItem['op_type'] } {
+function mapCfActionType(action: string): { opClass: 'A' | 'B' | 'F' | 'U'; opType: OpMetricItem['op_type'] } {
     switch (action) {
         case 'ListBuckets':
         case 'ListObjects':
@@ -209,14 +205,15 @@ function mapCfActionType(action: string): { opClass: 'A' | 'B'; opType: OpMetric
         case 'CopyObject':
             return { opClass: 'A', opType: 'COPY' };
         case 'DeleteObject':
-            return { opClass: 'A', opType: 'DELETE' };
+            return { opClass: 'F', opType: 'DELETE' };
         case 'DeleteObjects':
-            return { opClass: 'A', opType: 'DELETE_OBJECTS' };
+            return { opClass: 'F', opType: 'DELETE_OBJECTS' };
         case 'CreateMultipartUpload':
         case 'UploadPart':
         case 'CompleteMultipartUpload':
-        case 'AbortMultipartUpload':
             return { opClass: 'A', opType: 'OTHER' };
+        case 'AbortMultipartUpload':
+            return { opClass: 'F', opType: 'OTHER' };
         case 'ReadObject':
         case 'GetObject':
             return { opClass: 'B', opType: 'GET' };
@@ -224,6 +221,6 @@ function mapCfActionType(action: string): { opClass: 'A' | 'B'; opType: OpMetric
         case 'HeadBucket':
             return { opClass: 'B', opType: 'HEAD' };
         default:
-            return { opClass: 'B', opType: 'OTHER' };
+            return { opClass: 'U', opType: 'OTHER' };
     }
 }

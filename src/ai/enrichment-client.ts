@@ -41,6 +41,7 @@ function tracingHeaders(requestId?: string): Record<string, string> {
 }
 
 export interface AISpendContext {
+    economics_attribution_ref?: string;
     tenant_id: string;
     trigger_source: string;
     system_run_id?: string;

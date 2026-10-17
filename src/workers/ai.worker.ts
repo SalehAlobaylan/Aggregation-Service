@@ -206,7 +206,7 @@ export const createLegacyAIWorker = () => createWorker({
                             {
                                 requestId: job.id,
                                 extractTags: wantsTagExtraction,
-                                spendContext: { tenant_id: job.data.tenantId ?? "default", trigger_source: "ingest_ai", system_run_id: job.id },
+                                spendContext: { economics_attribution_ref: `content:${contentItemId}`, tenant_id: job.data.tenantId ?? "default", trigger_source: "ingest_ai", system_run_id: job.id },
                                 signal,
                             },
                         );
@@ -244,7 +244,7 @@ export const createLegacyAIWorker = () => createWorker({
                     const imgResult = await embedImageViaMedia(
                         heroImageUrl,
                         contentItemId,
-                        { requestId: job.id, signal, spendContext: { tenant_id:job.data.tenantId ?? "default", trigger_source:"ingest_ai",system_run_id:job.id } },
+                        { requestId: job.id, signal, spendContext: { economics_attribution_ref: `content:${contentItemId}`, tenant_id:job.data.tenantId ?? "default", trigger_source:"ingest_ai",system_run_id:job.id } },
                     );
                     jobLogger.info('Image embedding generated and written by Media-Service', {
                         contentItemId,

@@ -14,7 +14,7 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 		return;
 	}
 	const correlation = contentStageCorrelation(claim);
- const spendContext = { tenant_id: claim.tenant_id, trigger_source: "content_pipeline", system_run_id: claim.request_id };
+ const spendContext = { economics_attribution_ref: `content:${claim.content_item_id}`, tenant_id: claim.tenant_id, trigger_source: "content_pipeline", system_run_id: claim.request_id };
 	let heartbeat: NodeJS.Timeout | undefined;
 	let stageBegun = false;
 	try {

@@ -10,15 +10,12 @@
  * Map and POST it to CMS for persistence. If Aggregation crashes between
  * flushes, the in-flight bucket is lost (acceptable for telemetry).
  *
- * Class A vs Class B follows Cloudflare R2's published taxonomy (which also
- * matches AWS S3 billing classes):
- *   Class A: PUT, COPY, POST, LIST, DELETE multi (any state-mutating call
- *            and listings; the expensive class).
- *   Class B: GET, HEAD (the cheap class — but dominant at scale).
+ * R2 taxonomy: A writes/listings, B reads, F free deletes/abort, U unknown.
+ * These approximate SDK counts overlap provider analytics and are not bills.
  */
 import type { S3Client } from '@aws-sdk/client-s3';
 
-export type OpClass = 'A' | 'B';
+export type OpClass = 'A' | 'B' | 'F' | 'U';
 export type OpType =
     | 'PUT'
     | 'GET'
@@ -43,8 +40,7 @@ const counters = new Map<string, number>();
 
 /**
  * Map an AWS SDK command name to its billing class + op type. Unknown commands
- * are bucketed as 'B/OTHER' since the SDK is overwhelmingly read-shaped (a
- * misclassification here is the cheaper direction for the budget).
+ * stay unknown; no billable class or free price is inferred.
  */
 function classify(commandName: string): { opClass: OpClass; opType: OpType } {
     switch (commandName) {
@@ -53,24 +49,25 @@ function classify(commandName: string): { opClass: OpClass; opType: OpType } {
         case 'CopyObjectCommand':
             return { opClass: 'A', opType: 'COPY' };
         case 'DeleteObjectCommand':
-            return { opClass: 'A', opType: 'DELETE' };
+            return { opClass: 'F', opType: 'DELETE' };
         case 'DeleteObjectsCommand':
-            return { opClass: 'A', opType: 'DELETE_OBJECTS' };
+            return { opClass: 'F', opType: 'DELETE_OBJECTS' };
         case 'ListObjectsV2Command':
         case 'ListObjectsCommand':
             return { opClass: 'A', opType: 'LIST' };
         case 'CreateMultipartUploadCommand':
         case 'UploadPartCommand':
         case 'CompleteMultipartUploadCommand':
-        case 'AbortMultipartUploadCommand':
             return { opClass: 'A', opType: 'OTHER' };
+        case 'AbortMultipartUploadCommand':
+            return { opClass: 'F', opType: 'OTHER' };
         case 'HeadObjectCommand':
         case 'HeadBucketCommand':
             return { opClass: 'B', opType: 'HEAD' };
         case 'GetObjectCommand':
             return { opClass: 'B', opType: 'GET' };
         default:
-            return { opClass: 'B', opType: 'OTHER' };
+            return { opClass: 'U', opType: 'OTHER' };
     }
 }
 

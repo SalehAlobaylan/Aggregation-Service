@@ -2468,6 +2468,10 @@ export const cmsClient = {
    * `count` to the existing daily row, so re-flushing the same delta is
    * NOT idempotent — caller must already have drained its in-memory bucket.
    */
+  async getEconomicsCollection(storageScope?:string):Promise<{environment?:string;tenant_id?:string;storage_window_version?:number;storage_missing_hours?:string[]}> {
+    return makeRequest<{environment?:string;tenant_id?:string;storage_window_version?:number;storage_missing_hours?:string[]}>("GET",`/internal/economics/collection${storageScope ? `?storage_scope=${encodeURIComponent(storageScope)}` : ''}`);
+  },
+
   async writeOpMetrics(
     data: WriteOpMetricsRequest,
     requestId?: string,

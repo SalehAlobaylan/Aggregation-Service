@@ -604,7 +604,7 @@ export interface AtomizationRunReportResponse {
 
 export interface OpMetricItem {
   tier: "primary" | "cold";
-  op_class: "A" | "B";
+  op_class: "A" | "B" | "F" | "U";
   op_type:
     | "PUT"
     | "GET"
@@ -618,6 +618,9 @@ export interface OpMetricItem {
 }
 
 export interface WriteOpMetricsRequest {
+  window_start?: string;
+  window_end?: string;
+  window_key?: string;
   source: "internal" | "cloudflare";
   /** YYYY-MM-DD */
   date: string;

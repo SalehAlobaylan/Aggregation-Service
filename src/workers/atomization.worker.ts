@@ -226,7 +226,7 @@ export const createAtomizationWorker = () => createWorker({
         } else {
           const windows = buildWindows(input.segments);
           const generated = await generateChaptersViaEnrichment(windows, {
-            spendContext: { tenant_id: input.item.tenant_id, trigger_source: "media_atomization", system_run_id: stageClaim?.request_id ?? governed!.id },
+            spendContext: { economics_attribution_ref: `content:${contentItemId}`, tenant_id: input.item.tenant_id, trigger_source: "media_atomization", system_run_id: stageClaim?.request_id ?? governed!.id },
             requestId: job.id,
             language: input.transcript.language,
             // Context determines count. A density preference must not force
