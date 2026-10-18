@@ -27,12 +27,14 @@ vi.mock('../../src/services/rate-limiter.js', () => ({
 
 import {
     classifyTelegramError,
+    createTelegramClient,
     resetTelegramClientFactoryForTest,
     setTelegramClientFactoryForTest,
     wrapTelegramMediaDownloadError,
 } from '../../src/services/telegram-client.js';
 import { telegramFetcher } from '../../src/fetchers/telegram.fetcher.js';
 import type { TelegramSourceConfig } from '../../src/fetchers/types.js';
+import { withSourceProviderIO } from '../../src/services/source-provider-io.js';
 
 describe('telegram error handling', () => {
     afterEach(() => {
@@ -52,6 +54,32 @@ describe('telegram error handling', () => {
     it('wraps transient media download errors with a stable reason', () => {
         const wrapped = wrapTelegramMediaDownloadError(new Error('TIMEOUT'));
         expect(wrapped.message).toContain('telegram_media_download_timeout');
+    });
+
+    it('counts pagination RPCs but not cached entity reads, with an instance-local cap', async () => {
+        const invoke = vi.fn(async () => 'page');
+        setTelegramClientFactoryForTest(() => ({
+            invoke,
+            connect: vi.fn(async () => undefined),
+            disconnect: vi.fn(async () => undefined),
+            getEntity: vi.fn(async () => 'cached-channel'),
+            iterMessages: vi.fn(),
+            getMessages: vi.fn(),
+            downloadMedia: vi.fn(),
+        }));
+        const client = createTelegramClient();
+        const started = vi.fn(async () => undefined);
+        await withSourceProviderIO(1, started, () => {}, async () => {
+            await client.getEntity('cached-channel');
+            expect(started).not.toHaveBeenCalled();
+            await expect(client.invoke!({ page: 1 })).resolves.toBe('page');
+            await expect(client.invoke!({ page: 2 })).rejects.toThrow('budget exhausted');
+        });
+        expect(invoke).toHaveBeenCalledTimes(1);
+        expect(started).toHaveBeenCalledExactlyOnceWith(1);
+        // Other jobs have no source-run context and retain the normal SDK behavior.
+        await expect(createTelegramClient().invoke!({ page: 2 })).resolves.toBe('page');
+        expect(invoke).toHaveBeenCalledTimes(2);
     });
 
     it('throws on transient fetch timeout so the source job is retried', async () => {

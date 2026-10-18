@@ -1,3 +1,4 @@
+import { sourceProviderFetch as fetch } from '../services/source-provider-io.js';
 /**
  * Twitter/X Fetcher
  * Adapter interface supporting API or scraping modes
@@ -45,7 +46,7 @@ const scrapeAdapter: TwitterAdapter = {
         const rateCheck = await rateLimiter.consumeRateLimit('TWITTER', config.id);
         if (!rateCheck.allowed) {
             logger.warn('Twitter scrape rate limit exceeded', { sourceId: config.id });
-            return { items: [], hasMore: false, metadata: { totalFetched: 0, skipped: 0, errors: 0, reason: 'Local rate limit hit — wait a moment and retry.' } };
+            return { items: [], hasMore: false, metadata: { totalFetched: 0, skipped: 0, errors: 0, unavailable: true, reason: 'Local rate limit hit — wait a moment and retry.' } };
         }
 
         const { minEngagement = 0, skipRetweets = false, skipReplies = false } = config.settings;

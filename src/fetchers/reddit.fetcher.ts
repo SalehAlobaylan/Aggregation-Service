@@ -1,3 +1,4 @@
+import { sourceProviderFetch as fetch } from '../services/source-provider-io.js';
 /**
  * Reddit API Fetcher
  * Fetches posts/comments from subreddits with OAuth authentication

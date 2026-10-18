@@ -9,6 +9,7 @@
  * Aggregation passes content_id to every call; Enrichment writes back
  * embeddings + topic_tags to CMS via its /internal/* API.
  */
+import { sourceProviderOperation } from '../services/source-provider-io.js';
 import { config } from '../config/index.js';
 import type { ContentStageCorrelation } from '../queues/schemas.js';
 import { logger } from '../observability/logger.js';
@@ -388,7 +389,7 @@ export async function fetchTwitterProfile(
     username: string,
     requestId?: string,
 ): Promise<TwitterProfileInfo> {
-    const response = await fetch(`${baseUrl()}/v1/extract/twitter`, {
+    const response = await sourceProviderOperation(() => fetch(`${baseUrl()}/v1/extract/twitter`, {
         method: 'POST',
         body: JSON.stringify({ username }),
         headers: {
@@ -397,7 +398,7 @@ export async function fetchTwitterProfile(
             ...tracingHeaders(requestId),
         },
         signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
-    });
+    }));
 
     if (!response.ok) {
         const errorText = await response.text().catch(() => '');

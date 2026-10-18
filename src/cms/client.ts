@@ -1,3 +1,4 @@
+import { sourceRunNormalizationInputsSchema, type SourceRunNormalizationInputs } from '../contracts/source-runs.js';
 /**
  * CMS API Client with circuit breaker protection
  */
@@ -898,6 +899,7 @@ export const cmsClient = {
       unitKey: string;
       pageId: string;
       batchId?: string;
+      normalizationInputs?: SourceRunNormalizationInputs;
     },
     requestId?: string,
   ): Promise<SourceRunAuthorizedUnit> {
@@ -911,6 +913,7 @@ export const cmsClient = {
         unit_key: input.unitKey,
         page_id: input.pageId,
         batch_id: input.batchId ?? "",
+        normalization_inputs: input.unitType === "normalize_batch" ? sourceRunNormalizationInputsSchema.parse(input.normalizationInputs) : [],
       },
       requestId,
     );

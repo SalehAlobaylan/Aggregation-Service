@@ -1,3 +1,4 @@
+import { sourceProviderFetch as fetch } from '../services/source-provider-io.js';
 /**
  * YouTube Data API v3 Fetcher
  * Fetches video metadata from channels and playlists

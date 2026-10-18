@@ -30,6 +30,25 @@ describe('provider observation completeness for reset replay', () => {
     expect((await podcastFetcher.fetch(config)).metadata.truncated).toBe(false);
   });
 
+
+  it('replays the exact reserved Podcast identity before applying its one-item cap', async () => {
+    const { podcastFetcher } = await import('../../src/fetchers/podcast.fetcher.js');
+    mocks.parse.mockResolvedValue(feed(101));
+    const result = await podcastFetcher.fetch({ ...config, settings: { max_results: 1, deferred_observation_map: { '100': '00000000-0000-4000-8000-000000000001' } } });
+    expect(result.items.map((item) => item.externalId)).toEqual(['100']);
+    expect(result.metadata.truncated).toBe(false);
+  });
+
+  it('does not count a locally rate-limited Podcast as a provider request', async () => {
+    const { podcastFetcher } = await import('../../src/fetchers/podcast.fetcher.js');
+    const { withSourceProviderIO } = await import('../../src/services/source-provider-io.js');
+    mocks.rate.mockResolvedValue({ allowed: false });
+    const started = vi.fn();
+    await expect(withSourceProviderIO(1, started, () => {}, () => podcastFetcher.fetch(config))).rejects.toThrow('rate limit');
+    expect(started).not.toHaveBeenCalled();
+    expect(mocks.safeFetch).not.toHaveBeenCalled();
+  });
+
   it('marks local Reddit rate limiting as unavailable without provider or Redis calls', async () => {
     const { redditFetcher } = await import('../../src/fetchers/reddit.fetcher.js');
     mocks.rate.mockResolvedValue({ allowed: false });

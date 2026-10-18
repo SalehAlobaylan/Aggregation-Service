@@ -10,6 +10,7 @@
  *
  * All discovery fetching (feed validation, crawl candidates) must go through here.
  */
+import { sourceProviderOperation } from '../services/source-provider-io.js';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import { Agent, buildConnector, fetch as undiciFetch, type Response as UndiciResponse } from 'undici';
@@ -215,7 +216,7 @@ export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions =
         const dispatcher = createBoundDispatcher(target);
         let resp: UndiciResponse;
         try {
-            resp = await undiciFetch(u.toString(), {
+            resp = await sourceProviderOperation(() => undiciFetch(u.toString(), {
                 method: opts.method ?? 'GET',
                 redirect: 'manual',
                 signal,
@@ -225,7 +226,7 @@ export async function safeFetchResponse(rawUrl: string, opts: SafeFetchOptions =
                     Accept: ACCEPT,
                     ...(opts.headers ?? {}),
                 },
-            });
+            }));
         } catch (error) {
             await dispatcher.destroy();
             throw error;

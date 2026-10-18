@@ -1,9 +1,11 @@
+import { sourceProviderOperation } from './source-provider-io.js';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { config } from '../config/index.js';
 import { logger } from '../observability/logger.js';
 
 export interface TelegramClientLike {
+    invoke?(request: unknown, dcId?: number): Promise<unknown>;
     connect(): Promise<void>;
     disconnect(): Promise<void>;
     getEntity(entity: string): Promise<unknown>;
@@ -30,7 +32,14 @@ function buildDefaultTelegramClient(): TelegramClientLike {
 let factory: TelegramClientFactory = buildDefaultTelegramClient;
 
 export function createTelegramClient(): TelegramClientLike {
-    return factory();
+    const client = factory();
+    // A fresh per-job instance owns this wrapper. Cached entity reads do not
+    // invent calls, while pagination RPCs use the same fenced provider budget.
+    if (client.invoke) {
+        const invoke = client.invoke.bind(client);
+        client.invoke = (request, dcId) => sourceProviderOperation(() => invoke(request, dcId));
+    }
+    return client;
 }
 
 export function setTelegramClientFactoryForTest(nextFactory: TelegramClientFactory): void {

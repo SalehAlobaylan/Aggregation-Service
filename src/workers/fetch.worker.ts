@@ -12,6 +12,7 @@ import { cmsClient } from '../cms/client.js';
 import { sourceRunExecutionEnvelopeSchema, sourceRunManifestChildDigest, sourceRunQueueJobId, type SourceRunExecutionEnvelope } from '../contracts/source-runs.js';
 import { buildSourceRunReceipt, enqueueSourceRunReceipt } from '../services/lifecycle-receipts.js';
 import { startSourceRunLeaseHeartbeat } from '../services/source-run-lease.js';
+import { ProviderStartProofError, withSourceProviderIO } from '../services/source-provider-io.js';
 import type { RawFetchedItem } from '../fetchers/types.js';
 
 const SOURCE_RUN_NORMALIZE_BATCH_SIZE = 100;
@@ -57,19 +58,25 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
     const heartbeat = startSourceRunLeaseHeartbeat(envelope, { requestId: job.id });
     try {
     await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'execution_started', outcome: 'no_change', sequence: 0, pageId, payload: { page_id: pageId } });
-    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_request_started', outcome: 'no_change', sequence: 1, pageId, payload: { source_id: sourceId, source_type: sourceType } });
 
+    let actualProviderCalls = 0;
     let result: Awaited<ReturnType<typeof fetchFromSource>>;
     try {
 		heartbeat.assertCurrent();
-        result = await fetchFromSource(sourceConfig, config.cursor as string | undefined, signal);
+        const priorCalls = getNonNegativeInteger(config.providerCallsSoFar) ?? 0;
+        const allowedCalls = Math.max(0, (getPositiveInteger(settings.max_provider_calls) ?? 1) - priorCalls);
+        result = await withSourceProviderIO(allowedCalls, async (ordinal) => {
+            actualProviderCalls = ordinal;
+            await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_request_started', outcome: 'no_change', sequence: ordinal, pageId,
+                payload: { source_id: sourceId, source_type: sourceType, provider_call_ordinal: priorCalls + ordinal } });
+        }, () => { signal?.throwIfAborted(); heartbeat.assertCurrent(); }, () => fetchFromSource(sourceConfig, config.cursor as string | undefined, signal));
     } catch (error) {
         await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: 0, declaredChildDigest: sourceRunManifestChildDigest([]) }, job.id);
-        await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'failed', outcome: 'provider_failed', sequence: 2, pageId, payload: { failure_class: 'provider_fetch_failed' } });
+        await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: error instanceof ProviderStartProofError ? 'provider_terminal' : 'failed', outcome: error instanceof ProviderStartProofError ? 'unknown' : 'provider_failed', sequence: actualProviderCalls + 1, pageId, finalPage: error instanceof ProviderStartProofError, payload: { failure_class: error instanceof ProviderStartProofError ? 'provider_start_proof_unavailable' : 'provider_fetch_failed' } });
         throw error;
     }
 	const observedBytes = Buffer.byteLength(JSON.stringify(result.items), 'utf8');
-	const providerCallsSoFar = (getNonNegativeInteger(config.providerCallsSoFar) ?? 0) + 1;
+	const providerCallsSoFar = (getNonNegativeInteger(config.providerCallsSoFar) ?? 0) + actualProviderCalls;
 	const observedBytesSoFar = (getNonNegativeInteger(config.observedBytesSoFar) ?? 0) + observedBytes;
 	const configuredProviderCallCap = getPositiveInteger(settings.max_provider_calls);
 	const configuredByteCap = getPositiveInteger(settings.max_bytes);
@@ -97,7 +104,7 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 		}
 		await cmsClient.freezeSourceRunPage({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, unitId: envelope.executionUnitId, declaredChildCount: 0, declaredChildDigest: sourceRunManifestChildDigest([]) }, job.id);
 		const observationsTruncated = Boolean(capability && result.items.length > SOURCE_RUN_NORMALIZE_BATCH_SIZE);
-		const outcome = result.items.length === 0
+		const outcome = result.metadata.unavailable || result.metadata.errors > 0 ? 'provider_failed' : result.items.length === 0
 			? 'no_change'
 			: observationsTruncated
 				? 'partial'
@@ -105,8 +112,8 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 				? 'upstream_change_deferred'
 				: 'observation_blocked_by_intake';
 		const payload = { fetched: result.metadata.totalFetched, accepted: 0, observed: created, observation_truncated: observationsTruncated, observed_bytes: observedBytes, provider_capability: capability ?? 'none', intake_capacity: 0, cursor_advanced: false };
-		await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: 2, pageId, payload });
-		await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: true, payload });
+		await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: actualProviderCalls + 1, pageId, payload });
+		await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: actualProviderCalls + 2, pageId, finalPage: true, payload });
 		jobLogger.info('CMS source-run observation completed without intake', { sourceId, pageId, outcome, observed: created });
 		return;
 	}
@@ -165,7 +172,9 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 	        const batch = items.slice(offset, offset + SOURCE_RUN_NORMALIZE_BATCH_SIZE);
 	        const batchId = `batch-${batchIndex}`;
 	        const unitKey = `normalize:${pageId}:${batchId}`;
-	        const child = await cmsClient.authorizeSourceRunUnit({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, parentUnitId: envelope.executionUnitId, unitType: 'normalize_batch', unitKey, pageId, batchId }, job.id);
+	        const child = await cmsClient.authorizeSourceRunUnit({ tenantId: envelope.tenantId, requestId: envelope.sourceRunRequestId, attemptId: envelope.sourceRunAttemptId, parentUnitId: envelope.executionUnitId, unitType: 'normalize_batch', unitKey, pageId, batchId,
+                normalizationInputs: batch.map((item) => ({ upstream_item_id: item.externalId, observation_id: replayObservationIDs.get(item.externalId) ?? deferredObservationMap?.get(item.externalId), fingerprint: upstreamItemFingerprint(item) })),
+            }, job.id);
 		pendingBatches.push({ batch, batchId, unitKey, child });
 	        childKeys.push(unitKey);
 	    }
@@ -179,7 +188,7 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 			rawItems: pending.batch.map((item) => ({
 				externalId: item.externalId, rawData: item, fetchedAt: item.fetchedAt,
 				upstreamObservationId: replayObservationIDs.get(item.externalId) ?? deferredObservationMap?.get(item.externalId),
-				upstreamFingerprint: replayFingerprints.get(item.externalId),
+				upstreamFingerprint: replayFingerprints.get(item.externalId) ?? upstreamItemFingerprint(item),
 			})),
 			fetchJobId: job.id || envelope.unitJobId, triggeredBy: 'schedule', sourceSettings: settings,
 			sourceRunRequestId: envelope.sourceRunRequestId, tenantId: envelope.tenantId,
@@ -206,9 +215,9 @@ async function processDurableFetch(job: Job<FetchJob>, jobLogger: ReturnType<typ
 		heartbeat.assertCurrent();
 	const budgetTruncated = Boolean(result.hasMore && result.cursor && !canContinue);
 	const deferredTargetMissing = Boolean(deferredObservationMap && items.length === 0 && !(result.hasMore && result.cursor && canContinue));
-    const outcome = deferredTargetMissing || budgetTruncated ? 'partial' : items.length > 0 ? 'new_items' : 'no_change';
-    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: 2, pageId, payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, has_more: Boolean(result.hasMore && result.cursor && canContinue), budget_truncated: budgetTruncated, child_batches: childKeys.length } });
-    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: 3, pageId, finalPage: !(result.hasMore && result.cursor && canContinue), payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, next_cursor_present: Boolean(result.cursor && canContinue), budget_truncated: budgetTruncated } });
+    const outcome = result.metadata.unavailable ? 'provider_failed' : deferredTargetMissing || budgetTruncated || result.metadata.truncated || result.metadata.errors > 0 ? 'partial' : items.length > 0 ? 'new_items' : 'no_change';
+    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_page', outcome, sequence: actualProviderCalls + 1, pageId, payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, has_more: Boolean(result.hasMore && result.cursor && canContinue), budget_truncated: budgetTruncated, child_batches: childKeys.length } });
+    await emitDurableFetchReceipt({ envelope, stage: 'fetch', eventType: 'provider_terminal', outcome, sequence: actualProviderCalls + 2, pageId, finalPage: !(result.hasMore && result.cursor && canContinue), payload: { fetched: result.metadata.totalFetched, accepted: items.length, observed_bytes: observedBytes, errors: result.metadata.errors, next_cursor_present: Boolean(result.cursor && canContinue), budget_truncated: budgetTruncated } });
     jobLogger.info('CMS source-run fetch page completed', { sourceId, pageId, items: items.length, batches: childKeys.length });
 	} finally {
 		heartbeat.stop();

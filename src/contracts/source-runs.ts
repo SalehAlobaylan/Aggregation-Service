@@ -107,6 +107,13 @@ export const sourceRunExecutionEnvelopeSchema = z.object({
 
 export type SourceRunExecutionEnvelope = z.infer<typeof sourceRunExecutionEnvelopeSchema>
 
+export const sourceRunNormalizationInputsSchema = z.array(z.object({
+  upstream_item_id: z.string().min(1).max(255),
+  observation_id: z.string().uuid().optional(),
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict()).min(1).max(100).refine((inputs) => new Set(inputs.map((input) => input.upstream_item_id)).size === inputs.length, 'duplicate normalization identity');
+export type SourceRunNormalizationInputs = z.infer<typeof sourceRunNormalizationInputsSchema>;
+
 export const sourceRunReceiptSchema = z.object({
   ...sourceRunExecutionEnvelopeSchema.shape,
   producerEventKey: z.string().trim().min(1).max(255),

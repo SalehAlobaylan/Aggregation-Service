@@ -1,3 +1,4 @@
+import { sourceProviderOperation } from '../services/source-provider-io.js';
 /**
  * Telegram Fetcher
  * Fetches media and text messages from public Telegram channels.
@@ -76,7 +77,7 @@ export const telegramFetcher: Fetcher = {
             : undefined;
 
         try {
-            await client.connect();
+            await sourceProviderOperation(() => client.connect());
 
             const entity = await client.getEntity(settings.channelUsername);
             const channelTitle = getChannelTitle(entity);

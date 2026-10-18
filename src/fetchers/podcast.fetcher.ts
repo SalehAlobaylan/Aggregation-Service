@@ -50,6 +50,9 @@ export const podcastFetcher: Fetcher = {
         let errors = 0;
         const minDurationSec = configuredMinimumDurationSec(config.settings as Record<string, unknown> | undefined);
         const maxDurationSec = configuredMaximumDurationSec(config.settings as Record<string, unknown> | undefined);
+        const deferredMap = config.settings.deferred_observation_map;
+        const reservedIDs = deferredMap && typeof deferredMap === 'object' && !Array.isArray(deferredMap) ? new Set(Object.keys(deferredMap)) : undefined;
+        if (reservedIDs && (reservedIDs.size < 1 || reservedIDs.size > 20)) throw new Error('Invalid bounded Podcast replay identities');
         const maxResults = configuredResultLimit(config.settings as Record<string, unknown> | undefined, 10, 200);
         if (maxDurationSec !== undefined && maxDurationSec < minDurationSec) {
             throw new Error('Podcast duration settings are contradictory: maximum is below minimum');
@@ -83,6 +86,7 @@ export const podcastFetcher: Fetcher = {
             const showImage = (feed as Record<string, unknown>)['itunes:image'] as string | undefined;
 
             for (const episode of feed.items || []) {
+                if (reservedIDs && !reservedIDs.has(episode.guid || episode.enclosure?.url || '')) continue;
                 try {
                     // Podcast episodes must have an enclosure (audio file)
                     if (!episode.enclosure?.url) {
@@ -157,7 +161,7 @@ export const podcastFetcher: Fetcher = {
                     totalFetched: items.length,
                     skipped,
                     errors,
-					truncated: (feed.items?.length ?? 0) > items.length + skipped + errors,
+					truncated: !reservedIDs && (feed.items?.length ?? 0) > items.length + skipped + errors,
                 },
             };
         } catch (error) {
