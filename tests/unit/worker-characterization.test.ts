@@ -464,6 +464,86 @@ describe("normalize worker characterization", () => {
     expect(ai.add).not.toHaveBeenCalled();
   });
 
+  it("reconciles existing media after an exact URL precheck", async () => {
+    const media = mediaQueue();
+    const ai = aiQueue();
+    mocks.getQueue.mockImplementation((name: string) => {
+      if (name === mediaQueueName) return media;
+      if (name === aiQueueName) return ai;
+      return undefined;
+    });
+    mocks.normalizeItem.mockReturnValue(baseNormalized());
+    mocks.redundancyPrecheck.mockResolvedValue({ candidates: [{ verdict: "exact_identity", existing_item_id: "content-1", confidence: 1, reasons: ["exact URL"] }] });
+    mocks.upsertContentItem.mockResolvedValue({ contentItemId: "content-1", created: false, deliveryMode: "durable_required", nextRequiredStages: ["media"] });
+    const processor = mocks.capturedWorkers.get(normalizeQueueName)?.processor;
+
+    await processor!(
+      {
+        id: "normalize-job-1",
+        data: {
+          sourceId: "source-1",
+          sourceType: "YOUTUBE",
+          rawItems: [
+            {
+              externalId: "raw-1",
+              rawData: { externalId: "raw-1", metadata: {} },
+              fetchedAt: "2026-07-08T00:00:00.000Z",
+            },
+          ],
+          fetchJobId: "fetch-job-1",
+          triggeredBy: "manual",
+          sourceSettings: {},
+        },
+      },
+      logger(),
+    );
+
+    expect(mocks.upsertContentItem).toHaveBeenCalled();
+    expect(mocks.redundancyPrecheck).toHaveBeenCalledWith(expect.any(Array), "default", "source-1", "normalize-job-1", undefined);
+    expect(media.add).not.toHaveBeenCalled();
+    expect(ai.add).not.toHaveBeenCalled();
+  });
+
+  it("continues CMS reconciliation when advisory precheck is unavailable", async () => {
+    const media = mediaQueue();
+    const ai = aiQueue();
+    mocks.getQueue.mockImplementation((name: string) => {
+      if (name === mediaQueueName) return media;
+      if (name === aiQueueName) return ai;
+      return undefined;
+    });
+    mocks.normalizeItem.mockReturnValue(baseNormalized());
+    mocks.redundancyPrecheck.mockRejectedValue(new Error("CMS precheck unavailable"));
+    mocks.upsertContentItem.mockResolvedValue({ contentItemId: "content-1", created: false, deliveryMode: "durable_required", nextRequiredStages: ["media"] });
+    const processor = mocks.capturedWorkers.get(normalizeQueueName)?.processor;
+
+    await processor!(
+      {
+        id: "normalize-job-1",
+        data: {
+          sourceId: "source-1",
+          sourceType: "YOUTUBE",
+          rawItems: [
+            {
+              externalId: "raw-1",
+              rawData: { externalId: "raw-1", metadata: {} },
+              fetchedAt: "2026-07-08T00:00:00.000Z",
+            },
+          ],
+          fetchJobId: "fetch-job-1",
+          triggeredBy: "manual",
+          sourceSettings: {},
+        },
+      },
+      logger(),
+    );
+
+    expect(mocks.upsertContentItem).toHaveBeenCalled();
+    expect(mocks.redundancyPrecheck).toHaveBeenCalledWith(expect.any(Array), "default", "source-1", "normalize-job-1", undefined);
+    expect(media.add).not.toHaveBeenCalled();
+    expect(ai.add).not.toHaveBeenCalled();
+  });
+
   it("does not enqueue duplicate media work when a media job is already active", async () => {
     const media = mediaQueue();
     const ai = aiQueue();

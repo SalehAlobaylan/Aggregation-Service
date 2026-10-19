@@ -264,25 +264,25 @@ export const createNormalizeWorker = () => createWorker({
 
                 const moderation = evaluateModerationDecision(normalized, moderationConfig);
 
-				// Redundancy hygiene is advisory for near matches. Exact durable URL
-				// identity may reuse the existing idempotency skip; title/duration
-				// matches are recorded as a hint and continue through the pipeline.
-				if ((normalized.type === 'VIDEO' || normalized.type === 'PODCAST') && normalized.title) {
-					const precheck = await cmsClient.redundancyPrecheck([{
-						title: normalized.title,
-						duration_sec: typeof normalized.durationSec === 'number' ? normalized.durationSec : undefined,
-						source_url: normalized.originalUrl || undefined,
-					}], job.id, signal);
-					const verdict = precheck.candidates[0];
-					if (verdict?.verdict === 'exact_identity') {
-						await recordObservationDisposition(job, signal, rawItem, 'filtered', undefined, 'exact_duplicate');
-						duplicates++;
-						continue;
-					}
-					if (verdict?.verdict === 'likely_duplicate') {
-						normalized.metadata = { ...normalized.metadata, redundancyHint: verdict };
-					}
-				}
+                // Identity evidence never bypasses CMS lifecycle reconciliation.
+                // CMS determines whether an existing instance needs expensive stages.
+                if ((normalized.type === 'VIDEO' || normalized.type === 'PODCAST') && normalized.title) {
+                    try {
+                        const precheck = await cmsClient.redundancyPrecheck([{
+                            title: normalized.title,
+                            duration_sec: typeof normalized.durationSec === 'number' ? normalized.durationSec : undefined,
+                            source_url: normalized.originalUrl || undefined,
+                        }], tenantId, sourceId, job.id, signal);
+                        const verdict = precheck.candidates[0];
+                        if (verdict?.verdict === 'exact_identity' || verdict?.verdict === 'likely_duplicate') {
+                            normalized.metadata = { ...normalized.metadata, redundancyHint: verdict };
+                        }
+                    } catch {
+                        signal?.throwIfAborted();
+                        jobLogger.warn('Redundancy precheck unavailable; CMS lifecycle reconciliation remains authoritative', { sourceId });
+                        normalized.metadata = { ...normalized.metadata, redundancyPrecheck: { status: 'unavailable' } };
+                    }
+                }
                 normalized.metadata = {
                     ...normalized.metadata,
                     moderation: {

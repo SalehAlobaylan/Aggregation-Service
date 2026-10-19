@@ -26,3 +26,14 @@ it('aborts an in-flight ingest HTTP request when its normalize job is cancelled'
   await rejected;
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });
+
+it('keeps advisory precheck outages outside the authoritative CMS circuit', async () => {
+  vi.resetModules();
+  const fetchMock = vi.fn().mockRejectedValue(new Error('precheck deadline exceeded'));
+  vi.stubGlobal('fetch', fetchMock);
+  const { cmsClient } = await import('../../src/cms/client.js');
+  await Promise.allSettled(Array.from({ length: 5 }, () => cmsClient.redundancyPrecheck([{ title: 'Episode' }], 'tenant-a', 'source-a')));
+  fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ content_id: 'fixture-item', created: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  await expect(cmsClient.createContentItem({ type: 'VIDEO', source: 'RSS', status: 'PENDING', title: 'Episode', idempotency_key: 'test-only' })).resolves.toBeDefined();
+  expect(fetchMock).toHaveBeenCalledTimes(6);
+});

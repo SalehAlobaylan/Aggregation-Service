@@ -1221,6 +1221,8 @@ export const cmsClient = {
       duration_sec?: number;
       source_url?: string;
     }>,
+    tenantId: string,
+    contentSourceId: string,
     requestId?: string,
     parentSignal?: AbortSignal,
   ): Promise<{
@@ -1231,10 +1233,11 @@ export const cmsClient = {
       reasons: string[];
     }>;
   }> {
-    return makeProtectedRequest(
+    // Advisory evidence must not open the mandatory ingest/claim circuit.
+    return makeRequest(
       "POST",
       "/redundancy/precheck",
-      { candidates },
+      { candidates, tenant_id: tenantId, content_source_id: contentSourceId },
       requestId,
       parentSignal,
     );
