@@ -44,6 +44,7 @@ interface InternalQueueStats {
     completed: number;
     failed: number;
     delayed: number;
+    prioritized: number;
 }
 
 interface InternalRetryBody {
@@ -169,6 +170,7 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
                 completed: counts.completed || 0,
                 failed: counts.failed || 0,
                 delayed: counts.delayed || 0,
+                prioritized: counts.prioritized || 0,
             });
         }
         return reply.send({ data });
