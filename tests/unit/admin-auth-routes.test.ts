@@ -69,6 +69,12 @@ vi.mock('../../src/workers/index.js', () => ({
     syncSourceGraphSweeper: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../src/storage/client.js', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../../src/storage/client.js')>(),
+    computeStorageUsage: vi.fn().mockResolvedValue({ usedBytes: 4096, objectCount: 7, byArtifactType: { media: 4096 } }),
+    isColdTierConfigured: vi.fn().mockReturnValue(false),
+}));
+
 vi.mock('../../src/services/scheduler.service.js', () => ({
     scheduler: {
         triggerPoll: vi.fn().mockResolvedValue('job-123'),
@@ -115,6 +121,8 @@ async function buildServer(): Promise<FastifyInstance> {
     process.env.CMS_BASE_URL = 'http://localhost:8080/internal';
     process.env.CMS_AGGREGATION_SERVICE_TOKEN = 'test-token';
     process.env.CMS_SERVICE_TOKEN = '';
+    process.env.AGGREGATION_CMS_SERVICE_TOKEN = 'storage-read-token';
+    process.env.INTERNAL_SERVICE_TOKEN = 'storage-read-token';
     process.env.REDIS_URL = 'redis://localhost:6379';
     process.env.STORAGE_ENDPOINT = 'http://localhost:9000';
     process.env.STORAGE_BUCKET = 'test-bucket';
@@ -139,6 +147,23 @@ async function buildServer(): Promise<FastifyInstance> {
 describe('Admin auth and route protections', () => {
     afterEach(async () => {
         vi.clearAllMocks();
+    });
+
+    it('exposes only read-only bucket totals to the CMS service credential', async () => {
+        const server = await buildServer();
+        try {
+            const anonymous = await server.inject({ method: 'GET', url: '/internal/storage/stats' });
+            expect(anonymous.statusCode).toBe(401);
+            const wrong = await server.inject({ method: 'GET', url: '/internal/storage/stats', headers: { authorization: 'Bearer wrong' } });
+            expect(wrong.statusCode).toBe(401);
+            const read = await server.inject({ method: 'GET', url: '/internal/storage/stats', headers: { authorization: 'Bearer storage-read-token' } });
+            expect(read.statusCode).toBe(200);
+            expect(read.json()).toMatchObject({ used_bytes: 4096, object_count: 7, cold_enabled: false });
+            const admin = await server.inject({ method: 'GET', url: '/admin/storage/stats', headers: { authorization: 'Bearer storage-read-token' } });
+            expect(admin.statusCode).toBe(401);
+            expect(mocks.queueClean).not.toHaveBeenCalled();
+            expect(mocks.queueDrain).not.toHaveBeenCalled();
+        } finally { await server.close(); }
     });
 
     it('keeps /health public', async () => {

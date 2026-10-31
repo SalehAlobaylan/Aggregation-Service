@@ -1,7 +1,7 @@
 /**
  * Admin routes for manual triggers and inspection
  */
-import { FastifyInstance } from 'fastify';
+import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { scheduler } from '../../services/scheduler.service.js';
 import { getQueue, QUEUE_NAMES } from '../../queues/index.js';
 import { rateLimiter } from '../../services/rate-limiter.js';
@@ -9,6 +9,7 @@ import { itunesSearch } from '../../services/itunes-search.js';
 import { logger } from '../../observability/logger.js';
 import type { SourceType, DiscoveryJob, DiscoveryProfileInput, DiscoverySweepJob, SourceGraphJob } from '../../queues/schemas.js';
 import { verifyAdminAuth, verifyAdminOrCMSAutomation } from '../plugins/admin-auth.js';
+import { verifyInternalServiceAuth } from '../plugins/internal-auth.js';
 import { feedDiscoveryService } from '../../services/feed-discovery.service.js';
 import { fetchFromSource, getSupportedSourceTypes } from '../../fetchers/index.js';
 import { resolveYoutubeChannel } from '../../fetchers/youtube.fetcher.js';
@@ -779,29 +780,29 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         return payload;
     }
 
-    fastify.get(
-        '/admin/storage/stats',
-        { preHandler: verifyAdminAuth },
-        async (_request, reply) => {
-            if (cachedStats && Date.now() - cachedStats.at < STORAGE_STATS_TTL_MS) {
-                return reply.send(cachedStats.data);
-            }
-            try {
-                if (!statsInFlight) {
-                    statsInFlight = loadStorageStatsPayload().finally(() => {
-                        statsInFlight = null;
-                    });
-                }
-                const payload = await statsInFlight;
-                return reply.send(payload);
-            } catch (err) {
-                logger.error('storage.stats: failed', err);
-                return reply.status(502).send({
-                    error: err instanceof Error ? err.message : 'storage stats failed',
+    const storageStatsHandler = async (_request: FastifyRequest, reply: FastifyReply) => {
+        if (cachedStats && Date.now() - cachedStats.at < STORAGE_STATS_TTL_MS) {
+            return reply.send(cachedStats.data);
+        }
+        try {
+            if (!statsInFlight) {
+                statsInFlight = loadStorageStatsPayload().finally(() => {
+                    statsInFlight = null;
                 });
             }
+            const payload = await statsInFlight;
+            return reply.send(payload);
+        } catch (err) {
+            logger.error('storage.stats: failed', err);
+            return reply.status(502).send({
+                error: err instanceof Error ? err.message : 'storage stats failed',
+            });
         }
-    );
+    };
+    fastify.get('/admin/storage/stats', { preHandler: verifyAdminAuth }, storageStatsHandler);
+    // A read-only owner projection for CMS workers: no admin JWT, queue or
+    // storage-mutation capability is granted by this service credential.
+    fastify.get('/internal/storage/stats', { preHandler: verifyInternalServiceAuth }, storageStatsHandler);
 
     interface DeleteObjectsBody {
         keys?: string[];
