@@ -39,17 +39,17 @@ export function buildEmbeddingText(
 
     // Include the transcript (video/podcast) AND the description — not either/or.
     if (transcript) {
-        parts.push(transcript.substring(0, MAX_PART_LENGTH));
+        parts.push(Array.from(transcript).slice(0, MAX_PART_LENGTH).join(''));
     }
     if (bodyText) {
         // Clean before capping so the cap counts useful chars, not URLs.
-        parts.push(cleanForEmbedding(bodyText).substring(0, MAX_PART_LENGTH));
+        parts.push(Array.from(cleanForEmbedding(bodyText)).slice(0, MAX_PART_LENGTH).join(''));
     }
 
-    if (excerpt && excerpt !== bodyText?.substring(0, excerpt.length)) {
+    if (excerpt && !bodyText?.startsWith(excerpt)) {
         parts.push(excerpt);
     }
 
     const combined = parts.join(' ').trim();
-    return combined.substring(0, MAX_TEXT_LENGTH);
+    return Array.from(combined).slice(0, MAX_TEXT_LENGTH).join('');
 }

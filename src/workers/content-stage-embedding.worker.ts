@@ -22,9 +22,12 @@ async function processEmbeddingStage(expectedLane: 'news' | 'pods', allowedStage
 		stageBegun = true;
 		heartbeat = setInterval(() => void cmsClient.heartbeatContentStage(claim, job.id).catch(() => undefined), 15_000);
 		heartbeat.unref();
-		const text = claim.stage === 'pods_caption_reembedding'
-			? String(claim.bounded_input.caption_text ?? '')
-			: buildEmbeddingText(claim.bounded_input.title ?? '', claim.bounded_input.excerpt ?? undefined, claim.bounded_input.body_text ?? undefined);
+		const text = buildEmbeddingText(
+			claim.bounded_input.title ?? '',
+			claim.bounded_input.excerpt ?? undefined,
+			claim.bounded_input.body_text ?? undefined,
+			claim.stage === 'pods_caption_reembedding' ? String(claim.bounded_input.caption_text ?? '') : undefined,
+		);
 		if (!text.trim()) {
 			await cmsClient.failContentStage(claim, 'invalid_input', 'No normalized text is available for embedding', job.id);
 			return;
