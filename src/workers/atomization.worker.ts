@@ -8,7 +8,8 @@ import { startContentStageLeaseHeartbeats, type ContentStageLeaseHeartbeat } fro
 import { getQueue, QUEUE_NAMES, type AtomizationJob } from "../queues/index.js";
 import { cmsClient, CMSRequestError, contentStageCorrelation, isStaleContentStageDeliveryError } from "../cms/client.js";
 import { config } from "../config/index.js";
-import { downloadHttp, cleanupTempFile } from "../media/downloader.js";
+import { cleanupTempFile } from "../media/downloader.js";
+import { downloadStorageObject } from "../media/storage-downloader.js";
 import {
   createAdaptiveHlsPackage,
   validateAdaptiveHlsPackage,
@@ -334,8 +335,9 @@ export const createAtomizationWorker = () => createWorker({
         reservationHeartbeat.unref();
         const parentMedia = await resolveParentMediaForAtomization(input);
         const downloadStartedAt = Date.now();
-        const parentDownload = await downloadHttp(
-          parentMedia.url,
+        const parentDownload = await downloadStorageObject(
+          parentMedia.key,
+          parentMedia.tier,
           `${contentItemId}_atomize`,
           parentMedia.extension,
           signal,
@@ -876,6 +878,15 @@ attemptId: stageClaim?.attempt_id ?? governed?.attemptId,
         else if (governed) await cmsClient.deferAtomizationWork({ id: governed.id, claimToken: governed.claimToken, fenceToken: governed.fenceToken, retryAfterSec: 300, summary: "budget_capped: contextual planning paused" }, job.id, signal);
         return;
       }
+      if (error instanceof ResourceDeferredError && stageClaim && stageBegun && !activeUnit) {
+        // Scratch admission precedes chapter effects. Capacity pressure must
+        // not spend the effect retry budget or discard the frozen generation.
+        // Once a unit is active, retain the reconciliation path below.
+        await cmsClient.deferContentStage(stageClaim, error.retryAfterSec, error.message, job.id);
+        stageHeartbeat?.removeLease("content_stage");
+        await report("queued", currentPhase, { error_message: error.message });
+        return;
+      }
       if (error instanceof ResourceDeferredError && governed) {
         await cmsClient.deferAtomizationWork(
           {
@@ -980,9 +991,8 @@ async function enqueueChapterEmbeddingJobs(
 }
 
 interface ResolvedParentMedia {
-  url: string;
   extension: string;
-  key?: string;
+  key: string;
   tier: StorageTier;
 }
 
@@ -1011,7 +1021,6 @@ async function resolveParentMediaForAtomization(
   const tier = storageTierFromInput(input);
   if (await objectExists(manifestKey, tier)) {
     return {
-      url: directUrl,
       key: manifestKey,
       tier,
       extension: extensionFromKeyOrUrl(manifestKey),

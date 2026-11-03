@@ -300,6 +300,7 @@ export async function getObjectMetadata(
 export async function getObjectStream(
   key: string,
   tier: StorageTier = "primary",
+  signal?: AbortSignal,
 ): Promise<{
   body: NodeJS.ReadableStream;
   size: number;
@@ -308,6 +309,7 @@ export async function getObjectStream(
   const { client, bucket } = bindingFor(tier);
   const resp = await client.send(
     new GetObjectCommand({ Bucket: bucket, Key: key }),
+    { abortSignal: signal },
   );
   if (!resp.Body) {
     throw new Error(`Object ${key} returned an empty body`);

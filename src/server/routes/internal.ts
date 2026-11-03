@@ -27,6 +27,7 @@ import { cmsClient } from '../../cms/client.js';
 import { preflightCheck, resolveIngestProfile } from '../../services/quality.service.js';
 import { databaseMigrationQuiescence, quiesceForDatabaseMigration, resumeAfterDatabaseMigration } from '../../services/database-migration-quiescence.js';
 import { aggregateTopologyReadiness } from '../../runtime/role-readiness.js';
+import { registerSourceCapabilityRoutes } from './source-capabilities.js';
 
 interface UserContentResponse {
     success: boolean;
@@ -141,6 +142,7 @@ export async function internalRoutes(fastify: FastifyInstance): Promise<void> {
 		fastify.addContentTypeParser('application/octet-stream', (request, payload, done) => done(null, payload));
 	}
     fastify.addHook('onRequest', verifyInternalServiceAuth);
+    registerSourceCapabilityRoutes(fastify);
 
 	fastify.get('/internal/readiness/topology', async (_request, reply) => {
 		try {
